@@ -8,13 +8,10 @@ import { getTransactionNonce, logSkip } from "@sig-net/midnight-examples-test-ha
 import { POLL_TIMEOUT_MS } from "../poll-timeout.ts";
 import type { VaultSession } from "../vault-session.ts";
 import { broadcastEvm } from "./broadcast-evm.ts";
-import {
-  flushDepositAttestation,
-  settleDeposit,
-  type ShieldedTokenRecipient,
-} from "./complete-deposit.ts";
+import { settleDeposit, type ShieldedTokenRecipient } from "./complete-deposit.ts";
 import { pollRespondBidirectional } from "./poll-respond-bidirectional.ts";
 import { pollSignatureResponse } from "./poll-signature-response.ts";
+import { queueAndFlushAttestation } from "./queue-attestation.ts";
 import { startDeposit } from "./start-deposit.ts";
 
 /** Options for {@link runDepositRoundTrip}. */
@@ -146,7 +143,7 @@ export async function runDepositRoundTrip(
 
   let claimed = false;
   if (opts.skipClaim) {
-    if (open) await flushDepositAttestation(context, outcome);
+    if (open) await queueAndFlushAttestation(context, outcome);
     logSkip("completeDeposit", `skipClaim set: request ${requestId} left unclaimed on the ledger`);
     return { requestId, claimed };
   }

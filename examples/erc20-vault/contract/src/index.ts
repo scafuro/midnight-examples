@@ -60,6 +60,13 @@ export function deriveVaultEvmAddress(
 /**
  * Resolved ledger-tree path of `bidirectionalDepositMap`, which holds the deposit
  * requests, as the compiled `contract-info.json` lists it. Matches the depth 2 +
- * `requestsPath` [1, 12, 0, 0] the `sendDeposit` circuit packs.
+ * `requestsPath` [1, 11, 0, 0] the `sendDeposit` circuit packs.
  */
-export const VAULT_DEPOSIT_REQUESTS_PATH: readonly number[] = [1, 12];
+export const VAULT_DEPOSIT_REQUESTS_PATH: readonly number[] = [1, 11];
+
+/**
+ * Resolved ledger-tree path of `bidirectionalWithdrawMap`, which holds the withdraw
+ * requests, as the compiled `contract-info.json` lists it. Matches the depth 2 +
+ * `requestsPath` [1, 13, 0, 0] the `sendWithdraw` circuit packs.
+ */
+export const VAULT_WITHDRAW_REQUESTS_PATH: readonly number[] = [1, 13];

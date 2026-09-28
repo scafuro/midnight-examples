@@ -5,6 +5,7 @@ import {
   type CircuitContext,
   createCircuitContext,
   createConstructorContext,
+  rawTokenType,
   sampleContractAddress,
 } from "@midnight-ntwrk/compact-runtime";
 // This tree's wasm ContractState class: see signetStateProvider for why the
@@ -55,11 +56,13 @@ import {
   Contract,
   createVaultPrivateState,
   FlushChannel,
+  flushedRequestKey,
   flushSlots,
   ledger,
   pureCircuits,
   queuedRequestKey,
   VAULT_DEPOSIT_REQUESTS_PATH,
+  VAULT_WITHDRAW_REQUESTS_PATH,
   type VaultPrivateState,
   witnesses,
 } from "../src/index.ts";
@@ -474,7 +477,7 @@ describe("deposit round-trip", () => {
     expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
       version: 1,
       callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
-      requestsPath: [1, 12],
+      requestsPath: [1, 11],
     });
 
     // The contract-composed envelope: the deposit's token on the
@@ -955,6 +958,683 @@ describe("completeDeposit settle", () => {
   });
 });
 
+// ---- Withdraw fixtures ----
+
+// Where the vault sends the ERC20 on withdraw.
+const DEST_EVM = bytes(20, 0x77);
+
+// The vault token colour for ERC20 at the simulated contract address, computed
+// exactly as a wallet would: the compiled domain-separator circuit plus the
+// runtime's rawTokenType (the off-chain twin of the in-circuit
+// `tokenType(domainSep, kernel.self())`).
+const VAULT_TOKEN_COLOR = hexToBytes(
+  rawTokenType(pureCircuits.vaultTokenDomainSeparator(ERC20), VAULT_ADDRESS),
+);
+
+// The stdlib's shieldedBurnAddress() recipient: the all-zero coin public key.
+// The burn-output assertions below are the lockstep check for this mirror.
+const BURN_ADDRESS_BYTES = new Uint8Array(32);
+
+/** A surrendered vault coin: fixed nonce, vault-token colour, given value. */
+const vaultCoin = (value: bigint, color: Uint8Array = VAULT_TOKEN_COLOR) => ({
+  nonce: bytes(32, 0x0c),
+  color,
+  value,
+});
+
+/**
+ * A withdrawal's `startWithdraw` arguments: the input index, the
+ * `WithdrawRequest` and the surrendered coin. The nonce and gas are the
+ * vault's, so the caller passes neither.
+ */
+interface WithdrawCallArgs {
+  inIndex: bigint;
+  withdraw: { erc20Address: Uint8Array; amount: bigint; destEvmAddress: Uint8Array };
+  coin: ReturnType<typeof vaultCoin>;
+}
+
+/**
+ * Known-good withdraw call args, the base every test varies from.
+ * Shared across tests: NEVER mutate. Build a variation as an explicit spread
+ * of this base with the delta inline (see {@link WITHDRAW_REJECTION_CASES}).
+ */
+const VALID_WITHDRAW: WithdrawCallArgs = {
+  inIndex: 11n,
+  withdraw: { erc20Address: ERC20, amount: AMOUNT, destEvmAddress: DEST_EVM },
+  coin: vaultCoin(AMOUNT),
+};
+
+// The vault's gas settings initialise() stores, which every withdrawal copies at start.
+const DEFAULT_VAULT_GAS = {
+  gasLimit: 100_000n,
+  maxFeePerGas: 150_000_000_000n,
+  maxPriorityFeePerGas: 1_000_000_000n,
+};
+
+/** Queue a withdrawal: startWithdraw with its args in circuit order. */
+const queueWithdraw = (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  args: WithdrawCallArgs,
+) => contract.circuits.startWithdraw(ctx, args.inIndex, args.withdraw, args.coin);
+
+/** Queue, flush and send a withdrawal, returning the send's context and the request key. */
+const withdraw = async (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  args: WithdrawCallArgs,
+) => {
+  const queued = (await queueWithdraw(contract, ctx, args)).context;
+  const flushed = await flush(contract, queued, [args.inIndex], []);
+  const outKey = flushedRequestKey(ledgerOf(flushed), Action.withdraw, args.inIndex);
+  const sent = await contract.circuits.sendWithdraw(flushed, outKey);
+  return { context: sent.context, outKey };
+};
+
+/** The zswap local state a circuit run produced, failing when there is none. */
+const zswapState = (context: CircuitContext<VaultPrivateState>) => {
+  const state = context.callContext.currentZswapLocalState;
+  if (!state) {
+    throw new Error("expected zswap local state on the circuit context");
+  }
+  return state;
+};
+
+// ---- Withdraw tests ----
+
+describe("withdraw round-trip", () => {
+  it("burns the coin and stores a vault-path event built from the flushed entry and its args", async () => {
+    const { contract, ctx } = await deployInitialised();
+
+    const { context: next, outKey } = await withdraw(contract, ctx, VALID_WITHDRAW);
+    const state = next.callContext.currentQueryContext.state;
+
+    const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalWithdrawMap);
+    const rawLedger = readSignetRequestsLedgerFromState(state, VAULT_WITHDRAW_REQUESTS_PATH);
+    expect(typedIndex.size).toBe(1);
+    expect(rawLedger.requestsIndex).toEqual(typedIndex);
+    const [idHex, record] = first(typedIndex.entries(), "indexed withdraw request");
+
+    // The notification names THIS vault and the bidirectionalWithdrawMap.
+    const notificationEvent = first(
+      decodeSignetLogEvents(next.events, SIGNET_ADDRESS),
+      "signet notification event",
+    );
+    expect(notificationEvent.name).toBe(SignetEventName.SignBidirectionalEvent);
+    const notificationPost = decodeSignBidirectionalEventNotificationPayload(
+      notificationEvent.payload,
+    );
+    expect(requestIdHex(notificationPost.requestId)).toBe(idHex);
+    expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
+      version: 1,
+      callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
+      requestsPath: [1, 13],
+    });
+
+    // The vault's own account signs: the derivation path is the contract-fixed
+    // 32-byte literal "vault", the nonce is the first one the flush assigned,
+    // and the gas is the vault's setting copied at start.
+    expect(record.sender).toEqual({ bytes: VAULT_ADDRESS_BYTES });
+    expect(record.path).toEqual(asciiPadded("vault", 32));
+    const { calldata, ...envelope } = record.txParams;
+    expect(envelope).toEqual({
+      to: ERC20,
+      chainId: CHAIN_ID,
+      nonce: 0n,
+      ...DEFAULT_VAULT_GAS,
+      value: 0n,
+      accessListEntryCount: 0n,
+      accessList: [],
+    });
+    expect(record.executionDest).toEqual(EXPECTED_ROUTING.executionDest);
+    expect(record.keyVersion).toBe(MPC_KEY_VERSION);
+    expect(record.algo).toBe(EXPECTED_ROUTING.algo);
+    expect(record.signatureDest).toBe(EXPECTED_ROUTING.signatureDest);
+    expect(record.params).toEqual(EXPECTED_ROUTING.params);
+    expect(record.txParamType).toBe(TxParamType.evmType2);
+    expect(record.outputDeserializationSchema).toEqual(
+      EXPECTED_ROUTING.outputDeserializationSchema,
+    );
+    expect(record.respondSerializationSchema).toEqual(EXPECTED_ROUTING.respondSerializationSchema);
+
+    // Contract-built calldata: transfer(destEvmAddress, amount).
+    expect(calldata.is_some).toBe(true);
+    expect(calldata.value.selector).toEqual(ERC20_TRANSFER_SELECTOR);
+    expect(calldata.value.noWords).toBe(2n);
+    expect(calldata.value.words).toHaveLength(2);
+    expect(calldata.value.words[0]).toEqual(evmAddressAbiWord(DEST_EVM));
+    expect(calldata.value.words[1]).toEqual(numericAbiWord(AMOUNT));
+
+    expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
+
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    expect(entry).toEqual({
+      action: Action.withdraw,
+      nonceIsVault: true,
+      evmNonce: 0n,
+      inIndex: VALID_WITHDRAW.inIndex,
+      commitment: pureCircuits.ownershipCommitment(VALID_WITHDRAW.inIndex, SECRET_KEY),
+      argsHash: expect.any(Uint8Array) as Uint8Array,
+    });
+    expect(lastSeen).toBe(EVM_START_HEIGHT);
+    expect(ledger(state).withdrawArgsMap.lookup(VALID_WITHDRAW.inIndex)).toEqual({
+      request: VALID_WITHDRAW.withdraw,
+      gas: DEFAULT_VAULT_GAS,
+    });
+    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+    expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
+    expect(ledger(state).globalEvmNonce).toBe(1n);
+  });
+
+  it("start burns the surrendered coin: received by the vault, then paid in full to the burn address", async () => {
+    const { contract, ctx } = await deployInitialised();
+
+    const started = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const zswap = zswapState(started);
+
+    // The receive output's coin info must equal the spent coin's exactly: that
+    // identity lets the transaction builder pair the two into a same-transaction
+    // transient.
+    expect(zswap.inputs).toHaveLength(1);
+    const consumed = first(zswap.inputs, "consumed coin");
+    expect(consumed.color).toEqual(VAULT_TOKEN_COLOR);
+    expect(consumed.value).toBe(AMOUNT);
+
+    expect(zswap.outputs).toHaveLength(2);
+    const received = first(
+      zswap.outputs.filter((output) => !output.recipient.is_left),
+      "contract-owned receive output",
+    );
+    expect(received.recipient.right.bytes).toEqual(VAULT_ADDRESS_BYTES);
+    expect(received.coinInfo).toEqual({
+      nonce: consumed.nonce,
+      color: consumed.color,
+      value: consumed.value,
+    });
+    const burnOutput = first(
+      zswap.outputs.filter((output) => output.recipient.is_left),
+      "burn output",
+    );
+    expect(burnOutput.coinInfo.color).toEqual(VAULT_TOKEN_COLOR);
+    expect(burnOutput.coinInfo.value).toBe(AMOUNT);
+    expect(burnOutput.recipient.left.bytes).toEqual(BURN_ADDRESS_BYTES);
+  });
+
+  it("withdrawals across DIFFERENT ERC20 colours both land, at consecutive vault nonces", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const otherErc20 = bytes(20, 0xab);
+    const otherColor = hexToBytes(
+      rawTokenType(pureCircuits.vaultTokenDomainSeparator(otherErc20), VAULT_ADDRESS),
+    );
+
+    const afterFirst = (await withdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const afterSecond = (
+      await withdraw(contract, afterFirst, {
+        inIndex: VALID_WITHDRAW.inIndex + 1n,
+        withdraw: { erc20Address: otherErc20, amount: AMOUNT, destEvmAddress: DEST_EVM },
+        coin: vaultCoin(AMOUNT, otherColor),
+      })
+    ).context;
+
+    const index = toSignBidirectionalEventIndex(ledgerOf(afterSecond).bidirectionalWithdrawMap);
+    expect([...index.values()].map(({ txParams }) => [txParams.to, txParams.nonce]).sort()).toEqual(
+      [
+        [ERC20, 0n],
+        [otherErc20, 1n],
+      ],
+    );
+    expect(ledgerOf(afterSecond).withdrawArgsMap.size()).toBe(2n);
+  });
+});
+
+describe("vault nonces", () => {
+  it("initialise leaves the vault nonce at 0", async () => {
+    const { ctx } = await deployInitialised();
+    expect(ledgerOf(ctx).globalEvmNonce).toBe(0n);
+  });
+
+  it("one flush assigns two identical withdrawals nonces 0 and 1 in slot order, and both move", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const second = { ...VALID_WITHDRAW, inIndex: VALID_WITHDRAW.inIndex + 1n };
+    const queuedFirst = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const queuedBoth = (await queueWithdraw(contract, queuedFirst, second)).context;
+
+    const flushed = await flush(contract, queuedBoth, [second.inIndex, VALID_WITHDRAW.inIndex], []);
+
+    const state = ledgerOf(flushed);
+    const nonceOf = (inIndex: bigint) =>
+      state.outputRequestBuffer.lookup(flushedRequestKey(state, Action.withdraw, inIndex)).entry
+        .evmNonce;
+    expect(nonceOf(second.inIndex)).toBe(0n);
+    expect(nonceOf(VALID_WITHDRAW.inIndex)).toBe(1n);
+    expect(state.inputRequestBuffer.isEmpty()).toBe(true);
+    expect(state.outputRequestBuffer.size()).toBe(2n);
+    expect(state.globalEvmNonce).toBe(2n);
+  });
+
+  it("a deposit slot leaves the vault nonce unchanged and keeps the depositor's own nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const ownNonce = { ...VALID_DEPOSIT, evmNonce: 5n };
+    const queued = (await queueDeposit(contract, ctx, ownNonce)).context;
+    const outKey = queuedRequestKey(ledgerOf(queued), ownNonce.inIndex);
+
+    const flushed = await flush(contract, queued, [ownNonce.inIndex], []);
+
+    expect(ledgerOf(flushed).outputRequestBuffer.lookup(outKey).entry.evmNonce).toBe(5n);
+    expect(ledgerOf(flushed).globalEvmNonce).toBe(0n);
+  });
+
+  it("a skipped slot burns no nonce: the withdrawal behind a missing index still gets nonce 0", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const missingIndex = 999n;
+
+    const skippedOnly = await flush(contract, queued, [missingIndex], []);
+    expect(ledgerOf(skippedOnly).globalEvmNonce).toBe(0n);
+    expect(ledgerOf(skippedOnly).inputRequestBuffer.member(VALID_WITHDRAW.inIndex)).toBe(true);
+
+    const flushed = await flush(contract, queued, [missingIndex, VALID_WITHDRAW.inIndex], []);
+    const state = ledgerOf(flushed);
+    const outKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
+    expect(state.outputRequestBuffer.lookup(outKey).entry.evmNonce).toBe(0n);
+    expect(state.globalEvmNonce).toBe(1n);
+  });
+
+  it("queuedRequestKey refuses a vault-signed request, whose key waits on its flush", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    expect(() => queuedRequestKey(ledgerOf(queued), VALID_WITHDRAW.inIndex)).toThrow(
+      /vault-signed/,
+    );
+  });
+});
+
+/** One row of the withdraw rejection table: full inputs to expected error. */
+interface WithdrawRejectionCase {
+  /** Test name, completing the sentence "rejects <name>". */
+  name: string;
+  /** Complete call args passed to startWithdraw. */
+  args: WithdrawCallArgs;
+  /** Error startWithdraw must throw. */
+  throws: RegExp;
+}
+
+const WITHDRAW_REJECTION_CASES: WithdrawRejectionCase[] = [
+  {
+    name: "a zero ERC20 address",
+    args: {
+      ...VALID_WITHDRAW,
+      withdraw: { erc20Address: ZERO_ADDRESS, amount: AMOUNT, destEvmAddress: DEST_EVM },
+    },
+    throws: /ERC20 address cannot be zero/,
+  },
+  {
+    name: "a zero destination address",
+    args: {
+      ...VALID_WITHDRAW,
+      withdraw: { erc20Address: ERC20, amount: AMOUNT, destEvmAddress: ZERO_ADDRESS },
+    },
+    throws: /Destination address cannot be zero/,
+  },
+  {
+    name: "a zero amount",
+    args: {
+      ...VALID_WITHDRAW,
+      withdraw: { erc20Address: ERC20, amount: 0n, destEvmAddress: DEST_EVM },
+      coin: vaultCoin(0n),
+    },
+    throws: /Amount must be positive/,
+  },
+  {
+    name: "an amount above Uint<64> max (unrefundable)",
+    args: {
+      ...VALID_WITHDRAW,
+      withdraw: { erc20Address: ERC20, amount: UINT64_MAX + 1n, destEvmAddress: DEST_EVM },
+      coin: vaultCoin(UINT64_MAX + 1n),
+    },
+    throws: /Amount exceeds Uint<64> max/,
+  },
+  {
+    name: "a coin that is not the vault token for this ERC20",
+    args: { ...VALID_WITHDRAW, coin: vaultCoin(AMOUNT, bytes(32, 0x99)) },
+    throws: /Coin is not the vault token for this ERC20/,
+  },
+  {
+    name: "a coin whose value differs from the withdraw amount",
+    args: { ...VALID_WITHDRAW, coin: vaultCoin(AMOUNT - 1n) },
+    throws: /Coin value must equal the withdraw amount/,
+  },
+];
+
+describe("withdraw validation", () => {
+  it.each(WITHDRAW_REJECTION_CASES)("rejects $name", async ({ args, throws }) => {
+    const { contract, ctx } = await deployInitialised();
+    await expect(queueWithdraw(contract, ctx, args)).rejects.toThrow(throws);
+  });
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(queueWithdraw(contract, ctx, VALID_WITHDRAW)).rejects.toThrow(/Not initialised/);
+  });
+
+  it("rejects an index the input buffer holds", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    await expect(queueWithdraw(contract, queued, VALID_WITHDRAW)).rejects.toThrow(
+      /Index already in use/,
+    );
+  });
+
+  it("rejects an index the flush freed while its args stay in withdrawArgsMap", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const flushed = await flush(contract, queued, [VALID_WITHDRAW.inIndex], []);
+    expect(ledgerOf(flushed).inputRequestBuffer.member(VALID_WITHDRAW.inIndex)).toBe(false);
+    await expect(queueWithdraw(contract, flushed, VALID_WITHDRAW)).rejects.toThrow(
+      /Index already in use/,
+    );
+  });
+});
+
+describe("sendWithdraw", () => {
+  it("is permissionless: a stranger sends the withdrawer's request as queued", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const flushed = await flush(contract, queued, [VALID_WITHDRAW.inIndex], []);
+    const outKey = flushedRequestKey(ledgerOf(flushed), Action.withdraw, VALID_WITHDRAW.inIndex);
+
+    const sent = (
+      await contract.circuits.sendWithdraw(await strangerContext("sendWithdraw", flushed), outKey)
+    ).context;
+    const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalWithdrawMap);
+    expect(index.size).toBe(1);
+    const record = first(index.values(), "withdraw request");
+    expect(record.path).toEqual(asciiPadded("vault", 32));
+    expect(record.txParams.nonce).toBe(0n);
+  });
+
+  it("rejects a key the flush has not moved", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    await expect(contract.circuits.sendWithdraw(queued, bytes(32, 0x5a))).rejects.toThrow(
+      /Request not flushed/,
+    );
+  });
+
+  it("rejects a second send of the same request", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const { context: sent, outKey } = await withdraw(contract, ctx, VALID_WITHDRAW);
+    await expect(contract.circuits.sendWithdraw(sent, outKey)).rejects.toThrow(
+      /Request already sent/,
+    );
+  });
+
+  it("rejects a flushed deposit's key, and sendDeposit rejects a flushed withdrawal's", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedDeposit = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
+    const depositKey = queuedRequestKey(ledgerOf(queuedDeposit), VALID_DEPOSIT.inIndex);
+    const queuedBoth = (await queueWithdraw(contract, queuedDeposit, VALID_WITHDRAW)).context;
+    const flushed = await flush(
+      contract,
+      queuedBoth,
+      [VALID_DEPOSIT.inIndex, VALID_WITHDRAW.inIndex],
+      [],
+    );
+    const withdrawKey = flushedRequestKey(
+      ledgerOf(flushed),
+      Action.withdraw,
+      VALID_WITHDRAW.inIndex,
+    );
+
+    await expect(contract.circuits.sendWithdraw(flushed, depositKey)).rejects.toThrow(
+      /Wrong action/,
+    );
+    await expect(contract.circuits.sendDeposit(flushed, withdrawKey)).rejects.toThrow(
+      /Wrong action/,
+    );
+  });
+});
+
+/**
+ * Deploy + initialise + withdraw(VALID_WITHDRAW): the arrange step of every
+ * complete-withdraw test. Returns the sent withdrawal's request id (the single
+ * withdraw map key) alongside the threaded context.
+ */
+const withdrawRequested = async () => {
+  const { contract, ctx } = await deployInitialised();
+  const { context: next } = await withdraw(contract, ctx, VALID_WITHDRAW);
+  const index = toSignBidirectionalEventIndex(ledgerOf(next).bidirectionalWithdrawMap);
+  const idHex = first(index.keys(), "withdraw request id");
+  return { contract, ctx: next, requestId: requestIdBytes(idHex) };
+};
+
+/** Queue a 0-byte (failure) attestation and flush it: the arrange step before a settle. */
+const attestFailure = async (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  attestation: RespondBidirectionalEvent,
+): Promise<CircuitContext<VaultPrivateState>> => {
+  const queued = (await contract.circuits.queueAttestation0(ctx, attestation, OUTPUT_EMPTY))
+    .context;
+  return flush(contract, queued, [], [attestation.requestId]);
+};
+
+/** The shielded mints a circuit run requested, as [token, amount] pairs. */
+const shieldedMintsOf = (ctx: CircuitContext<VaultPrivateState>): [string, bigint][] => [
+  ...ctx.callContext.currentQueryContext.effects.shieldedMints.entries(),
+];
+
+// The mint key completeWithdraw re-mints the surrendered ERC20's vault token under.
+const VAULT_TOKEN_MINT_KEY = bytesToHex(pureCircuits.vaultTokenDomainSeparator(ERC20));
+
+/** Arrange a flushed attestation of the given verdict for the requested withdrawal. */
+interface WithdrawVerdictCase {
+  /** Test name, completing the sentence "<name> and consumes the request". */
+  name: string;
+  /** The verdict the MPC attests. */
+  outputKind: OutputKind;
+  /** The output the MPC signs (empty under a failure kind). */
+  signedOutput: Uint8Array;
+  /** The output completeWithdraw is passed. */
+  presentedOutput: Uint8Array;
+  /** The mints completeWithdraw must request. */
+  mints: [string, bigint][];
+}
+
+const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
+  {
+    name: "a transfer that returned true keeps the burn: mints nothing",
+    outputKind: OutputKind.executed,
+    signedOutput: OUTPUT_SUCCESS,
+    presentedOutput: OUTPUT_SUCCESS,
+    mints: [],
+  },
+  {
+    name: "a transfer that returned false re-mints the surrendered amount",
+    outputKind: OutputKind.executed,
+    signedOutput: OUTPUT_FALSE,
+    presentedOutput: OUTPUT_FALSE,
+    mints: [[VAULT_TOKEN_MINT_KEY, AMOUNT]],
+  },
+  {
+    name: "a reverted transfer (failed) re-mints the surrendered amount",
+    outputKind: OutputKind.failed,
+    signedOutput: OUTPUT_EMPTY,
+    presentedOutput: OUTPUT_IGNORED,
+    mints: [[VAULT_TOKEN_MINT_KEY, AMOUNT]],
+  },
+  {
+    name: "a transfer whose nonce another transaction took (unviable) re-mints the surrendered amount",
+    outputKind: OutputKind.unviable,
+    signedOutput: OUTPUT_EMPTY,
+    presentedOutput: OUTPUT_IGNORED,
+    mints: [[VAULT_TOKEN_MINT_KEY, AMOUNT]],
+  },
+];
+
+describe("completeWithdraw settle", () => {
+  it.each(WITHDRAW_VERDICT_CASES)(
+    "$name and consumes the request",
+    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+      const { contract, ctx, requestId } = await withdrawRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        signedOutput,
+        ATTESTED_HEIGHT,
+      );
+      const attested =
+        outputKind === OutputKind.executed
+          ? await attest(contract, ctx, attestation, signedOutput)
+          : await attestFailure(contract, ctx, attestation);
+
+      const next = (
+        await contract.circuits.completeWithdraw(attested, requestId, presentedOutput, MINT_NONCE)
+      ).context;
+
+      expect(shieldedMintsOf(next)).toEqual(mints);
+      const state = ledgerOf(next);
+      expect(state.bidirectionalWithdrawMap.isEmpty()).toBe(true);
+      expect(state.withdrawArgsMap.isEmpty()).toBe(true);
+      expect(state.outputRequestBuffer.isEmpty()).toBe(true);
+      expect(state.outputAttestationBuffer.isEmpty()).toBe(true);
+      expect(state.evictionMap.isEmpty()).toBe(true);
+    },
+  );
+
+  it.each(WITHDRAW_VERDICT_CASES)(
+    "rejects a caller other than the withdrawer when $name",
+    async ({ outputKind, signedOutput, presentedOutput }) => {
+      const { contract, ctx, requestId } = await withdrawRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        signedOutput,
+        ATTESTED_HEIGHT,
+      );
+      const attested =
+        outputKind === OutputKind.executed
+          ? await attest(contract, ctx, attestation, signedOutput)
+          : await attestFailure(contract, ctx, attestation);
+
+      await expect(
+        contract.circuits.completeWithdraw(
+          await strangerContext("completeWithdraw", attested),
+          requestId,
+          presentedOutput,
+          MINT_NONCE,
+        ),
+      ).rejects.toThrow(/Not the requester/);
+    },
+  );
+
+  it("rejects a false output presented for a transfer attested as returning true", async () => {
+    // Presenting the false byte would re-mint tokens that already left the vault.
+    const { contract, ctx, requestId } = await withdrawRequested();
+    const attested = await attest(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    await expect(
+      contract.circuits.completeWithdraw(attested, requestId, OUTPUT_FALSE, MINT_NONCE),
+    ).rejects.toThrow(/Output does not match the attestation/);
+  });
+
+  it.each([
+    { name: "queueAttestation1", outputKind: OutputKind.executed, output: OUTPUT_SUCCESS },
+    { name: "queueAttestation0", outputKind: OutputKind.failed, output: OUTPUT_EMPTY },
+  ])(
+    "$name refuses an attestation at or below the withdrawal's lastSeen",
+    async ({ outputKind, output }) => {
+      const { contract, ctx, requestId } = await withdrawRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        output,
+        EVM_START_HEIGHT,
+      );
+      await expect(
+        outputKind === OutputKind.executed
+          ? contract.circuits.queueAttestation1(ctx, attestation, output)
+          : contract.circuits.queueAttestation0(ctx, attestation, output),
+      ).rejects.toThrow(/Stale attestation/);
+    },
+  );
+
+  it("settles once: a second completeWithdraw for the same request rejects", async () => {
+    const { contract, ctx, requestId } = await withdrawRequested();
+    const attested = await attestFailure(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.failed, OUTPUT_EMPTY, ATTESTED_HEIGHT),
+    );
+    const next = (
+      await contract.circuits.completeWithdraw(attested, requestId, OUTPUT_IGNORED, MINT_NONCE)
+    ).context;
+    await expect(
+      contract.circuits.completeWithdraw(next, requestId, OUTPUT_IGNORED, MINT_NONCE),
+    ).rejects.toThrow(/Request not sent/);
+  });
+});
+
+describe("cross-action settle isolation", () => {
+  it("completeWithdraw rejects a deposit's request id, and completeDeposit a withdrawal's", async () => {
+    const { contract, ctx, requestId: depositId } = await depositRequested();
+    const { context: withdrawn } = await withdraw(contract, ctx, VALID_WITHDRAW);
+    const withdrawId = requestIdBytes(
+      first(
+        toSignBidirectionalEventIndex(ledgerOf(withdrawn).bidirectionalWithdrawMap).keys(),
+        "withdraw request id",
+      ),
+    );
+    const depositQueued = (
+      await contract.circuits.queueAttestation1(
+        withdrawn,
+        respond(
+          MPC_RESPONSE_SECRET,
+          depositId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      )
+    ).context;
+    const bothQueued = (
+      await contract.circuits.queueAttestation1(
+        depositQueued,
+        respond(
+          MPC_RESPONSE_SECRET,
+          withdrawId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      )
+    ).context;
+    const attested = await flush(contract, bothQueued, [], [depositId, withdrawId]);
+
+    await expect(
+      contract.circuits.completeWithdraw(attested, depositId, OUTPUT_SUCCESS, MINT_NONCE),
+    ).rejects.toThrow(/Wrong action/);
+    await expect(
+      contract.circuits.completeDeposit(
+        attested,
+        withdrawId,
+        OUTPUT_SUCCESS,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+    ).rejects.toThrow(/Wrong action/);
+  });
+});
+
 interface VaultCall {
   contractAddress: string;
   publicTranscript: unknown;
@@ -1033,6 +1713,50 @@ describe("throughput: requests never pin shared state, only the flush does", () 
     expect(ledgerOf(flushed).inputRequestBuffer.member(repeat.inIndex)).toBe(true);
     expect(ledgerOf(flushed).inputRequestBuffer.member(other.inIndex)).toBe(false);
     expect(ledgerOf(flushed).outputRequestBuffer.member(otherKey)).toBe(true);
+  });
+
+  it("two concurrent startWithdraws from different callers both apply", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const alice = await queueWithdraw(contract, ctx, VALID_WITHDRAW);
+    const stateAfterAlice = stateOf(alice.context);
+    const bobCtx = await strangerContext("startWithdraw", ctx);
+    const bob = await queueWithdraw(contract, bobCtx, {
+      ...VALID_WITHDRAW,
+      inIndex: VALID_WITHDRAW.inIndex + 1n,
+    });
+    expect(replay(stateAfterAlice, bob, true)).toBe("applied");
+  });
+
+  it("a deposit-only flush applies after a concurrent flush moved the vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedDeposit = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
+    const queuedBoth = (await queueWithdraw(contract, queuedDeposit, VALID_WITHDRAW)).context;
+    const withdrawFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([VALID_WITHDRAW.inIndex], []),
+    );
+    const depositFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([VALID_DEPOSIT.inIndex], []),
+    );
+    expect(ledgerOf(withdrawFlush.context).globalEvmNonce).toBe(1n);
+    expect(replay(stateOf(withdrawFlush.context), depositFlush, true)).toBe("applied");
+  });
+
+  it("two flushes that each move a withdrawal conflict on the vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const second = { ...VALID_WITHDRAW, inIndex: VALID_WITHDRAW.inIndex + 1n };
+    const queuedFirst = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const queuedBoth = (await queueWithdraw(contract, queuedFirst, second)).context;
+    const firstFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([VALID_WITHDRAW.inIndex], []),
+    );
+    const secondFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([second.inIndex], []),
+    );
+    expect(replay(stateOf(firstFlush.context), secondFlush, true)).toMatch(/^REJECTED/);
   });
 });
 
@@ -1208,6 +1932,35 @@ describe("setGasParams", () => {
 });
 
 describe("gas parameters reach the constructed transaction", () => {
+  it("sendWithdraw carries the updated fee envelope and the WITHDRAW gas limit", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const configured = (await setGasParams(contract, ctx, NEW_GAS_PARAMS)).context;
+
+    const next = (await withdraw(contract, configured, VALID_WITHDRAW)).context;
+
+    expect(envelopeOf(ledgerOf(next).bidirectionalWithdrawMap)).toEqual({
+      maxFeePerGas: NEW_MAX_FEE_PER_GAS,
+      maxPriorityFeePerGas: NEW_MAX_PRIORITY_FEE_PER_GAS,
+      gasLimit: NEW_WITHDRAW_GAS_LIMIT,
+    });
+  });
+
+  it("a withdrawal keeps the gas it was queued with when setGasParams runs before its send", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const flushed = await flush(contract, queued, [VALID_WITHDRAW.inIndex], []);
+    const outKey = flushedRequestKey(ledgerOf(flushed), Action.withdraw, VALID_WITHDRAW.inIndex);
+    const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
+
+    const sent = (await contract.circuits.sendWithdraw(reconfigured, outKey)).context;
+
+    expect(envelopeOf(ledgerOf(sent).bidirectionalWithdrawMap)).toEqual({
+      maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
+      maxPriorityFeePerGas: DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+      gasLimit: DEFAULT_WITHDRAW_GAS_LIMIT,
+    });
+  });
+
   it("sendDeposit is UNAFFECTED: the deposit carries the CALLER's own gas arguments", async () => {
     const { contract, ctx } = await deployInitialised();
     const configured = (await setGasParams(contract, ctx, NEW_GAS_PARAMS)).context;

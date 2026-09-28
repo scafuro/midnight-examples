@@ -85,8 +85,16 @@ over any commit, including one named elsewhere in this repo's history.
 4. `examples/erc20-vault/contract/src/vault-queue.ts`: how clients flush.
 5. The deposit flows: `integration-tests/src/flows/start-deposit.ts`,
    `complete-deposit.ts`, `deposit-round-trip.ts`, `vault-queue.ts`.
-6. Your action's section of the OLD contract, plus its old flows, unit test
-   blocks and e2e specs (its task in section 5 names them).
+6. `/Users/bernard/Projects/github.com/sig-net/midnight-examples-refactor-contention-handling/porting-packs/knowledge.md`,
+   when it exists: how the current code, tests and flows fit together, as
+   learned by the agents before you.
+7. Your task's port pack,
+   `/Users/bernard/Projects/github.com/sig-net/midnight-examples-refactor-contention-handling/porting-packs/<task>.md`
+   (for example `P2a.md`). It holds the old contract's declarations for your
+   action verbatim, and the exact line ranges of the old unit test blocks,
+   flows and e2e specs to port. Read those ranges in the old worktree. Both
+   files live only in the integrator's worktree and are read only. You may
+   research beyond them whenever they leave a question open.
 
 ### 1.4 Toolchain and commands
 
@@ -128,7 +136,7 @@ These were learned the hard way while building deposit. Treat them as facts.
   ledger tree and puts the last 15 fields in the last chunk, so adding any
   field shifts where chunk 0 ends and moves the path of every field. Each send
   circuit's MPC notification carries its event map's path as a hand-written
-  vector (`[1, 12, 0, 0]`), and `index.ts` exports it as a constant. After any
+  vector (`[chunk, offset, 0, 0]`), and `index.ts` exports it as a constant. After any
   ledger change: recompile, read `contract-info.json`, and update every
   notification vector, every exported path constant and every row of
   `ledger-paths.test.ts`. A stale vector does not fail to compile. The MPC
@@ -166,6 +174,10 @@ These were learned the hard way while building deposit. Treat them as facts.
   instead. A start flow must wait for its own entry to leave
   `inputRequestBuffer`, never for its request key to appear in
   `outputRequestBuffer`, which an open twin already satisfies.
+- **Old e2e specs understate the vault's gas.** They budgeted vault
+  transactions with the `ERC20_TRANSFER_*` constants, which describe a
+  deposit's caller-chosen gas. The vault signs at its own settings, five times
+  higher by default. Budget vault-signed preflights with `vaultGasEnvelope`.
 - **Unfunded test identities** cannot pay for a queue or flush transaction.
   Arrange those steps with the funded session.
 - **The proof server** needs a 16 GB Docker VM and still gets OOM-killed after
@@ -344,6 +356,12 @@ No gate, no argument besides the key: the entry and args fix every byte.
   requests never collide and never wait as twins.
 - Sends are permissionless, so any flushed vault request can always be sent.
   No set of "unsent nonces" exists and none is needed.
+- **The SDK side is already built** (`contract/src/vault-queue.ts`).
+  `queuedRequestKey` works for caller-signed entries only and throws for a
+  vault-signed one, whose key covers a nonce only the flush assigns. Read a
+  vault-signed request's key after its flush with
+  `flushedRequestKey(state, Action.<x>, inIndex)`. `movableItems` never treats
+  a vault-signed request as a twin. A port changes nothing in this file.
 
 ### 2.6 Naming
 
@@ -388,8 +406,13 @@ and stay in Configuration.
 
 Every complete re-mints to `left(ownPublicKey())`, the caller, except
 deposit's success mint, which takes an optional `recipient`. Every complete is
-requester-gated through `settleRequest`, the approvals and replaceNonce by the
-deployer who started them.
+requester-gated through `settleRequest` in every branch, success included, the
+approvals and replaceNonce by the deployer who started them.
+
+The address fields each start asserts non-zero: withdraw `erc20Address` and
+`destEvmAddress`, the router approval `erc20Address`, swap `erc20AddressIn` and
+`erc20AddressOut`. Supply, redeem and the stata approval take no address: the
+contract fixes theirs.
 
 The widths 8 need `queueAttestation8`. Whichever task first needs it adds it
 to the Request queue section with exactly this code, so two parallel copies
@@ -487,8 +510,9 @@ Each port task includes, for its action:
 - **Deploy:** the provable circuit count in `deploy/tests/deploy-vault.test.ts`.
 - **Unit tests:** the old describe blocks ported to the new circuits, plus
   new cases for anything the table in section 3 makes new.
-- **Flows:** `start-<x>.ts`, `complete-<x>.ts`, `<x>-round-trip.ts`, ported
-  from the old flows and shaped like the deposit flows.
+- **Flows:** `start-<x>.ts` and `complete-<x>.ts`, ported from the old flows
+  and shaped like the deposit and withdraw flows. Add `<x>-round-trip.ts` only
+  when a spec calls it: an unused flow is dead code.
 - **e2e:** the spec, added to the pinned order in
   `integration-tests/vitest.config.ts`.
 - **Design doc:** any change to `docs/contention-handling.md` the port makes
@@ -514,6 +538,9 @@ Each port task includes, for its action:
 4. `grep -n "SettleView\|Binder\|unflushed\|refund[A-Z]" examples/erc20-vault/contract/src/erc20-vault.compact`
    returns nothing.
 5. No new ESLint disables, no `any`, JSDoc on every new export.
+6. **Mutation check:** for each new branch or assert in the contract, break it
+   on purpose, confirm a unit test fails, then restore it and recompile. The
+   hand-back lists what was broken and which test caught it.
 
 **Integration criteria, common to every task (the integrator runs these):**
 
@@ -543,11 +570,11 @@ Each port task includes, for its action:
   4. Hoist `flushDepositAttestation` out of `complete-deposit.ts` into
      `flows/queue-attestation.ts` as `queueAndFlushAttestation(context, outcome)`,
      used by deposit and withdraw (withdraw is its second consumer, and the
-     deposit name stops being true). It picks `queueAttestation0`, `1` or `8`
-     from the output's length. Update every caller, including
-     `deposit-round-trip.ts`.
-  5. Port the three e2e specs. The deposit failure path now closes through
-     `completeDeposit`.
+     deposit name stops being true). It picks `queueAttestation0` or `1` from
+     the output's length. The first width-8 port widens it. Update every
+     caller, including `deposit-round-trip.ts`.
+  5. Port the three e2e specs. The withdraw failure path re-mints through
+     `completeWithdraw`.
   6. Update `docs/contention-handling.md`: the Vault-signed requests section
      describes what now exists, not a plan.
 - **Extra offline criteria:**
@@ -645,7 +672,7 @@ Each port task includes, for its action:
     "refundSwap settle".
   - The old e2e `swap-e2e.test.ts` and `swap-refund-e2e.test.ts`.
 - **Work:** per the table in section 3. Adds `queueAttestation8` if it is
-  absent.
+  absent, and widens `queueAndFlushAttestation` to width 8 if not yet done.
 - **Extra offline criteria:**
   - `completeSwap` asserts `changeNonce != mintNonce`.
   - An exact spend mints a zero-value change coin, as before.
@@ -663,7 +690,7 @@ Each port task includes, for its action:
   - The old e2e: the supply half of `supply-redeem-e2e.test.ts`, and
     `supply-refund-e2e.test.ts`.
 - **Work:** per the table in section 3. Adds `queueAttestation8` if it is
-  absent.
+  absent, and widens `queueAndFlushAttestation` to width 8 if not yet done.
 
 ### Phase 3
 
@@ -765,14 +792,15 @@ worktree.
 ### 6.3 What a task agent may and may not do
 
 - **May:** edit, compile without zk, run the offline gate, read anything in
-  the old worktree, and commit locally on its own branch.
+  the old worktree, read `porting-packs/` in the integrator's worktree, and
+  commit locally on its own branch.
 - **May not:**
   - run `docker`, `yarn compile:erc20-vault:zk` or any e2e
   - touch `.env`
   - push
   - compile in another worktree
   - change the Request queue section beyond the verbatim
-    `queueAttestation8`
+    `queueAttestation8` (P0 alone builds there)
   - change another action's section.
 
 ### 6.4 Handing back

@@ -6,9 +6,11 @@
 // EVM chain and shielded tokens on Midnight, with the Signet Distributed MPC network
 // executing the EVM side. See ../../README.md for the full integration walkthrough.
 //
-// Contention: flushQueue is the ONLY circuit that reads or writes globalLastSeen.
-// Every other circuit touches only entries keyed by its own request, so user calls
-// never conflict with each other or with a flush. See ../docs/contention-handling.md.
+// Contention: apart from initialise setting globalLastSeen once, flushQueue is the ONLY
+// circuit that reads or writes globalLastSeen and globalEvmNonce. Every other circuit
+// touches only entries keyed by its own request, so user calls never conflict with each
+// other or with a flush.
+// See ../docs/contention-handling.md.
 //
 // Layout: configuration, then the request queue every action shares, then one section
 // per action holding its request types, its ledger fields and its circuits.
@@ -184,10 +186,10 @@ export circuit setGasParams(
 // attestation, flush the attestation, complete. This section holds the machinery the
 // steps share. Each action's own section holds its start, send and complete circuits.
 
-// `reserved` keeps the enum at two variants: a one-variant enum in a hashed struct
-// compiles to a field element the ledger parses as zero bytes, and proofs then fail
-// the proof server's alignment check.
-export enum Action { deposit, reserved }
+// Keep at least two variants: a one-variant enum in a hashed struct compiles to a
+// field element the ledger parses as zero bytes, and proofs then fail the proof
+// server's alignment check.
+export enum Action { deposit, withdraw }
 
 // The EIP-1559 fee envelope of a request's EVM transaction, fixed at start.
 export struct GasParams {
@@ -200,7 +202,8 @@ export struct GasParams {
 // own arguments live in its args map under inIndex, and argsHash commits to them.
 export struct RequestBufferEntry {
   action: Action;
-  // false: evmNonce is the caller's own nonce, taken verbatim.
+  // false: evmNonce is the caller's own nonce, taken verbatim. true: the vault's account
+  // signs, and the flush overwrites evmNonce with the vault's next nonce.
   nonceIsVault: Boolean;
   evmNonce: Uint<64>;
   // The key of the entry in inputRequestBuffer and of its args in the action's args
@@ -237,6 +240,10 @@ export struct FlushSlot {
 
 // The highest block height of any attestation the flush has folded.
 export ledger globalLastSeen: Uint<64>;
+
+// The vault EVM account's next nonce. Starts at 0: each deployment derives a fresh
+// account from its own contract address.
+export ledger globalEvmNonce: Uint<64>;
 
 export ledger inputRequestBuffer: Map<Uint<64>, RequestBufferEntry>;
 export ledger outputRequestBuffer: Map<Bytes<32>, OutputRequestEntry>;
@@ -291,11 +298,17 @@ export circuit flushQueue(slots: Vector<10, FlushSlot>): [] {
 // A slot naming an index that is not queued is a no-op. So is one whose twin (same
 // requestKey) is still open: the twin stays queued until the open request settles.
 // The twin check must precede the remove, as a skipped slot commits whatever ran.
+// A vault-signed entry takes globalEvmNonce BEFORE its key is computed, so its key is
+// unique, and the nonce advances only once the entry moves: the first vault request
+// gets nonce 0, and a skipped slot never burns one.
 circuit flushRequest(inIndex: Uint<64>): [] {
   if (!inputRequestBuffer.member(inIndex)) {
     return;
   }
-  const entry = inputRequestBuffer.lookup(inIndex);
+  const queued = inputRequestBuffer.lookup(inIndex);
+  const entry = queued.nonceIsVault
+    ? RequestBufferEntry { ...queued, evmNonce: globalEvmNonce }
+    : queued;
   const outKey = requestKey(entry);
   if (outputRequestBuffer.member(outKey)) {
     return;
@@ -305,6 +318,9 @@ circuit flushRequest(inIndex: Uint<64>): [] {
     entry: entry,
     lastSeen: globalLastSeen,
   });
+  if (entry.nonceIsVault) {
+    globalEvmNonce = (globalEvmNonce + 1) as Uint<64>;
+  }
 }
 
 // A slot naming a request id with no queued attestation is a no-op.
@@ -426,7 +442,7 @@ export struct DepositArgs {
 }
 
 // Deposit requests (2-word ERC20 transfer, 34-byte schemas).
-// Compiled path for MPC notification: [1, 12] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [1, 11] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalDepositMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the deposit queued under it, from start to complete.
@@ -518,11 +534,11 @@ export circuit sendDeposit(outKey: Bytes<32>): [] {
   bidirectionalDepositMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [1, 12]).
+  // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [1, 11]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [1, 12, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [1, 11, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -586,5 +602,156 @@ export struct WithdrawArgs {
   gas: GasParams;
 }
 
+// Withdraw requests (2-word ERC20 transfer, 34-byte schemas).
+// Compiled path for MPC notification: [1, 13] (read from managed/erc20-vault/compiler/contract-info.json).
+export ledger bidirectionalWithdrawMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
+
 // inIndex -> the arguments of the withdrawal queued under it, from start to complete.
 export ledger withdrawArgsMap: Map<Uint<64>, WithdrawArgs>;
+
+circuit withdrawArgsHash(args: WithdrawArgs): Bytes<32> {
+  return upgradeFromTransient(transientHash<[Bytes<32>, WithdrawArgs]>([
+    pad(32, "vault:withdraw:args"),
+    args
+  ]));
+}
+
+// Queues the withdrawal under inIndex, a caller-chosen random index, and burns the
+// surrendered vault coin: the coin spend is the authorisation. The vault's account
+// signs and pays, so the gas is the vault's own setting at start.
+export circuit startWithdraw(
+  inIndex: Uint<64>,
+  withdrawRequest: WithdrawRequest,
+  coin: ShieldedCoinInfo
+): [] {
+  requireInitialised();
+  assert(withdrawRequest.erc20Address as Field != 0 as Field, "ERC20 address cannot be zero");
+  assert(withdrawRequest.destEvmAddress as Field != 0 as Field, "Destination address cannot be zero");
+  assert(withdrawRequest.amount > 0 as Uint<128>, "Amount must be positive");
+  // completeWithdraw re-mints via a Uint<64> API, so reject unrefundable amounts.
+  assert(withdrawRequest.amount <= 18446744073709551615 as Uint<128>, "Amount exceeds Uint<64> max");
+
+  assert(
+    coin.color == tokenType(vaultTokenDomainSeparator(withdrawRequest.erc20Address), kernel.self()),
+    "Coin is not the vault token for this ERC20"
+  );
+  assert(coin.value == withdrawRequest.amount, "Coin value must equal the withdraw amount");
+  receiveShielded(disclose(coin));
+  sendImmediateShielded(disclose(coin), shieldedBurnAddress(), disclose(coin).value);
+
+  const disclosedIndex = disclose(inIndex);
+  assert(
+    !inputRequestBuffer.member(disclosedIndex) && !withdrawArgsMap.member(disclosedIndex),
+    "Index already in use"
+  );
+
+  const args = disclose(WithdrawArgs {
+    request: withdrawRequest,
+    gas: GasParams {
+      gasLimit: vaultGasLimits.withdraw,
+      maxFeePerGas: vaultMaxFeePerGas,
+      maxPriorityFeePerGas: vaultMaxPriorityFeePerGas,
+    },
+  });
+  withdrawArgsMap.insert(disclosedIndex, args);
+  inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
+    action: Action.withdraw,
+    nonceIsVault: true,
+    evmNonce: 0 as Uint<64>,
+    inIndex: inIndex,
+    commitment: ownershipCommitment(inIndex, callerSecretKey()),
+    argsHash: withdrawArgsHash(args),
+  }));
+}
+
+// Records the flushed withdrawal's SignBidirectionalEvent and notifies the MPC.
+// Permissionless: the entry and its args fix every byte of the EVM transaction, so a
+// second send of the same entry names the same request id and is refused.
+export circuit sendWithdraw(outKey: Bytes<32>): [] {
+  requireInitialised();
+  const disclosedKey = disclose(outKey);
+  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  assert(entry.action == Action.withdraw, "Wrong action");
+  const args = withdrawArgsMap.lookup(entry.inIndex);
+  const calldata = EvmCalldata<2> {
+    selector: Bytes [0xa9, 0x05, 0x9c, 0xbb], // transfer(address,uint256)
+    noWords: 2 as Uint<16>,
+    words: [
+      evmAddressAbiWord(args.request.destEvmAddress),
+      numericAbiWord(args.request.amount),
+    ]
+  };
+  const txParams = EvmType2TxParams<2, 0, 0> {
+    chainId: evmChainId,
+    nonce: entry.evmNonce,
+    maxPriorityFeePerGas: args.gas.maxPriorityFeePerGas,
+    maxFeePerGas: args.gas.maxFeePerGas,
+    gasLimit: args.gas.gasLimit,
+    to: args.request.erc20Address,
+    value: 0 as Uint<128>,
+    calldata: some<EvmCalldata<2>>(calldata),
+    accessListEntryCount: 0,
+    accessList: []
+  };
+  const schema = vaultResponseSchema();
+  const request = constructSignBidirectionalEventV1<EvmType2TxParams<2, 0, 0>, 34, 34>(
+    mpcKeyVersion, kernel.self(), pad(32, "vault"),
+    MPCSignatureAlgorithm.ecdsa, TxParamType.evmType2, txParams, ethereumCaip2Id(),
+    MPCDestination.unused, pad(64, ""), schema, schema
+  );
+  const requestId = calculateEvmType2RequestIdV1<2, 0, 0, 34, 34>(request);
+  assert(!bidirectionalWithdrawMap.member(requestId), "Request already sent");
+  bidirectionalWithdrawMap.insert(requestId, request);
+  evictionMap.insert(requestId, disclosedKey);
+
+  // Notify the MPC (bidirectionalWithdrawMap's compiled ledger path, [1, 13]).
+  signetSigner.signBidirectional(
+    requestId,
+    constructSignBidirectionalEventNotificationV1(
+      kernel.self(), 2 as Uint<8>, [1, 13, 0, 0] as Vector<4, Uint<8>>,
+    ),
+  );
+}
+
+// Settles a withdrawal on either verdict. Executed: checks the output against the
+// attestation. A transfer that returned true moved the tokens, so the burn stands. One
+// that returned false, or a failed or unviable transaction, moved nothing, so the
+// surrendered amount is re-minted to the caller, and on a failure serializedOutput is
+// ignored. Withdrawer-gated, one settle per request. mintNonce must be caller-chosen
+// RANDOM: one derived from the (public) requestId would link the re-minted coin to the
+// withdrawal.
+export circuit completeWithdraw(
+  requestId: RequestId,
+  serializedOutput: Bytes<1>,
+  mintNonce: Bytes<32>,
+): [] {
+  requireInitialised();
+  const disclosedId = disclose(requestId);
+  const settled = settleRequest(disclosedId, Action.withdraw);
+  const entry = settled[0];
+  const record = settled[1];
+  const args = withdrawArgsMap.lookup(entry.inIndex);
+  withdrawArgsMap.remove(entry.inIndex);
+  assert(bidirectionalWithdrawMap.member(disclosedId), "Request event missing");
+  bidirectionalWithdrawMap.remove(disclosedId);
+
+  const executed = record.outputKind == OutputKind.executed;
+  const output = disclose(serializedOutput);
+  if (executed) {
+    assert(
+      calculateSignetAttestationDigestV1<1>(
+        disclosedId, record.blockHeight, record.outputKind, output
+      ) == record.digest,
+      "Output does not match the attestation"
+    );
+  }
+  if (!executed || !deserialize<VaultResponse, 1>(output).success) {
+    mintShieldedToken(
+      vaultTokenDomainSeparator(args.request.erc20Address),
+      args.request.amount as Uint<64>,
+      disclose(mintNonce),
+      left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey())
+    );
+  }
+}

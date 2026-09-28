@@ -23,6 +23,7 @@ The price of a lost race is the losing flush's fee.
 | Cell             | Read and written by              | Holds                                                            |
 | ---------------- | -------------------------------- | ---------------------------------------------------------------- |
 | `globalLastSeen` | `flushQueue` (and `initialise`)  | the highest block height of any attestation the flush has folded |
+| `globalEvmNonce` | `flushQueue`                     | the vault EVM account's next nonce                               |
 
 `globalLastSeen` is the safety bound every settlement checks: an attestation
 settles a request only if it comes from a block strictly above every height the
@@ -30,8 +31,10 @@ vault had seen when it accepted that request (see
 [The last seen height](#the-last-seen-height)). `initialise` sets it to the
 current EVM height.
 
-Requests signed by the vault's own EVM account add a second flush-only cell,
-the vault's next EVM nonce (see [Vault-signed requests](#vault-signed-requests)).
+`globalEvmNonce` hands each request the vault's own account signs a nonce no
+other request holds (see [Vault-signed requests](#vault-signed-requests)). It
+starts at 0, as every deployment derives a fresh vault account from its own
+contract address.
 
 ## Buffers
 
@@ -53,7 +56,9 @@ carries:
 
 - **The action.**
 - **The nonce.** `nonceIsVault` is `false` for a deposit: `evmNonce` is the
-  depositor's own account nonce, taken verbatim.
+  depositor's own account nonce, taken verbatim. It is `true` for a withdrawal,
+  which the vault's account signs: the start writes 0, and the flush replaces
+  it with the vault's next nonce.
 - **The input index** it was queued under, which is public already.
 - **An ownership commitment**, `ownershipCommitment(inIndex, secret key)`. The
   complete circuit recomputes it from the stored index and the caller's
@@ -63,9 +68,11 @@ carries:
 The arguments themselves live in the action's own args map, keyed by the input
 index: `depositArgsMap` holds each deposit's `DepositArgs` (the
 `DepositRequest`, the MPC derivation path of the depositor's EVM account, and
-the gas envelope). The start circuit writes them, the send and complete
-circuits read them, and the complete circuit removes them. The flush never
-touches them, so its cost does not grow with the actions the vault supports.
+the gas envelope), and `withdrawArgsMap` each withdrawal's `WithdrawArgs` (the
+`WithdrawRequest` and the vault's gas envelope at start). The start circuit
+writes them, the send and complete circuits read them, and the complete circuit
+removes them. The flush never touches them, so its cost does not grow with the
+actions the vault supports.
 The start circuit refuses an index that either the input buffer or its args
 map already holds.
 
@@ -131,7 +138,9 @@ flushes touch shared state.
 `flushQueue` takes a vector of 10 slots. Each slot names a channel and a key:
 
 - **Request slot.** Moves one entry from `inputRequestBuffer` to
-  `outputRequestBuffer`, recording `globalLastSeen` as its `lastSeen`.
+  `outputRequestBuffer`, recording `globalLastSeen` as its `lastSeen`. A
+  vault-signed entry also takes `globalEvmNonce` as its nonce, which then
+  advances by one.
 - **Attestation slot.** Moves one record from `inputAttestationBuffer` to
   `outputAttestationBuffer` and folds its block height into `globalLastSeen`.
 - **Empty slot.** Does nothing, so a flush with fewer than 10 waiting items is
@@ -158,18 +167,23 @@ it to would make it read a count that every start writes, and every start would
 then conflict with every flush.
 
 Two flushes built against the same state conflict when they carry a common
-item, or when one raises `globalLastSeen` and the other read it (every slot
-that moves an item reads it). One of them lands, and the other is rebuilt and
+item, when one raises `globalLastSeen` and the other read it (every slot that
+moves an item reads it), or when both move a vault-signed request (each reads
+and advances `globalEvmNonce`). A slot that moves a caller-signed request never
+reads `globalEvmNonce`. One of them lands, and the other is rebuilt and
 resubmitted. Only the flusher ever retries. Users' own transactions never fail
 because of a flush.
 
 The SDK's `flushPending` fills the slots from the ledger, up to 10 items: the
 items its caller names first, then queued attestations, then queued requests,
-each in ledger order. It leaves out a request whose twin is open, or whose
-request key an earlier request in the batch already takes, as the flush would
-skip it, and it submits nothing when no item would move. So another user's
-waiting repeats cannot fill a caller's flush, and `flushUntil` puts the items
-the caller waits for into every flush it submits.
+each in ledger order. It leaves out a caller-signed request whose twin is open,
+or whose request key an earlier request in the batch already takes, as the
+flush would skip it, and it submits nothing when no item would move. A
+vault-signed request is never left out: its key covers the nonce the flush
+assigns, so it has no twin, and for the same reason its key is known only after
+its flush (`flushedRequestKey` reads it). So another user's waiting repeats
+cannot fill a caller's flush, and `flushUntil` puts the items the caller waits
+for into every flush it submits.
 
 The SDK's `flushPending` submits every flush with its whole transcript in the
 transaction's fallible section, which runs after the fee is paid. Before taking
@@ -247,7 +261,8 @@ the record's storage is width-independent.
 ## Invariants the circuits keep
 
 - **Only the flush writes shared state.** No circuit other than `flushQueue`
-  and `initialise` reads or writes `globalLastSeen`.
+  and `initialise` reads or writes `globalLastSeen`, and none other than
+  `flushQueue` reads or writes `globalEvmNonce`.
 - **Only the flush inserts into an output buffer.** Send writes the event map
   and `evictionMap`, and the complete circuit only removes.
 - **The flush never touches arguments.** An action's arguments go into its
@@ -271,24 +286,36 @@ the record's storage is width-independent.
 
 ## Vault-signed requests
 
-The contract does not carry these requests yet. This section is the design
-they follow.
-
-Requests signed by the vault's own EVM account (withdraw, swap, supply, redeem
-and the approvals) need the account's next nonce, and no two may get the same
-one. That nonce is the second shared cell, and it follows the same rule: the
-flush is its only reader and writer.
+A withdrawal is signed by the vault's own EVM account, so it needs the
+account's next nonce, and no two requests may get the same one. That nonce is
+the second shared cell, and it follows the same rule: the flush is its only
+reader and writer.
 
 - **A request slot assigns it.** An entry with `nonceIsVault` set takes the
-  current vault nonce, and the flush then increments it. Assigning before
-  incrementing matters: the first vault request must receive the account's
-  next unused nonce, or every later vault transaction waits behind a nonce no
-  request ever uses.
+  current `globalEvmNonce` before its request key is computed, and the cell
+  advances only once the entry moves. Assigning before advancing gives the
+  first vault request nonce 0, the account's next unused nonce: any other start
+  would leave every later vault transaction waiting behind a nonce no request
+  uses. A skipped slot advances nothing, so it never burns a nonce.
 - **Such requests never collide.** Each carries a nonce the flush assigned
-  once, so their request keys are unique.
-- **A stuck nonce is replaced through the flush.** A replacement names an
-  already-issued nonce, and its flush slot checks it against the current vault
-  nonce, never reading the cell outside the flush.
+  once, so their request keys are unique and they never wait as twins, even
+  when two withdrawals are otherwise identical.
+- **Every flushed vault request can be sent.** Sends are permissionless, so a
+  nonce the flush assigned never waits on its requester to reach the MPC.
+
+The withdraw lifecycle is the deposit's six steps with three differences:
+
+1. **Start.** `startWithdraw` takes the input index, the `WithdrawRequest` and
+   the vault coin of the ERC20, whose value must equal the amount. It burns the
+   coin, copies the vault's gas settings into `withdrawArgsMap`, and queues the
+   entry with `nonceIsVault` set.
+2. **Send.** `sendWithdraw` builds `transfer(destEvmAddress, amount)` on the
+   ERC20 with the derivation path `"vault"` and the nonce the flush assigned,
+   and records it in `bidirectionalWithdrawMap`.
+3. **Complete.** `completeWithdraw` settles every verdict. A transfer that
+   returned true moved the tokens, so the burn stands. One that returned false,
+   failed or was unviable moved nothing, so it re-mints the burned amount to
+   the withdrawer.
 
 ## Costs
 
@@ -303,7 +330,9 @@ flush is its only reader and writer.
   number of users.
 - **No gas bump.** A request's gas is fixed at start, so a deposit queued with
   too little gas to be mined stays pending until the network fee falls to meet
-  it.
+  it. A vault-signed request is fixed to the vault's gas settings at its start,
+  and while its transaction waits, every later vault transaction waits behind
+  its nonce.
 - **No cancel.** No circuit closes an open request without an attestation that
   passes the bound. A request that is sent but never mined, or attested stale,
   stays in `outputRequestBuffer`, and it keeps its identical repeats in

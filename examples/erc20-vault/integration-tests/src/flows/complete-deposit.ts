@@ -5,23 +5,15 @@
 
 import { type CoinPublicKey, encodeCoinPublicKey } from "@midnight-ntwrk/compact-runtime";
 import { withContractScopedTransaction } from "@midnight-ntwrk/midnight-js/contracts";
-import {
-  OutputKind,
-  type RequestIdHex,
-  requestIdHex,
-  respondBidirectionalEventToCircuitInput,
-} from "@sig-net/midnight";
+import { OutputKind, type RequestIdHex, requestIdHex } from "@sig-net/midnight";
 import type { EncPublicKey } from "@sig-net/midnight-contract-deploy";
-import {
-  readVaultLedger,
-  VAULT_DEPOSIT_REQUESTS_PATH,
-} from "@sig-net/midnight-examples-erc20-vault-contract";
+import { VAULT_DEPOSIT_REQUESTS_PATH } from "@sig-net/midnight-examples-erc20-vault-contract";
 
 import { POLL_TIMEOUT_MS } from "../poll-timeout.ts";
 import type { VaultContext } from "../vault-context.ts";
 import { pollRespondBidirectional } from "./poll-respond-bidirectional.ts";
+import { queueAndFlushAttestation } from "./queue-attestation.ts";
 import type { RespondOutcome } from "./respond-output.ts";
-import { flushUntil } from "./vault-queue.ts";
 
 /**
  * A shielded wallet the vault can mint to. Both halves of the key pair are
@@ -38,45 +30,7 @@ export interface ShieldedTokenRecipient {
 }
 
 /**
- * Queue a resolved deposit outcome's attestation (the event in circuit-input
- * form and the output bytes its signature verified over) with the queue
- * circuit for the output's width, and flush until the vault holds it under the
- * request id. Both steps are permissionless, and the caller's wallet pays for
- * them. A rerun finds the attestation already queued or flushed and carries on
- * from there.
- *
- * @param context - The flow context.
- * @param outcome - The attested outcome from {@link pollRespondBidirectional}.
- * @throws {Error} If the attestation does not reach `outputAttestationBuffer`.
- */
-export async function flushDepositAttestation(
-  context: VaultContext,
-  outcome: RespondOutcome,
-): Promise<void> {
-  const requestId = outcome.event.requestId;
-  const ledger = await readVaultLedger(
-    context.providers.publicDataProvider,
-    context.vaultContractAddress,
-  );
-  if (
-    !ledger.inputAttestationBuffer.member(requestId) &&
-    !ledger.outputAttestationBuffer.member(requestId)
-  ) {
-    const attestation = respondBidirectionalEventToCircuitInput(outcome.event);
-    const queued =
-      outcome.serializedOutput.length === 0
-        ? await context.vault.callTx.queueAttestation0(attestation, outcome.serializedOutput)
-        : await context.vault.callTx.queueAttestation1(attestation, outcome.serializedOutput);
-    console.log(`attestation queued in tx ${queued.public.txId}`);
-  }
-  await flushUntil(context, (state) => state.outputAttestationBuffer.member(requestId), {
-    inIndexes: [],
-    requestIds: [requestId],
-  });
-}
-
-/**
- * Settle a resolved deposit outcome: {@link flushDepositAttestation}, then call
+ * Settle a resolved deposit outcome: {@link queueAndFlushAttestation}, then call
  * `completeDeposit` with the request id, the output bytes (one zero byte for a
  * failed or unviable sweep, whose output the circuit ignores), a random mint
  * nonce, and the wallet the mint goes to: `recipient` when given, otherwise the
@@ -111,7 +65,7 @@ export async function settleDeposit(
   }
 
   const requestIdOnLedger = outcome.event.requestId;
-  await flushDepositAttestation(context, outcome);
+  await queueAndFlushAttestation(context, outcome);
   const serializedOutput =
     outcome.event.outputKind === OutputKind.executed ? outcome.serializedOutput : new Uint8Array(1);
 
