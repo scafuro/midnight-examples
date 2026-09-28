@@ -52,7 +52,6 @@ import * as SignetSigner from "@sig-net/midnight-contract/managed/contract/index
 
 import {
   Action,
-  attestationDigestsFor,
   Contract,
   createVaultPrivateState,
   FlushChannel,
@@ -685,11 +684,10 @@ const attest = async (
 ) => {
   const queued = (await contract.circuits.queueAttestation1(ctx, attestation, serializedOutput))
     .context;
-  const digest = first(
-    attestationDigestsFor(ledgerOf(queued).inputAttestationBuffer, attestation.requestId),
-    "queued attestation digest",
-  );
-  return { ctx: await flush(contract, queued, [], [digest]), digest };
+  return {
+    ctx: await flush(contract, queued, [], [attestation.digest]),
+    digest: attestation.digest,
+  };
 };
 
 // ---- Settle fixtures ----
@@ -771,6 +769,7 @@ describe("completeDeposit settle", () => {
       )
     ).context;
 
+    expect(next.callContext.currentQueryContext.effects.shieldedMints.size).toBe(1);
     const state = ledgerOf(next);
     expect(state.bidirectionalDepositMap.isEmpty()).toBe(true);
     expect(state.outputRequestBuffer.isEmpty()).toBe(true);
@@ -790,7 +789,7 @@ describe("completeDeposit settle", () => {
     ).rejects.toThrow(/Invalid attestation signature/);
   });
 
-  it("rejects a genuinely signed sweep that returned false", async () => {
+  it("closes a genuinely signed sweep that returned false without minting", async () => {
     const { contract, ctx, requestId } = await depositRequested();
     const attested = await attest(
       contract,
@@ -798,16 +797,25 @@ describe("completeDeposit settle", () => {
       respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_FALSE, ATTESTED_HEIGHT),
       OUTPUT_FALSE,
     );
-    await expect(
-      contract.circuits.completeDeposit(
+
+    const next = (
+      await contract.circuits.completeDeposit(
         attested.ctx,
         requestId,
         attested.digest,
         OUTPUT_FALSE,
         MINT_NONCE,
         CALLER_RECIPIENT,
-      ),
-    ).rejects.toThrow(/ERC20 transfer returned false/);
+      )
+    ).context;
+
+    expect(next.callContext.currentQueryContext.effects.shieldedMints.size).toBe(0);
+    const state = ledgerOf(next);
+    expect(state.bidirectionalDepositMap.isEmpty()).toBe(true);
+    expect(state.outputRequestBuffer.isEmpty()).toBe(true);
+    expect(state.outputAttestationBuffer.isEmpty()).toBe(true);
+    expect(state.evictionMap.isEmpty()).toBe(true);
+    expect(state.sentRequestKeys.isEmpty()).toBe(true);
   });
 
   it("queueAttestation1 rejects presented output bytes that differ from what was signed", async () => {
@@ -1294,10 +1302,7 @@ describe("attested block heights", () => {
       const queuedBoth = (
         await contract.circuits.queueAttestation1(queuedRepeat, attestation, OUTPUT_SUCCESS)
       ).context;
-      const digest = first(
-        attestationDigestsFor(ledgerOf(queuedBoth).inputAttestationBuffer, requestId),
-        "queued attestation digest",
-      );
+      const digest = attestation.digest;
 
       // Whatever the slot order, the first request is still open, so the
       // repeat's slot is skipped and the repeat stays queued.

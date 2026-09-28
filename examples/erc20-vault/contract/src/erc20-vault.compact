@@ -130,7 +130,6 @@ export ledger evictionMap: Map<RequestId, Bytes<32>>;
 
 // outputRequestBuffer keys already sent: gas is chosen at send, so a second send of
 // one entry would carry a different request id at the same nonce.
-// FIXME: can we remove this??
 export ledger sentRequestKeys: Set<Bytes<32>>;
 
 circuit requireInitialised(): [] {
@@ -476,7 +475,7 @@ export circuit sendDeposit(
   bidirectionalDepositMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
   sentRequestKeys.insert(disclosedKey);
-  
+
   // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [0, 0]).
   signetSigner.signBidirectional(
     requestId,
@@ -518,7 +517,8 @@ circuit settleDeposit(
   return [out.entry, record];
 }
 
-// Settles a successful deposit: mints shielded vault tokens for the deposited amount.
+// Settles an executed deposit: mints shielded vault tokens for the deposited amount
+// when the transfer returned true, and only closes the request when it returned false.
 // Depositor-gated, one settle per request. mintNonce must be caller-chosen RANDOM: one
 // derived from the (public) requestId would link the minted coin to the deposit.
 export circuit completeDeposit(
@@ -540,18 +540,17 @@ export circuit completeDeposit(
     ) == disclose(digest),
     "Output does not match the attestation"
   );
-  const response = deserialize<VaultResponse, 1>(output);
-  assert(response.success, "ERC20 transfer returned false");
-
-  const claimRecipient = disclose(recipient).is_some
-    ? disclose(recipient).value
-    : left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
-  mintShieldedToken(
-    vaultTokenDomainSeparator(entry.depositArgs.request.erc20Address),
-    entry.depositArgs.request.amount as Uint<64>,
-    disclose(mintNonce),
-    claimRecipient
-  );
+  if (deserialize<VaultResponse, 1>(output).success) {
+    const claimRecipient = disclose(recipient).is_some
+      ? disclose(recipient).value
+      : left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
+    mintShieldedToken(
+      vaultTokenDomainSeparator(entry.depositArgs.request.erc20Address),
+      entry.depositArgs.request.amount as Uint<64>,
+      disclose(mintNonce),
+      claimRecipient
+    );
+  }
 }
 
 // Nothing was surrendered for a deposit, so a failed one only closes its records.

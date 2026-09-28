@@ -18,6 +18,7 @@ import {
   Intent,
   Transaction,
 } from "@midnight-ntwrk/midnight-js-protocol/ledger";
+import { bytesToHex } from "@sig-net/midnight";
 
 import {
   VAULT_PRIVATE_STATE_ID,
@@ -90,29 +91,6 @@ export function queuedRequestKey(state: VaultLedgerState, inIndex: bigint): Uint
   return pureCircuits.requestKey(state.inputRequestBuffer.lookup(inIndex));
 }
 
-/**
- * The digests under which an attestation buffer holds records for a request.
- *
- * @param buffer - `inputAttestationBuffer` or `outputAttestationBuffer`.
- * @param requestId - The request the attestations name.
- * @returns The matching digests, in ledger order.
- */
-export function attestationDigestsFor(
-  buffer: VaultLedgerState["inputAttestationBuffer"],
-  requestId: Uint8Array,
-): Uint8Array[] {
-  const digests: Uint8Array[] = [];
-  for (const [digest, record] of buffer) {
-    if (
-      record.requestId.length === requestId.length &&
-      record.requestId.every((byte, i) => byte === requestId[i])
-    ) {
-      digests.push(digest);
-    }
-  }
-  return digests;
-}
-
 const FLUSH_TTL_MS = 5 * 60_000;
 
 // midnight-js sections a call's transcript before the wallet adds its fee payment, so
@@ -169,28 +147,69 @@ async function submitFlush(
   }
 }
 
+/** Queued items a flush carries ahead of every other waiting item. */
+export interface FlushItems {
+  /** Input buffer indexes of queued requests. */
+  readonly inIndexes: readonly bigint[];
+  /** Digests of queued attestations. */
+  readonly digests: readonly Uint8Array[];
+}
+
+// Up to FLUSH_WIDTH items that would move: `first` ahead of the rest, attestations ahead
+// of requests. A request whose request key is open, or taken by an earlier request in
+// the batch, would be skipped by the flush, so it is left out.
+function movableItems(state: VaultLedgerState, first: FlushItems): FlushItems {
+  const digests: Uint8Array[] = [];
+  const inIndexes: bigint[] = [];
+  const takenDigests = new Set<string>();
+  const takenRequestKeys = new Set<string>();
+  const addDigest = (digest: Uint8Array): void => {
+    const hex = bytesToHex(digest);
+    if (digests.length + inIndexes.length === FLUSH_WIDTH || takenDigests.has(hex)) return;
+    if (!state.inputAttestationBuffer.member(digest)) return;
+    takenDigests.add(hex);
+    digests.push(digest);
+  };
+  const addRequest = (inIndex: bigint): void => {
+    if (digests.length + inIndexes.length === FLUSH_WIDTH) return;
+    if (!state.inputRequestBuffer.member(inIndex)) return;
+    const key = pureCircuits.requestKey(state.inputRequestBuffer.lookup(inIndex));
+    const hex = bytesToHex(key);
+    if (takenRequestKeys.has(hex) || state.outputRequestBuffer.member(key)) return;
+    takenRequestKeys.add(hex);
+    inIndexes.push(inIndex);
+  };
+  first.digests.forEach(addDigest);
+  first.inIndexes.forEach(addRequest);
+  for (const [digest] of state.inputAttestationBuffer) addDigest(digest);
+  for (const [inIndex] of state.inputRequestBuffer) addRequest(inIndex);
+  return { inIndexes, digests };
+}
+
 /**
- * Flushes up to FLUSH_WIDTH waiting items, whoever queued them: queued attestations
- * first, then queued requests, in ledger order. The flush's ledger work runs in the
- * transaction's fallible section, so a flush that loses a race to another flush lands
- * as a {@link CallTxFailedError} with status `FailFallible` and still pays its fee.
+ * Flushes up to FLUSH_WIDTH waiting items, whoever queued them: `first` ahead of the
+ * rest, then queued attestations, then queued requests, in ledger order. Requests the
+ * flush would skip (an identical request is open) are left out, and nothing is
+ * submitted when no item would move. The flush's ledger work runs in the transaction's
+ * fallible section, so a flush that loses a race to another flush lands as a
+ * {@link CallTxFailedError} with status `FailFallible` and still pays its fee.
  *
  * @param providers - The vault's provider set, whose wallet pays for the flush.
  * @param compiledContract - The vault's compiled contract.
  * @param vaultContractAddress - The vault's contract address.
- * @returns How many slots the flush filled.
+ * @param first - Items to carry ahead of every other waiting item.
+ * @returns How many slots the flush filled, 0 when it submitted nothing.
  * @throws {CallTxFailedError} When the flush lands but does not succeed entirely.
  */
 export async function flushPending(
   providers: VaultProviders,
   compiledContract: VaultCompiledContract,
   vaultContractAddress: string,
+  first: FlushItems = { inIndexes: [], digests: [] },
 ): Promise<number> {
   const state = await readVaultLedger(providers.publicDataProvider, vaultContractAddress);
-  const digests = [...state.inputAttestationBuffer].map(([digest]) => digest).slice(0, FLUSH_WIDTH);
-  const inIndexes = [...state.inputRequestBuffer]
-    .map(([inIndex]) => inIndex)
-    .slice(0, FLUSH_WIDTH - digests.length);
+  const { inIndexes, digests } = movableItems(state, first);
+  if (inIndexes.length + digests.length === 0) return 0;
   await submitFlush(
     providers,
     compiledContract,
@@ -201,37 +220,43 @@ export async function flushPending(
 }
 
 /**
- * Flushes until `flushed` holds for the ledger. A flush that loses its block to another
- * flush is retried.
+ * Flushes, carrying `first` ahead of every other waiting item, until `flushed` holds for
+ * the ledger. A flush that loses its block to another flush is retried.
  *
  * @param providers - The vault's provider set, whose wallet pays for the flushes.
  * @param compiledContract - The vault's compiled contract.
  * @param vaultContractAddress - The vault's contract address.
  * @param flushed - Whether the ledger shows what the caller waits for.
+ * @param first - The items the caller waits for.
  * @param attempts - How many flushes to try.
  * @returns The ledger state that satisfied `flushed`.
- * @throws {Error} On a non-conflict failure, or when `flushed` still fails after the attempts.
+ * @throws {Error} When no waiting item would move while `flushed` fails, on a failure
+ *   other than a lost race, or when `flushed` still fails after the attempts.
  */
 export async function flushUntil(
   providers: VaultProviders,
   compiledContract: VaultCompiledContract,
   vaultContractAddress: string,
   flushed: (state: VaultLedgerState) => boolean,
+  first: FlushItems,
   attempts = 5,
 ): Promise<VaultLedgerState> {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const state = await readVaultLedger(providers.publicDataProvider, vaultContractAddress);
     if (flushed(state)) return state;
+    let carried: number;
     try {
-      await flushPending(providers, compiledContract, vaultContractAddress);
+      carried = await flushPending(providers, compiledContract, vaultContractAddress, first);
     } catch (error) {
-      const staleRead: boolean =
-        error instanceof Error && error.message.includes("mismatch between expected read");
-      const failedFallible: boolean =
-        error instanceof CallTxFailedError && error.finalizedTxData.status === FailFallible;
-      if (!staleRead && !failedFallible) throw error;
-      console.log(
-        `flush attempt ${String(attempt + 1)} lost: ${String(error).split("\n")[0] ?? ""}`,
+      if (!(error instanceof CallTxFailedError && error.finalizedTxData.status === FailFallible)) {
+        throw error;
+      }
+      console.log(`flush attempt ${String(attempt + 1)} lost a race to another flush`);
+      continue;
+    }
+    if (carried === 0) {
+      throw new Error(
+        "nothing to flush: the awaited items are not queued, or each waits for an identical open request to settle",
       );
     }
   }

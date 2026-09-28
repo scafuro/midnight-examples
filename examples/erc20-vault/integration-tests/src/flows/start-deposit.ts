@@ -179,7 +179,10 @@ export async function startDeposit(
     await readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress),
     inIndex,
   );
-  await flushUntil(context, (state) => state.outputRequestBuffer.member(outKey));
+  await flushUntil(context, (state) => state.outputRequestBuffer.member(outKey), {
+    inIndexes: [inIndex],
+    digests: [],
+  });
   const result = await context.vault.callTx.sendDeposit(
     outKey,
     gasLimit,

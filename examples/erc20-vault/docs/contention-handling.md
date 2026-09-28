@@ -11,8 +11,9 @@ them writes it always can.
 Some vault state is genuinely shared by every request. The vault's rule is
 that such state has exactly one writer: `flushQueue`. Every other circuit works
 only on entries keyed by its own request, so the circuits users call (start,
-send, queue an attestation, settle) never conflict with each other or with the
-flush. All contention is concentrated in the flush, where it is cheap to
+send, queue an attestation, settle) never conflict with the flush, and calls
+for different requests never conflict with each other. All contention is
+concentrated in the flush, where it is cheap to
 handle: a flush carries no user funds or secrets, anyone may submit one, and a
 flush that loses a race is simply rebuilt from the new state and resubmitted.
 The price of a lost race is the losing flush's fee.
@@ -113,7 +114,9 @@ flushes touch shared state.
    close) and that the caller owns the entry. `completeDeposit` also checks
    that the output hashes to the digest. Settlement then removes the request's
    event, its `evictionMap` and `sentRequestKeys` entries, the attestation and
-   the output entry, and `completeDeposit` mints the deposited amount.
+   the output entry. `completeDeposit` mints the deposited amount when the
+   attested transfer returned true, and only closes the request when it
+   returned false.
 
 ## The flush
 
@@ -132,7 +135,9 @@ stays in `inputRequestBuffer`, and a later flush moves it once the open request
 settles. The twin check comes before the entry is removed from the input
 buffer, as a skipped slot is part of a transaction that succeeds and commits
 whatever the slot already did. Nothing a user queues can therefore make a flush
-fail.
+fail. A settle can still make a flush built before it fail: a flush that
+skipped a twin read the open entry the settle removes, so that flush is
+rebuilt, like any flush that loses a race.
 
 Slots run in order, so within one flush a request slot placed after an
 attestation slot sees that attestation's height in its `lastSeen`.
@@ -144,9 +149,19 @@ themselves. The flush does not have to take every waiting item: a rule forcing
 it to would make it read a count that every start writes, and every start would
 then conflict with every flush.
 
-Two flushes built against the same state conflict on `globalLastSeen`. One of
-them lands, and the other is rebuilt and resubmitted. Only the flusher ever
-retries. Users' own transactions never fail because of a flush.
+Two flushes built against the same state conflict when they carry a common
+item, or when one raises `globalLastSeen` and the other read it (every slot
+that moves an item reads it). One of them lands, and the other is rebuilt and
+resubmitted. Only the flusher ever retries. Users' own transactions never fail
+because of a flush.
+
+The SDK's `flushPending` fills the slots from the ledger, up to 10 items: the
+items its caller names first, then queued attestations, then queued requests,
+each in ledger order. It leaves out a request whose twin is open, or whose
+request key an earlier request in the batch already takes, as the flush would
+skip it, and it submits nothing when no item would move. So another user's
+waiting repeats cannot fill a caller's flush, and `flushUntil` puts the items
+the caller waits for into every flush it submits.
 
 The SDK's `flushPending` submits every flush with its whole transcript in the
 transaction's fallible section, which runs after the fee is paid. Before taking
@@ -189,11 +204,24 @@ depositor (their derived account, their nonce, their token and amount, and the
 gas they choose), so an identical second deposit can produce the identical
 request id. The MPC would observe the same finalised transaction and issue
 exactly the attestation that settled the first deposit. The `lastSeen` check
-rejects it.
+rejects it. An identical repeat of a deposit therefore never settles: it shares
+the first deposit's nonce, which the first deposit's transaction consumed, so
+every attestation of it describes a block the vault has already folded.
 
-A real attestation for a new request always passes: its transaction is signed
-only after the entry was flushed, so it lands in a block strictly above every
-height the flush had seen.
+A real attestation for a new request passes: its transaction is signed only
+after the entry was flushed, so it lands in a block strictly above every height
+the flush had seen. One case does not pass. A deposit names the depositor's own
+nonce, and when another transaction consumed that nonce before the flush, the
+MPC attests the request unviable at that transaction's block, which can lie at
+or below the entry's `lastSeen`. Such a deposit stays open, with nothing lost,
+as a deposit surrenders nothing at start.
+
+The bound assumes the MPC attests each request id at one height, the height of
+the finalised block holding the transaction the attestation describes, as the
+Signet protocol defines it. Two validly signed attestations of one request id
+at different heights would defeat it: a repeat flushed while the higher one was
+still in `inputAttestationBuffer` takes the lower height as its `lastSeen`, and
+the higher one then settles that repeat, minting twice for one transfer.
 
 ## Why the queue takes the full output
 
@@ -235,6 +263,9 @@ the record's storage is width-independent.
 
 ## Vault-signed requests
 
+The contract does not carry these requests yet. This section is the design
+they follow.
+
 Requests signed by the vault's own EVM account (withdraw, swap, supply, redeem
 and the approvals) need the account's next nonce, and no two may get the same
 one. That nonce is the second shared cell, and it follows the same rule: the
@@ -258,8 +289,13 @@ flush is its only reader and writer.
 - **Flush throughput.** Every request uses two flush slots over its life, one
   for its entry and one for its attestation, so a 10-slot flush carries the
   equivalent of 5 complete requests.
-- **Serial flushes.** Flushes built against the same state conflict, so they
-  land one after another, and throughput is bounded by the flush width and the
-  flush rate, not by the number of users.
+- **Serial flushes.** Concurrent flushes of the same waiting items conflict
+  (see [The flush](#the-flush)), so under load flushes land one after another,
+  and throughput is bounded by the flush width and the flush rate, not by the
+  number of users.
 - **No gas bump.** A request is sent once, so a deposit sent with too little gas
   to be mined stays pending until the network fee falls to meet it.
+- **No cancel.** No circuit closes an open request without an attestation that
+  passes the bound. A request that is flushed but never sent, sent but never
+  mined, or attested stale stays in `outputRequestBuffer`, and it keeps its
+  identical repeats in `inputRequestBuffer`.

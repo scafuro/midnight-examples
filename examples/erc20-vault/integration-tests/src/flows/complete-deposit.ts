@@ -14,7 +14,6 @@ import {
 } from "@sig-net/midnight";
 import type { EncPublicKey } from "@sig-net/midnight-contract-deploy";
 import {
-  attestationDigestsFor,
   readVaultLedger,
   VAULT_DEPOSIT_REQUESTS_PATH,
 } from "@sig-net/midnight-examples-erc20-vault-contract";
@@ -49,20 +48,20 @@ export interface ShieldedTokenRecipient {
  * @param context - The flow context.
  * @param outcome - The attested outcome from {@link pollRespondBidirectional}.
  * @returns The digest the vault holds the flushed attestation under.
- * @throws {Error} If no flushed attestation for the request appears.
+ * @throws {Error} If the attestation does not reach `outputAttestationBuffer`.
  */
 export async function flushDepositAttestation(
   context: VaultContext,
   outcome: RespondOutcome,
 ): Promise<Uint8Array> {
-  const requestIdOnLedger = outcome.event.requestId;
+  const digest = outcome.event.digest;
   const ledger = await readVaultLedger(
     context.providers.publicDataProvider,
     context.vaultContractAddress,
   );
   if (
-    attestationDigestsFor(ledger.inputAttestationBuffer, requestIdOnLedger).length === 0 &&
-    attestationDigestsFor(ledger.outputAttestationBuffer, requestIdOnLedger).length === 0
+    !ledger.inputAttestationBuffer.member(digest) &&
+    !ledger.outputAttestationBuffer.member(digest)
   ) {
     const queued = await context.vault.callTx.queueAttestation1(
       respondBidirectionalEventToCircuitInput(outcome.event),
@@ -70,14 +69,10 @@ export async function flushDepositAttestation(
     );
     console.log(`attestation queued in tx ${queued.public.txId}`);
   }
-  const flushed = await flushUntil(
-    context,
-    (state) => attestationDigestsFor(state.outputAttestationBuffer, requestIdOnLedger).length > 0,
-  );
-  const digest = attestationDigestsFor(flushed.outputAttestationBuffer, requestIdOnLedger).at(0);
-  if (digest === undefined) {
-    throw new Error(`no flushed attestation for request ${requestIdHex(requestIdOnLedger)}`);
-  }
+  await flushUntil(context, (state) => state.outputAttestationBuffer.member(digest), {
+    inIndexes: [],
+    digests: [digest],
+  });
   return digest;
 }
 
