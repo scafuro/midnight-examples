@@ -181,7 +181,9 @@ export async function startDeposit(
     await readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress),
     inIndex,
   );
-  await flushUntil(context, (state) => state.outputRequestBuffer.member(outKey), {
+  // Only the flush removes an entry from the input buffer. An identical open request
+  // holds outKey already, so outputRequestBuffer membership would not show this one moved.
+  await flushUntil(context, (state) => !state.inputRequestBuffer.member(inIndex), {
     inIndexes: [inIndex],
     requestIds: [],
   });

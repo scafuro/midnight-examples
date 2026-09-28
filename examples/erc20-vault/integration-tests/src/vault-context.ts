@@ -162,7 +162,7 @@ export async function createVaultContext(
  *
  * @param context - The flow's context.
  * @param requestsPath - The resolved ledger-tree path of the request map.
- *   Defaults to VAULT_DEPOSIT_REQUESTS_PATH ([0, 0], the bidirectionalDepositMap).
+ *   Defaults to VAULT_DEPOSIT_REQUESTS_PATH (the bidirectionalDepositMap).
  * @returns The reader.
  */
 export function createResponseReader(

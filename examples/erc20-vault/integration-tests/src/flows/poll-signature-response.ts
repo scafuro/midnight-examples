@@ -27,7 +27,7 @@ export interface PollSignatureResponseOptions {
   readonly expectedSigner: string;
   /**
    * The resolved ledger-tree path of the request map. Defaults to
-   * VAULT_DEPOSIT_REQUESTS_PATH ([0, 0], the bidirectionalDepositMap).
+   * VAULT_DEPOSIT_REQUESTS_PATH (the bidirectionalDepositMap).
    */
   readonly requestsPath?: readonly number[];
 }
