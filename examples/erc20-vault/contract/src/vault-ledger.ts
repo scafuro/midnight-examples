@@ -57,6 +57,7 @@ export async function printVaultState(
 
   printRequestMap("deposit", state.bidirectionalDepositMap);
   printRequestMap("withdraw", state.bidirectionalWithdrawMap);
+  printRequestMap("nonce replacement", state.bidirectionalReplaceNonceMap);
 }
 
 /**

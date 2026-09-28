@@ -189,7 +189,7 @@ export circuit setGasParams(
 // Keep at least two variants: a one-variant enum in a hashed struct compiles to a
 // field element the ledger parses as zero bytes, and proofs then fail the proof
 // server's alignment check.
-export enum Action { deposit, withdraw }
+export enum Action { deposit, withdraw, replaceNonce }
 
 // The EIP-1559 fee envelope of a request's EVM transaction, fixed at start.
 export struct GasParams {
@@ -202,8 +202,8 @@ export struct GasParams {
 // own arguments live in its args map under inIndex, and argsHash commits to them.
 export struct RequestBufferEntry {
   action: Action;
-  // false: evmNonce is the caller's own nonce, taken verbatim. true: the vault's account
-  // signs, and the flush overwrites evmNonce with the vault's next nonce.
+  // false: evmNonce is the nonce the caller names, taken verbatim. true: the vault's
+  // account signs, and the flush overwrites evmNonce with the vault's next nonce.
   nonceIsVault: Boolean;
   evmNonce: Uint<64>;
   // The key of the entry in inputRequestBuffer and of its args in the action's args
@@ -442,7 +442,7 @@ export struct DepositArgs {
 }
 
 // Deposit requests (2-word ERC20 transfer, 34-byte schemas).
-// Compiled path for MPC notification: [1, 11] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [1, 9] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalDepositMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the deposit queued under it, from start to complete.
@@ -534,11 +534,11 @@ export circuit sendDeposit(outKey: Bytes<32>): [] {
   bidirectionalDepositMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [1, 11]).
+  // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [1, 9]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [1, 11, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [1, 9, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -603,7 +603,7 @@ export struct WithdrawArgs {
 }
 
 // Withdraw requests (2-word ERC20 transfer, 34-byte schemas).
-// Compiled path for MPC notification: [1, 13] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [1, 11] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalWithdrawMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the withdrawal queued under it, from start to complete.
@@ -705,11 +705,11 @@ export circuit sendWithdraw(outKey: Bytes<32>): [] {
   bidirectionalWithdrawMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalWithdrawMap's compiled ledger path, [1, 13]).
+  // Notify the MPC (bidirectionalWithdrawMap's compiled ledger path, [1, 11]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [1, 13, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [1, 11, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -752,6 +752,133 @@ export circuit completeWithdraw(
       args.request.amount as Uint<64>,
       disclose(mintNonce),
       left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey())
+    );
+  }
+}
+
+// ==== Replace nonce ==================================================================
+// A zero-value self-transfer to vaultEvmAddress with no calldata, signed by the MPC with
+// the vault's own account at the nonce the deployer names, under the vault's fee
+// settings and the 21000 gas a plain transfer costs.
+
+export struct ReplaceNonceArgs {
+  gas: GasParams;
+}
+
+// Nonce replacement requests (no calldata, 34-byte schemas).
+// Compiled path for MPC notification: [1, 13] (read from managed/erc20-vault/compiler/contract-info.json).
+export ledger bidirectionalReplaceNonceMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
+
+// inIndex -> the arguments of the replacement queued under it, from start to complete.
+export ledger replaceNonceArgsMap: Map<Uint<64>, ReplaceNonceArgs>;
+
+circuit replaceNonceArgsHash(args: ReplaceNonceArgs): Bytes<32> {
+  return upgradeFromTransient(transientHash<[Bytes<32>, ReplaceNonceArgs]>([
+    pad(32, "vault:replaceNonce:args"),
+    args
+  ]));
+}
+
+// ⚠️ EMERGENCY USE ONLY. THIS CAN LOSE USER FUNDS. ⚠️
+// Replaces the vault account's transaction at evmNonce with a zero-value
+// self-transfer, to unstick the account when that transaction can never be
+// mined. Every nonce the flush assigns belongs to a user's request, and the
+// replacement takes it: that request's own transaction can then never
+// execute. Before calling this the deployer must be certain the original
+// transaction is not in flight ANYWHERE, including mempools they cannot see:
+// a replacement racing a live transaction decides which of the two mines.
+// The replaced request can then settle only through an unviable attestation.
+// If none is ever posted, whatever it surrendered at start stays burned.
+export circuit startReplaceNonce(inIndex: Uint<64>, evmNonce: Uint<64>): [] {
+  requireInitialised();
+  assert(userCommitment(callerSecretKey()) == deployer, "Not the deployer");
+
+  const disclosedIndex = disclose(inIndex);
+  assert(
+    !inputRequestBuffer.member(disclosedIndex) && !replaceNonceArgsMap.member(disclosedIndex),
+    "Index already in use"
+  );
+
+  const args = ReplaceNonceArgs {
+    gas: GasParams {
+      gasLimit: 21000 as Uint<64>,
+      maxFeePerGas: vaultMaxFeePerGas,
+      maxPriorityFeePerGas: vaultMaxPriorityFeePerGas,
+    },
+  };
+  replaceNonceArgsMap.insert(disclosedIndex, args);
+  inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
+    action: Action.replaceNonce,
+    nonceIsVault: false,
+    evmNonce: evmNonce,
+    inIndex: inIndex,
+    commitment: ownershipCommitment(inIndex, callerSecretKey()),
+    argsHash: replaceNonceArgsHash(args),
+  }));
+}
+
+// Records the flushed replacement's SignBidirectionalEvent and notifies the MPC.
+// Permissionless: the entry and its args fix every byte of the EVM transaction, so a
+// second send of the same entry names the same request id and is refused.
+export circuit sendReplaceNonce(outKey: Bytes<32>): [] {
+  requireInitialised();
+  const disclosedKey = disclose(outKey);
+  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  assert(entry.action == Action.replaceNonce, "Wrong action");
+  const args = replaceNonceArgsMap.lookup(entry.inIndex);
+  const txParams = EvmType2TxParams<2, 0, 0> {
+    chainId: evmChainId,
+    nonce: entry.evmNonce,
+    maxPriorityFeePerGas: args.gas.maxPriorityFeePerGas,
+    maxFeePerGas: args.gas.maxFeePerGas,
+    gasLimit: args.gas.gasLimit,
+    to: vaultEvmAddress,
+    value: 0 as Uint<128>,
+    calldata: none<EvmCalldata<2>>(),
+    accessListEntryCount: 0,
+    accessList: []
+  };
+  const schema = vaultResponseSchema();
+  const request = constructSignBidirectionalEventV1<EvmType2TxParams<2, 0, 0>, 34, 34>(
+    mpcKeyVersion, kernel.self(), pad(32, "vault"),
+    MPCSignatureAlgorithm.ecdsa, TxParamType.evmType2, txParams, ethereumCaip2Id(),
+    MPCDestination.unused, pad(64, ""), schema, schema
+  );
+  const requestId = calculateEvmType2RequestIdV1<2, 0, 0, 34, 34>(request);
+  assert(!bidirectionalReplaceNonceMap.member(requestId), "Request already sent");
+  bidirectionalReplaceNonceMap.insert(requestId, request);
+  evictionMap.insert(requestId, disclosedKey);
+
+  // Notify the MPC (bidirectionalReplaceNonceMap's compiled ledger path, [1, 13]).
+  signetSigner.signBidirectional(
+    requestId,
+    constructSignBidirectionalEventNotificationV1(
+      kernel.self(), 2 as Uint<8>, [1, 13, 0, 0] as Vector<4, Uint<8>>,
+    ),
+  );
+}
+
+// Settles a replacement on every verdict by closing it: it surrendered nothing. The MPC
+// attests an executed plain transfer with the schema's synthesised success value, 0x01,
+// which is checked against the attestation. On a failure serializedOutput is ignored.
+// Deployer-gated through the ownership commitment, one settle per request.
+export circuit completeReplaceNonce(requestId: RequestId, serializedOutput: Bytes<1>): [] {
+  requireInitialised();
+  const disclosedId = disclose(requestId);
+  const settled = settleRequest(disclosedId, Action.replaceNonce);
+  const entry = settled[0];
+  const record = settled[1];
+  replaceNonceArgsMap.remove(entry.inIndex);
+  assert(bidirectionalReplaceNonceMap.member(disclosedId), "Request event missing");
+  bidirectionalReplaceNonceMap.remove(disclosedId);
+
+  if (record.outputKind == OutputKind.executed) {
+    assert(
+      calculateSignetAttestationDigestV1<1>(
+        disclosedId, record.blockHeight, record.outputKind, disclose(serializedOutput)
+      ) == record.digest,
+      "Output does not match the attestation"
     );
   }
 }

@@ -8,7 +8,11 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import { VAULT_DEPOSIT_REQUESTS_PATH, VAULT_WITHDRAW_REQUESTS_PATH } from "../src/index.ts";
+import {
+  VAULT_DEPOSIT_REQUESTS_PATH,
+  VAULT_REPLACE_NONCE_REQUESTS_PATH,
+  VAULT_WITHDRAW_REQUESTS_PATH,
+} from "../src/index.ts";
 
 interface LedgerFieldInfo {
   readonly name: string;
@@ -32,8 +36,9 @@ const compiledFieldIndex = (name: string): readonly number[] => {
 
 describe("exported ledger paths match the compiled contract-info.json", () => {
   it.each([
-    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [1, 11]],
-    ["bidirectionalWithdrawMap", VAULT_WITHDRAW_REQUESTS_PATH, [1, 13]],
+    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [1, 9]],
+    ["bidirectionalWithdrawMap", VAULT_WITHDRAW_REQUESTS_PATH, [1, 11]],
+    ["bidirectionalReplaceNonceMap", VAULT_REPLACE_NONCE_REQUESTS_PATH, [1, 13]],
     // The literal column is deliberate: the notification vectors in
     // erc20-vault.compact are hand-written, so a re-chunk that moves a path
     // must fail here even when the exported constant was updated with it.
