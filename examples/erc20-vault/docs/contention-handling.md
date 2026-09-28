@@ -56,9 +56,9 @@ carries:
 
 - **The action.**
 - **The nonce.** `nonceIsVault` is `false` for a deposit: `evmNonce` is the
-  depositor's own account nonce, taken verbatim. It is `true` for a withdrawal,
-  which the vault's account signs: the start writes 0, and the flush replaces
-  it with the vault's next nonce.
+  depositor's own account nonce, taken verbatim. It is `true` for a withdrawal
+  or an approval, which the vault's account signs: the start writes 0, and the
+  flush replaces it with the vault's next nonce.
 - **The input index** it was queued under, which is public already.
 - **An ownership commitment**, `ownershipCommitment(inIndex, secret key)`. The
   complete circuit recomputes it from the stored index and the caller's
@@ -68,8 +68,10 @@ carries:
 The arguments themselves live in the action's own args map, keyed by the input
 index: `depositArgsMap` holds each deposit's `DepositArgs` (the
 `DepositRequest`, the MPC derivation path of the depositor's EVM account, and
-the gas envelope), and `withdrawArgsMap` each withdrawal's `WithdrawArgs` (the
-`WithdrawRequest` and the vault's gas envelope at start). The start circuit
+the gas envelope), `withdrawArgsMap` each withdrawal's `WithdrawArgs` (the
+`WithdrawRequest` and the vault's gas envelope at start), and `approveArgsMap`
+each approval's `ApproveArgs` (the `ApproveRequest`, naming the ERC20 and the
+spender, and the vault's gas envelope at start). The start circuit
 writes them, the send and complete circuits read them, and the complete circuit
 removes them. The flush never touches them, so its cost does not grow with the
 actions the vault supports.
@@ -286,8 +288,8 @@ the record's storage is width-independent.
 
 ## Vault-signed requests
 
-A withdrawal is signed by the vault's own EVM account, so it needs the
-account's next nonce, and no two requests may get the same one. That nonce is
+A withdrawal or an approval is signed by the vault's own EVM account, so it
+needs the account's next nonce, and no two requests may get the same one. That nonce is
 the second shared cell, and it follows the same rule: the flush is its only
 reader and writer.
 
@@ -316,6 +318,25 @@ The withdraw lifecycle is the deposit's six steps with three differences:
    returned true moved the tokens, so the burn stands. One that returned false,
    failed or was unviable moved nothing, so it re-mints the burned amount to
    the withdrawer.
+
+The approve lifecycle is the same six steps. It lets the vault's account grant
+one of its two pinned spenders an allowance the later EVM calls draw on: the
+Uniswap router for a swap, the stataToken wrapper for a supply. Both approvals
+share one action, one event map and one args map, as they build the same
+transaction:
+
+1. **Start.** Only the deployer may start an approval.
+   `startApproveRouter` takes the input index and the ERC20, and names the
+   pinned `uniswapRouter` as the spender. `startApproveStata` takes only the
+   input index, and names the pinned `stataToken` as the spender on
+   `stataUnderlying`. Either copies the vault's gas settings into
+   `approveArgsMap` and queues the entry with `nonceIsVault` set. Nothing is
+   surrendered.
+2. **Send.** `sendApprove` builds `approve(spender, unlimitedAllowance())` on
+   the ERC20 with the derivation path `"vault"` and the nonce the flush
+   assigned, and records it in `bidirectionalApproveMap`.
+3. **Complete.** `completeApprove` settles every verdict by closing the
+   request. It mints nothing, as the start surrendered nothing.
 
 ## Costs
 

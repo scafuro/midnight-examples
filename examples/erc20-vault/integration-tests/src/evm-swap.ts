@@ -1,5 +1,5 @@
 // Uniswap V3 constants for the swap flow: the pinned SwapRouter02 + QuoterV2 (Sepolia
-// canonical, present on the pinned fork), the exactOutputSingle/approve ABI shapes, and a
+// canonical, present on the pinned fork), the exactOutputSingle ABI shape, and a
 // read-only QuoterV2 quote. Mirrors evm-transfer.ts for the swap leg.
 import { UNISWAP_SWAP_ROUTER_02 } from "@sig-net/midnight-examples-erc20-vault-contract";
 import type { ContractReadMethod } from "@sig-net/midnight-examples-test-harness";
@@ -10,9 +10,6 @@ export const UNISWAP_QUOTER_V2 = "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3";
 
 /** exactOutputSingle((address,address,uint24,address,uint256,uint256,uint160)) selector. */
 export const EXACT_OUTPUT_SINGLE_SELECTOR = new Uint8Array([0x50, 0x23, 0xb4, 0xdf]);
-
-/** approve(address,uint256) selector. */
-export const APPROVE_SELECTOR = new Uint8Array([0x09, 0x5e, 0xa7, 0xb3]);
 
 const QUOTER_ABI = [
   "function quoteExactOutputSingle((address tokenIn,address tokenOut,uint256 amount,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountIn,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)",
