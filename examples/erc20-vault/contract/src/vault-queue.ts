@@ -14,6 +14,7 @@ import {
 import {
   communicationCommitmentRandomness,
   ContractCallPrototype,
+  ContractState,
   Intent,
   Transaction,
 } from "@midnight-ntwrk/midnight-js-protocol/ledger";
@@ -136,7 +137,10 @@ async function submitFlush(
     privateStateId: VAULT_PRIVATE_STATE_ID,
   });
   const [guaranteed, fallible] = call.public.partitionedTranscript;
-  const state = await providers.publicDataProvider.queryContractState(vaultContractAddress);
+  const raw = await providers.publicDataProvider.queryContractState(vaultContractAddress);
+  // The indexer's state is the runtime's ContractState class, and ContractCallPrototype
+  // accepts only the ledger's own ContractOperation: round-trip through bytes.
+  const state = raw && ContractState.deserialize(raw.serialize());
   const operation = state?.operation("flushQueue");
   if (!operation?.verifierKey) {
     throw new Error(`flushQueue has no verifier key on chain at ${vaultContractAddress}`);

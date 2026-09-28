@@ -203,10 +203,11 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
 
         // Identity B presents the SAME request id and the SAME valid MPC
         // response, i.e. everything a claim needs except the right secret key.
-        // Queueing and flushing the attestation are permissionless and go
-        // through. completeDeposit recomputes B's ownership commitment from the
-        // callerSecretKey witness, compares it to the one the deposit's entry
-        // pins (A's), and rejects during local transaction building.
+        // The arrange step already queued and flushed the attestation, so B's
+        // unfunded wallet goes straight to completeDeposit, which recomputes
+        // B's ownership commitment from the callerSecretKey witness, compares
+        // it to the one the deposit's entry pins (A's), and rejects during
+        // local transaction building.
         const falseClaimerContext = await falseClaimerSession.vaultContext();
         await expect(
           completeDeposit(falseClaimerContext, { requestId: depositRequestId }),

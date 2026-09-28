@@ -40,15 +40,53 @@ export interface ShieldedTokenRecipient {
 }
 
 /**
- * Settle a resolved deposit outcome: queue the attestation (the event in
- * circuit-input form and the output bytes its signature verified over), flush
- * it until the vault holds it under its digest, then call `completeDeposit`
- * with the request id, that digest, the output bytes, a random mint nonce, and
- * the wallet the mint goes to: `recipient` when given, otherwise the caller's
- * own. A rerun finds an attestation already queued or flushed and carries on
- * from there. The
- * mint's coin handling is midnight-js's job: the callTx balances the
- * resulting offer like any other call.
+ * Queue a resolved deposit outcome's attestation (the event in circuit-input
+ * form and the output bytes its signature verified over) with
+ * `queueAttestation1`, and flush until the vault holds it under its digest.
+ * Both steps are permissionless, and the caller's wallet pays for them. A rerun
+ * finds an attestation already queued or flushed and carries on from there.
+ *
+ * @param context - The flow context.
+ * @param outcome - The attested outcome from {@link pollRespondBidirectional}.
+ * @returns The digest the vault holds the flushed attestation under.
+ * @throws {Error} If no flushed attestation for the request appears.
+ */
+export async function flushDepositAttestation(
+  context: VaultContext,
+  outcome: RespondOutcome,
+): Promise<Uint8Array> {
+  const requestIdOnLedger = outcome.event.requestId;
+  const ledger = await readVaultLedger(
+    context.providers.publicDataProvider,
+    context.vaultContractAddress,
+  );
+  if (
+    attestationDigestsFor(ledger.inputAttestationBuffer, requestIdOnLedger).length === 0 &&
+    attestationDigestsFor(ledger.outputAttestationBuffer, requestIdOnLedger).length === 0
+  ) {
+    const queued = await context.vault.callTx.queueAttestation1(
+      respondBidirectionalEventToCircuitInput(outcome.event),
+      outcome.serializedOutput,
+    );
+    console.log(`attestation queued in tx ${queued.public.txId}`);
+  }
+  const flushed = await flushUntil(
+    context,
+    (state) => attestationDigestsFor(state.outputAttestationBuffer, requestIdOnLedger).length > 0,
+  );
+  const digest = attestationDigestsFor(flushed.outputAttestationBuffer, requestIdOnLedger).at(0);
+  if (digest === undefined) {
+    throw new Error(`no flushed attestation for request ${requestIdHex(requestIdOnLedger)}`);
+  }
+  return digest;
+}
+
+/**
+ * Settle a resolved deposit outcome: {@link flushDepositAttestation}, then call
+ * `completeDeposit` with the request id, the attestation's digest, the output
+ * bytes, a random mint nonce, and the wallet the mint goes to: `recipient` when
+ * given, otherwise the caller's own. The mint's coin handling is midnight-js's
+ * job: the callTx balances the resulting offer like any other call.
  *
  * @param context - The flow context.
  * @param outcome - The attested outcome from {@link pollRespondBidirectional}.
@@ -79,28 +117,7 @@ export async function settleDeposit(
   }
 
   const requestIdOnLedger = outcome.event.requestId;
-  const ledger = await readVaultLedger(
-    context.providers.publicDataProvider,
-    context.vaultContractAddress,
-  );
-  if (
-    attestationDigestsFor(ledger.inputAttestationBuffer, requestIdOnLedger).length === 0 &&
-    attestationDigestsFor(ledger.outputAttestationBuffer, requestIdOnLedger).length === 0
-  ) {
-    const queued = await context.vault.callTx.queueAttestation1(
-      respondBidirectionalEventToCircuitInput(outcome.event),
-      outcome.serializedOutput,
-    );
-    console.log(`attestation queued in tx ${queued.public.txId}`);
-  }
-  const flushed = await flushUntil(
-    context,
-    (state) => attestationDigestsFor(state.outputAttestationBuffer, requestIdOnLedger).length > 0,
-  );
-  const digest = attestationDigestsFor(flushed.outputAttestationBuffer, requestIdOnLedger).at(0);
-  if (digest === undefined) {
-    throw new Error(`no flushed attestation for request ${requestId}`);
-  }
+  const digest = await flushDepositAttestation(context, outcome);
 
   // A fresh random mint nonce per settle: the circuit threads it into the
   // shielded mint verbatim, so randomness HERE is what keeps the minted coin
