@@ -3430,6 +3430,121 @@ describe("attested block heights", () => {
     ).rejects.toThrow(/Stale attestation/);
   });
 
+  it("a repeat queued and stamped while the first is outstanding cannot reuse its attestation", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const key = depositKey(ctx, VALID_DEPOSIT.evmNonce);
+    const repeatStamped = await flushOne(
+      contract,
+      (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context,
+      key,
+    );
+    expect(stampOf(ledger(stateOf(repeatStamped) as never), key).knownHeight).toBe(
+      EVM_START_HEIGHT,
+    );
+    const settledAt = 150n;
+    const attestation = respond(MPC_RESPONSE_SECRET, requestId, OUTPUT_SUCCESS, settledAt);
+    const settled = (
+      await contract.circuits.completeDeposit(
+        repeatStamped,
+        requestId,
+        attestation,
+        OUTPUT_SUCCESS,
+        settledAt,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      )
+    ).context;
+    const resent = (await contract.circuits.sendDeposit(settled, key)).context;
+    expect(ledger(stateOf(resent) as never).depositSettleViews.lookup(requestId).knownHeight).toBe(
+      settledAt,
+    );
+    await expect(
+      contract.circuits.completeDeposit(
+        resent,
+        requestId,
+        attestation,
+        OUTPUT_SUCCESS,
+        settledAt,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+    ).rejects.toThrow(/Stale attestation/);
+  });
+
+  it("a repeat whose flush folds nothing cannot reuse the attestation of its first execution", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const settledAt = 150n;
+    const attestation = respond(MPC_RESPONSE_SECRET, requestId, OUTPUT_SUCCESS, settledAt);
+    const settled = (
+      await contract.circuits.completeDeposit(
+        ctx,
+        requestId,
+        attestation,
+        OUTPUT_SUCCESS,
+        settledAt,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      )
+    ).context;
+    const reissued = (await deposit(contract, settled, VALID_DEPOSIT)).context;
+    const state = ledger(stateOf(reissued) as never);
+    expect(state.lastSeenEvmHeight).toBe(EVM_START_HEIGHT);
+    expect(state.seenEvmHeights.lookup(requestId)).toBe(settledAt);
+    expect(state.depositSettleViews.lookup(requestId).knownHeight).toBe(settledAt);
+    await expect(
+      contract.circuits.completeDeposit(
+        reissued,
+        requestId,
+        attestation,
+        OUTPUT_SUCCESS,
+        settledAt,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+    ).rejects.toThrow(/Stale attestation/);
+  });
+
+  it("a repeat stamped before a fold and sent after it cannot reuse the attestation either", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const key = depositKey(ctx, VALID_DEPOSIT.evmNonce);
+    const settledAt = 150n;
+    const attestation = respond(MPC_RESPONSE_SECRET, requestId, OUTPUT_SUCCESS, settledAt);
+    const settled = (
+      await contract.circuits.completeDeposit(
+        ctx,
+        requestId,
+        attestation,
+        OUTPUT_SUCCESS,
+        settledAt,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      )
+    ).context;
+    const repeatStamped = await flushOne(
+      contract,
+      (await queueDeposit(contract, settled, VALID_DEPOSIT)).context,
+      key,
+    );
+    const folded = (await contract.circuits.flush(repeatStamped, padKeys([]), padKeys([requestId])))
+      .context;
+    expect(ledger(stateOf(folded) as never).seenEvmHeights.member(requestId)).toBe(false);
+    const resent = (await contract.circuits.sendDeposit(folded, key)).context;
+    expect(ledger(stateOf(resent) as never).depositSettleViews.lookup(requestId).knownHeight).toBe(
+      settledAt,
+    );
+    await expect(
+      contract.circuits.completeDeposit(
+        resent,
+        requestId,
+        attestation,
+        OUTPUT_SUCCESS,
+        settledAt,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+    ).rejects.toThrow(/Stale attestation/);
+  });
+
   it("sendDeposit is permissionless", async () => {
     const { contract, ctx } = await deployInitialised();
     const key = depositKey(ctx, VALID_DEPOSIT.evmNonce);

@@ -244,6 +244,18 @@ circuit settleHeight(disclosedRequestId: RequestId, knownHeight: Uint<64>, block
   seenEvmHeights.insert(disclosedRequestId, disclose(blockHeight));
 }
 
+circuit depositKnownHeight(requestId: RequestId): Uint<64> {
+  if (seenEvmHeights.member(requestId)) {
+    if (seenEvmHeights.lookup(requestId) > lastSeenEvmHeight) {
+      return seenEvmHeights.lookup(requestId);
+    } else {
+      return lastSeenEvmHeight;
+    }
+  } else {
+    return lastSeenEvmHeight;
+  }
+}
+
 // Pins WHO may configure. Everything needing the contract's own address waits for
 // initialise().
 constructor(
@@ -474,7 +486,7 @@ export circuit sendDeposit(key: Bytes<32>): [] {
   assert(initialised >= 1, "Not initialised");
   const disclosedKey = disclose(key);
   const pending = takePending(disclosedKey, PendingRequestKind.deposit);
-  const stamp = takeStamp(disclosedKey, PendingRequestKind.deposit);
+  takeStamp(disclosedKey, PendingRequestKind.deposit);
   // The pinned recipient stops a client having the MPC sign a transfer to themselves.
   const calldata = EvmCalldata<2> {
     selector: Bytes [0xa9, 0x05, 0x9c, 0xbb], // transfer(address,uint256)
@@ -509,7 +521,7 @@ export circuit sendDeposit(key: Bytes<32>): [] {
     commitment: pending.requester,
     erc20: pending.addressA,
     amount: pending.amountA as Uint<64>,
-    knownHeight: stamp.knownHeight,
+    knownHeight: depositKnownHeight(requestId),
   });
   // Notify the MPC (depositEventMap's compiled ledger path, [1,3]).
   signetSigner.signBidirectional(
