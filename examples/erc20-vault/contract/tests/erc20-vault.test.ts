@@ -61,6 +61,7 @@ import {
   ledger,
   pureCircuits,
   queuedRequestKey,
+  VAULT_APPROVE_REQUESTS_PATH,
   VAULT_DEPOSIT_REQUESTS_PATH,
   VAULT_WITHDRAW_REQUESTS_PATH,
   type VaultPrivateState,
@@ -477,7 +478,7 @@ describe("deposit round-trip", () => {
     expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
       version: 1,
       callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
-      requestsPath: [1, 11],
+      requestsPath: [1, 9],
     });
 
     // The contract-composed envelope: the deposit's token on the
@@ -1068,7 +1069,7 @@ describe("withdraw round-trip", () => {
     expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
       version: 1,
       callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
-      requestsPath: [1, 13],
+      requestsPath: [1, 11],
     });
 
     // The vault's own account signs: the derivation path is the contract-fixed
@@ -1635,6 +1636,509 @@ describe("cross-action settle isolation", () => {
   });
 });
 
+// ---- Approve fixtures ----
+
+// The ERC20 approve(address,uint256) selector: the TS mirror of the literal
+// `Bytes [0x09, 0x5e, 0xa7, 0xb3]` hardcoded in erc20-vault.compact.
+const APPROVE_SELECTOR = new Uint8Array([0x09, 0x5e, 0xa7, 0xb3]);
+
+// The input index every approval fixture queues under, clear of the deposit and
+// withdraw fixtures' indexes.
+const APPROVE_INDEX = 21n;
+
+// The vault's gas settings initialise() stores, which every approval copies at start.
+const DEFAULT_APPROVE_GAS = { ...DEFAULT_VAULT_GAS, gasLimit: 100_000n };
+
+/**
+ * One of the two approvals: its start circuit called with every argument, the
+ * ERC20 the approve is called on and the spender it grants.
+ */
+interface ApprovalCase {
+  /** The start circuit the row calls. */
+  name: string;
+  /** The start call, queueing the approval under {@link APPROVE_INDEX}. */
+  start: (
+    contract: Contract<VaultPrivateState>,
+    ctx: CircuitContext<VaultPrivateState>,
+  ) => ReturnType<Contract<VaultPrivateState>["circuits"]["startApproveStata"]>;
+  /** The ERC20 the approve transaction is sent to. */
+  erc20Address: Uint8Array;
+  /** The spender the approve grants. */
+  spender: Uint8Array;
+}
+
+const ROUTER_APPROVAL: ApprovalCase = {
+  name: "startApproveRouter",
+  start: (contract, ctx) => contract.circuits.startApproveRouter(ctx, APPROVE_INDEX, ERC20),
+  erc20Address: ERC20,
+  spender: ROUTER,
+};
+
+const STATA_APPROVAL: ApprovalCase = {
+  name: "startApproveStata",
+  start: (contract, ctx) => contract.circuits.startApproveStata(ctx, APPROVE_INDEX),
+  erc20Address: STATA_UNDERLYING,
+  spender: STATA_TOKEN,
+};
+
+const APPROVALS: ApprovalCase[] = [ROUTER_APPROVAL, STATA_APPROVAL];
+
+/** Start, flush and send an approval, returning the send's context and the request key. */
+const approve = async (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  approval: ApprovalCase,
+) => {
+  const queued = (await approval.start(contract, ctx)).context;
+  const flushed = await flush(contract, queued, [APPROVE_INDEX], []);
+  const outKey = flushedRequestKey(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
+  const sent = await contract.circuits.sendApprove(flushed, outKey);
+  return { context: sent.context, outKey };
+};
+
+// ---- Approve tests ----
+
+describe("approve round-trip", () => {
+  it.each(APPROVALS)(
+    "$name records a vault-path approve(spender, unlimitedAllowance()) built from the flushed entry and its args",
+    async (approval) => {
+      const { erc20Address, spender } = approval;
+      const { contract, ctx } = await deployInitialised();
+
+      const { context: next, outKey } = await approve(contract, ctx, approval);
+      const state = next.callContext.currentQueryContext.state;
+
+      const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalApproveMap);
+      const rawLedger = readSignetRequestsLedgerFromState(state, VAULT_APPROVE_REQUESTS_PATH);
+      expect(typedIndex.size).toBe(1);
+      expect(rawLedger.requestsIndex).toEqual(typedIndex);
+      const [idHex, record] = first(typedIndex.entries(), "indexed approve request");
+
+      // The notification names THIS vault and the bidirectionalApproveMap.
+      const notificationEvent = first(
+        decodeSignetLogEvents(next.events, SIGNET_ADDRESS),
+        "signet notification event",
+      );
+      expect(notificationEvent.name).toBe(SignetEventName.SignBidirectionalEvent);
+      const notificationPost = decodeSignBidirectionalEventNotificationPayload(
+        notificationEvent.payload,
+      );
+      expect(requestIdHex(notificationPost.requestId)).toBe(idHex);
+      expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
+        version: 1,
+        callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
+        requestsPath: [1, 13],
+      });
+
+      expect(record.sender).toEqual({ bytes: VAULT_ADDRESS_BYTES });
+      expect(record.path).toEqual(asciiPadded("vault", 32));
+      const { calldata, ...envelope } = record.txParams;
+      expect(envelope).toEqual({
+        to: erc20Address,
+        chainId: CHAIN_ID,
+        nonce: 0n,
+        ...DEFAULT_APPROVE_GAS,
+        value: 0n,
+        accessListEntryCount: 0n,
+        accessList: [],
+      });
+      expect(record.executionDest).toEqual(EXPECTED_ROUTING.executionDest);
+      expect(record.keyVersion).toBe(MPC_KEY_VERSION);
+      expect(record.algo).toBe(EXPECTED_ROUTING.algo);
+      expect(record.signatureDest).toBe(EXPECTED_ROUTING.signatureDest);
+      expect(record.params).toEqual(EXPECTED_ROUTING.params);
+      expect(record.txParamType).toBe(TxParamType.evmType2);
+      expect(record.outputDeserializationSchema).toEqual(
+        EXPECTED_ROUTING.outputDeserializationSchema,
+      );
+      expect(record.respondSerializationSchema).toEqual(
+        EXPECTED_ROUTING.respondSerializationSchema,
+      );
+
+      // Contract-built calldata: approve(spender, unlimitedAllowance()).
+      expect(calldata.is_some).toBe(true);
+      expect(calldata.value.selector).toEqual(APPROVE_SELECTOR);
+      expect(calldata.value.noWords).toBe(2n);
+      expect(calldata.value.words).toHaveLength(2);
+      expect(calldata.value.words[0]).toEqual(evmAddressAbiWord(spender));
+      expect(calldata.value.words[1]).toEqual(numericAbiWord(pureCircuits.unlimitedAllowance()));
+
+      expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
+
+      const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+      expect(entry).toEqual({
+        action: Action.approve,
+        nonceIsVault: true,
+        evmNonce: 0n,
+        inIndex: APPROVE_INDEX,
+        commitment: pureCircuits.ownershipCommitment(APPROVE_INDEX, SECRET_KEY),
+        argsHash: expect.any(Uint8Array) as Uint8Array,
+      });
+      expect(lastSeen).toBe(EVM_START_HEIGHT);
+      expect(ledger(state).approveArgsMap.lookup(APPROVE_INDEX)).toEqual({
+        request: { erc20Address, spender },
+        gas: DEFAULT_APPROVE_GAS,
+      });
+      expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+      expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
+      expect(ledger(state).globalEvmNonce).toBe(1n);
+    },
+  );
+
+  it("unlimitedAllowance is 2^128 - 1, the largest allowance the Uint<128> word carries", () => {
+    expect(pureCircuits.unlimitedAllowance()).toBe(2n ** 128n - 1n);
+  });
+
+  it.each(APPROVALS)("$name surrenders nothing: no coin enters or leaves", async ({ start }) => {
+    const { contract, ctx } = await deployInitialised();
+
+    const started = (await start(contract, ctx)).context;
+
+    expect(zswapState(started).inputs).toHaveLength(0);
+    expect(zswapState(started).outputs).toHaveLength(0);
+  });
+
+  it("the router approval sends to the ERC20 it names", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const otherErc20 = bytes(20, 0xab);
+
+    const queued = (await contract.circuits.startApproveRouter(ctx, APPROVE_INDEX, otherErc20))
+      .context;
+    const flushed = await flush(contract, queued, [APPROVE_INDEX], []);
+    const outKey = flushedRequestKey(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
+    const sent = (await contract.circuits.sendApprove(flushed, outKey)).context;
+
+    const record = first(
+      toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalApproveMap).values(),
+      "approve request",
+    );
+    expect(record.txParams.to).toEqual(otherErc20);
+    expect(record.txParams.calldata.value.words[0]).toEqual(evmAddressAbiWord(ROUTER));
+  });
+
+  it("an approval and a withdrawal share the vault nonce: one flush assigns 0 and 1 in slot order", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedApproval = (await ROUTER_APPROVAL.start(contract, ctx)).context;
+    const queuedBoth = (await queueWithdraw(contract, queuedApproval, VALID_WITHDRAW)).context;
+
+    const flushed = await flush(contract, queuedBoth, [APPROVE_INDEX, VALID_WITHDRAW.inIndex], []);
+
+    const state = ledgerOf(flushed);
+    const approveKey = flushedRequestKey(state, Action.approve, APPROVE_INDEX);
+    const withdrawKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
+    expect(state.outputRequestBuffer.lookup(approveKey).entry.evmNonce).toBe(0n);
+    expect(state.outputRequestBuffer.lookup(withdrawKey).entry.evmNonce).toBe(1n);
+    expect(state.globalEvmNonce).toBe(2n);
+  });
+});
+
+describe("approve validation", () => {
+  it("startApproveRouter rejects a zero ERC20 address", async () => {
+    const { contract, ctx } = await deployInitialised();
+    await expect(
+      contract.circuits.startApproveRouter(ctx, APPROVE_INDEX, ZERO_ADDRESS),
+    ).rejects.toThrow(/ERC20 address cannot be zero/);
+  });
+
+  it.each(APPROVALS)("$name rejects a caller other than the deployer", async ({ name, start }) => {
+    const { contract, ctx } = await deployInitialised();
+    await expect(start(contract, await strangerContext(name, ctx))).rejects.toThrow(
+      /Not the deployer/,
+    );
+  });
+
+  it.each(APPROVALS)("$name rejects before initialise", async ({ start }) => {
+    const { contract, ctx } = await deployContract();
+    await expect(start(contract, ctx)).rejects.toThrow(/Not initialised/);
+  });
+
+  it.each(APPROVALS)("$name rejects an index the input buffer holds", async ({ start }) => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await start(contract, ctx)).context;
+    await expect(start(contract, queued)).rejects.toThrow(/Index already in use/);
+  });
+
+  it.each(APPROVALS)(
+    "$name rejects an index another action's queued request holds",
+    async ({ start }) => {
+      const { contract, ctx } = await deployInitialised();
+      const queued = (
+        await queueWithdraw(contract, ctx, { ...VALID_WITHDRAW, inIndex: APPROVE_INDEX })
+      ).context;
+      await expect(start(contract, queued)).rejects.toThrow(/Index already in use/);
+    },
+  );
+
+  it.each(APPROVALS)(
+    "$name rejects an index the flush freed while its args stay in approveArgsMap",
+    async ({ start }) => {
+      const { contract, ctx } = await deployInitialised();
+      const queued = (await start(contract, ctx)).context;
+      const flushed = await flush(contract, queued, [APPROVE_INDEX], []);
+      expect(ledgerOf(flushed).inputRequestBuffer.member(APPROVE_INDEX)).toBe(false);
+      await expect(start(contract, flushed)).rejects.toThrow(/Index already in use/);
+    },
+  );
+});
+
+describe("sendApprove", () => {
+  it("is permissionless: a stranger sends the deployer's approval as queued", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await ROUTER_APPROVAL.start(contract, ctx)).context;
+    const flushed = await flush(contract, queued, [APPROVE_INDEX], []);
+    const outKey = flushedRequestKey(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
+
+    const sent = (
+      await contract.circuits.sendApprove(await strangerContext("sendApprove", flushed), outKey)
+    ).context;
+    const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalApproveMap);
+    expect(index.size).toBe(1);
+    const record = first(index.values(), "approve request");
+    expect(record.path).toEqual(asciiPadded("vault", 32));
+    expect(record.txParams.nonce).toBe(0n);
+  });
+
+  it("rejects a key the flush has not moved", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await ROUTER_APPROVAL.start(contract, ctx)).context;
+    await expect(contract.circuits.sendApprove(queued, bytes(32, 0x5a))).rejects.toThrow(
+      /Request not flushed/,
+    );
+  });
+
+  it("rejects a second send of the same request", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const { context: sent, outKey } = await approve(contract, ctx, ROUTER_APPROVAL);
+    await expect(contract.circuits.sendApprove(sent, outKey)).rejects.toThrow(
+      /Request already sent/,
+    );
+  });
+
+  it("rejects a flushed withdrawal's key, and sendWithdraw rejects a flushed approval's", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedApproval = (await ROUTER_APPROVAL.start(contract, ctx)).context;
+    const queuedBoth = (await queueWithdraw(contract, queuedApproval, VALID_WITHDRAW)).context;
+    const flushed = await flush(contract, queuedBoth, [APPROVE_INDEX, VALID_WITHDRAW.inIndex], []);
+    const approveKey = flushedRequestKey(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
+    const withdrawKey = flushedRequestKey(
+      ledgerOf(flushed),
+      Action.withdraw,
+      VALID_WITHDRAW.inIndex,
+    );
+
+    await expect(contract.circuits.sendApprove(flushed, withdrawKey)).rejects.toThrow(
+      /Wrong action/,
+    );
+    await expect(contract.circuits.sendWithdraw(flushed, approveKey)).rejects.toThrow(
+      /Wrong action/,
+    );
+  });
+});
+
+/**
+ * Deploy + initialise + approve(ROUTER_APPROVAL): the arrange step of every
+ * complete-approve test. Returns the sent approval's request id (the single
+ * approve map key) alongside the threaded context.
+ */
+const approveRequested = async () => {
+  const { contract, ctx } = await deployInitialised();
+  const { context: next } = await approve(contract, ctx, ROUTER_APPROVAL);
+  const index = toSignBidirectionalEventIndex(ledgerOf(next).bidirectionalApproveMap);
+  const idHex = first(index.keys(), "approve request id");
+  return { contract, ctx: next, requestId: requestIdBytes(idHex) };
+};
+
+/** One verdict the MPC can attest for an approval, and the output completeApprove is passed. */
+interface ApproveVerdictCase {
+  /** Test name, completing the sentence "closes <name> without minting". */
+  name: string;
+  /** The verdict the MPC attests. */
+  outputKind: OutputKind;
+  /** The output the MPC signs (empty under a failure kind). */
+  signedOutput: Uint8Array;
+  /** The output completeApprove is passed. */
+  presentedOutput: Uint8Array;
+}
+
+const APPROVE_VERDICT_CASES: ApproveVerdictCase[] = [
+  {
+    name: "an approve that returned true",
+    outputKind: OutputKind.executed,
+    signedOutput: OUTPUT_SUCCESS,
+    presentedOutput: OUTPUT_SUCCESS,
+  },
+  {
+    name: "an approve that returned false",
+    outputKind: OutputKind.executed,
+    signedOutput: OUTPUT_FALSE,
+    presentedOutput: OUTPUT_FALSE,
+  },
+  {
+    name: "a reverted approve (failed)",
+    outputKind: OutputKind.failed,
+    signedOutput: OUTPUT_EMPTY,
+    presentedOutput: OUTPUT_IGNORED,
+  },
+  {
+    name: "an approve whose nonce another transaction took (unviable)",
+    outputKind: OutputKind.unviable,
+    signedOutput: OUTPUT_EMPTY,
+    presentedOutput: OUTPUT_IGNORED,
+  },
+];
+
+describe("completeApprove settle", () => {
+  it.each(APPROVE_VERDICT_CASES)(
+    "closes $name without minting and consumes the request",
+    async ({ outputKind, signedOutput, presentedOutput }) => {
+      const { contract, ctx, requestId } = await approveRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        signedOutput,
+        ATTESTED_HEIGHT,
+      );
+      const attested =
+        outputKind === OutputKind.executed
+          ? await attest(contract, ctx, attestation, signedOutput)
+          : await attestFailure(contract, ctx, attestation);
+
+      const next = (await contract.circuits.completeApprove(attested, requestId, presentedOutput))
+        .context;
+
+      expect(shieldedMintsOf(next)).toEqual([]);
+      const state = ledgerOf(next);
+      expect(state.bidirectionalApproveMap.isEmpty()).toBe(true);
+      expect(state.approveArgsMap.isEmpty()).toBe(true);
+      expect(state.outputRequestBuffer.isEmpty()).toBe(true);
+      expect(state.outputAttestationBuffer.isEmpty()).toBe(true);
+      expect(state.evictionMap.isEmpty()).toBe(true);
+    },
+  );
+
+  it.each(APPROVE_VERDICT_CASES)(
+    "rejects a caller other than the deployer who started it, for $name",
+    async ({ outputKind, signedOutput, presentedOutput }) => {
+      const { contract, ctx, requestId } = await approveRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        signedOutput,
+        ATTESTED_HEIGHT,
+      );
+      const attested =
+        outputKind === OutputKind.executed
+          ? await attest(contract, ctx, attestation, signedOutput)
+          : await attestFailure(contract, ctx, attestation);
+
+      await expect(
+        contract.circuits.completeApprove(
+          await strangerContext("completeApprove", attested),
+          requestId,
+          presentedOutput,
+        ),
+      ).rejects.toThrow(/Not the requester/);
+    },
+  );
+
+  it("rejects a false output presented for an approve attested as returning true", async () => {
+    const { contract, ctx, requestId } = await approveRequested();
+    const attested = await attest(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    await expect(
+      contract.circuits.completeApprove(attested, requestId, OUTPUT_FALSE),
+    ).rejects.toThrow(/Output does not match the attestation/);
+  });
+
+  it.each([
+    { name: "queueAttestation1", outputKind: OutputKind.executed, output: OUTPUT_SUCCESS },
+    { name: "queueAttestation0", outputKind: OutputKind.failed, output: OUTPUT_EMPTY },
+  ])(
+    "$name refuses an attestation at or below the approval's lastSeen",
+    async ({ outputKind, output }) => {
+      const { contract, ctx, requestId } = await approveRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        output,
+        EVM_START_HEIGHT,
+      );
+      await expect(
+        outputKind === OutputKind.executed
+          ? contract.circuits.queueAttestation1(ctx, attestation, output)
+          : contract.circuits.queueAttestation0(ctx, attestation, output),
+      ).rejects.toThrow(/Stale attestation/);
+    },
+  );
+
+  it("settles once: a second completeApprove for the same request rejects", async () => {
+    const { contract, ctx, requestId } = await approveRequested();
+    const attested = await attest(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    const next = (await contract.circuits.completeApprove(attested, requestId, OUTPUT_SUCCESS))
+      .context;
+    await expect(
+      contract.circuits.completeApprove(next, requestId, OUTPUT_SUCCESS),
+    ).rejects.toThrow(/Request not sent/);
+  });
+
+  it("completeApprove rejects a withdrawal's request id, and completeWithdraw an approval's", async () => {
+    const { contract, ctx, requestId: approveId } = await approveRequested();
+    const { context: withdrawn } = await withdraw(contract, ctx, VALID_WITHDRAW);
+    const withdrawId = requestIdBytes(
+      first(
+        toSignBidirectionalEventIndex(ledgerOf(withdrawn).bidirectionalWithdrawMap).keys(),
+        "withdraw request id",
+      ),
+    );
+    const approveQueued = (
+      await contract.circuits.queueAttestation1(
+        withdrawn,
+        respond(
+          MPC_RESPONSE_SECRET,
+          approveId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      )
+    ).context;
+    const bothQueued = (
+      await contract.circuits.queueAttestation1(
+        approveQueued,
+        respond(
+          MPC_RESPONSE_SECRET,
+          withdrawId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      )
+    ).context;
+    const attested = await flush(contract, bothQueued, [], [approveId, withdrawId]);
+
+    await expect(
+      contract.circuits.completeApprove(attested, withdrawId, OUTPUT_SUCCESS),
+    ).rejects.toThrow(/Wrong action/);
+    await expect(
+      contract.circuits.completeWithdraw(attested, approveId, OUTPUT_SUCCESS, MINT_NONCE),
+    ).rejects.toThrow(/Wrong action/);
+  });
+});
+
 interface VaultCall {
   contractAddress: string;
   publicTranscript: unknown;
@@ -1757,6 +2261,32 @@ describe("throughput: requests never pin shared state, only the flush does", () 
       flushSlots([second.inIndex], []),
     );
     expect(replay(stateOf(firstFlush.context), secondFlush, true)).toMatch(/^REJECTED/);
+  });
+  it("an approval start applies after a concurrent flush moved the vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const withdrawFlush = await contract.circuits.flushQueue(
+      queued,
+      flushSlots([VALID_WITHDRAW.inIndex], []),
+    );
+    const approvalStart = await ROUTER_APPROVAL.start(contract, queued);
+    expect(ledgerOf(withdrawFlush.context).globalEvmNonce).toBe(1n);
+    expect(replay(stateOf(withdrawFlush.context), approvalStart, true)).toBe("applied");
+  });
+
+  it("a flush moving an approval conflicts with a concurrent flush moving a withdrawal on the vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedApproval = (await ROUTER_APPROVAL.start(contract, ctx)).context;
+    const queuedBoth = (await queueWithdraw(contract, queuedApproval, VALID_WITHDRAW)).context;
+    const withdrawFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([VALID_WITHDRAW.inIndex], []),
+    );
+    const approvalFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([APPROVE_INDEX], []),
+    );
+    expect(replay(stateOf(withdrawFlush.context), approvalFlush, true)).toMatch(/^REJECTED/);
   });
 });
 
@@ -1958,6 +2488,38 @@ describe("gas parameters reach the constructed transaction", () => {
       maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
       maxPriorityFeePerGas: DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
       gasLimit: DEFAULT_WITHDRAW_GAS_LIMIT,
+    });
+  });
+
+  it.each(APPROVALS)(
+    "$name carries the updated fee envelope and the APPROVE gas limit",
+    async (approval) => {
+      const { contract, ctx } = await deployInitialised();
+      const configured = (await setGasParams(contract, ctx, NEW_GAS_PARAMS)).context;
+
+      const next = (await approve(contract, configured, approval)).context;
+
+      expect(envelopeOf(ledgerOf(next).bidirectionalApproveMap)).toEqual({
+        maxFeePerGas: NEW_MAX_FEE_PER_GAS,
+        maxPriorityFeePerGas: NEW_MAX_PRIORITY_FEE_PER_GAS,
+        gasLimit: NEW_APPROVE_GAS_LIMIT,
+      });
+    },
+  );
+
+  it("an approval keeps the gas it was queued with when setGasParams runs before its send", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await ROUTER_APPROVAL.start(contract, ctx)).context;
+    const flushed = await flush(contract, queued, [APPROVE_INDEX], []);
+    const outKey = flushedRequestKey(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
+    const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
+
+    const sent = (await contract.circuits.sendApprove(reconfigured, outKey)).context;
+
+    expect(envelopeOf(ledgerOf(sent).bidirectionalApproveMap)).toEqual({
+      maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
+      maxPriorityFeePerGas: DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+      gasLimit: DEFAULT_APPROVE_GAS_LIMIT,
     });
   });
 

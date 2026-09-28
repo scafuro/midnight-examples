@@ -189,7 +189,7 @@ export circuit setGasParams(
 // Keep at least two variants: a one-variant enum in a hashed struct compiles to a
 // field element the ledger parses as zero bytes, and proofs then fail the proof
 // server's alignment check.
-export enum Action { deposit, withdraw }
+export enum Action { deposit, withdraw, approve }
 
 // The EIP-1559 fee envelope of a request's EVM transaction, fixed at start.
 export struct GasParams {
@@ -442,7 +442,7 @@ export struct DepositArgs {
 }
 
 // Deposit requests (2-word ERC20 transfer, 34-byte schemas).
-// Compiled path for MPC notification: [1, 11] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [1, 9] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalDepositMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the deposit queued under it, from start to complete.
@@ -534,11 +534,11 @@ export circuit sendDeposit(outKey: Bytes<32>): [] {
   bidirectionalDepositMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [1, 11]).
+  // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [1, 9]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [1, 11, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [1, 9, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -603,7 +603,7 @@ export struct WithdrawArgs {
 }
 
 // Withdraw requests (2-word ERC20 transfer, 34-byte schemas).
-// Compiled path for MPC notification: [1, 13] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [1, 11] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalWithdrawMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the withdrawal queued under it, from start to complete.
@@ -705,11 +705,11 @@ export circuit sendWithdraw(outKey: Bytes<32>): [] {
   bidirectionalWithdrawMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalWithdrawMap's compiled ledger path, [1, 13]).
+  // Notify the MPC (bidirectionalWithdrawMap's compiled ledger path, [1, 11]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [1, 13, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [1, 11, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -752,6 +752,170 @@ export circuit completeWithdraw(
       args.request.amount as Uint<64>,
       disclose(mintNonce),
       left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey())
+    );
+  }
+}
+
+// ==== Approve ========================================================================
+// approve(spender, unlimitedAllowance()) on the ERC20, signed by the MPC with the vault's
+// own account at a nonce the flush assigns, under the vault's gas settings. The router
+// approval names the ERC20 and grants uniswapRouter. The stata approval grants
+// stataToken on stataUnderlying.
+
+export struct ApproveRequest {
+  erc20Address: Bytes<20>;
+  spender: Bytes<20>;
+}
+
+export struct ApproveArgs {
+  request: ApproveRequest;
+  gas: GasParams;
+}
+
+// Approve requests of both spenders (2-word ERC20 approve, 34-byte schemas).
+// Compiled path for MPC notification: [1, 13] (read from managed/erc20-vault/compiler/contract-info.json).
+export ledger bidirectionalApproveMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
+
+// inIndex -> the arguments of the approval queued under it, from start to complete.
+export ledger approveArgsMap: Map<Uint<64>, ApproveArgs>;
+
+circuit approveArgsHash(args: ApproveArgs): Bytes<32> {
+  return upgradeFromTransient(transientHash<[Bytes<32>, ApproveArgs]>([
+    pad(32, "vault:approve:args"),
+    args
+  ]));
+}
+
+// The allowance every approval grants: 2^128-1, so one approval per token and spender
+// suffices forever.
+export pure circuit unlimitedAllowance(): Uint<128> {
+  return 340282366920938463463374607431768211455;
+}
+
+// The deployer gate and the queueing both approval starts share, run after each start's
+// own validation. The vault's account signs and pays, so the gas is the vault's own
+// setting at start.
+circuit queueApprove(inIndex: Uint<64>, approveRequest: ApproveRequest): [] {
+  assert(userCommitment(callerSecretKey()) == deployer, "Not the deployer");
+
+  const disclosedIndex = disclose(inIndex);
+  assert(
+    !inputRequestBuffer.member(disclosedIndex) && !approveArgsMap.member(disclosedIndex),
+    "Index already in use"
+  );
+
+  const args = disclose(ApproveArgs {
+    request: approveRequest,
+    gas: GasParams {
+      gasLimit: vaultGasLimits.approve,
+      maxFeePerGas: vaultMaxFeePerGas,
+      maxPriorityFeePerGas: vaultMaxPriorityFeePerGas,
+    },
+  });
+  approveArgsMap.insert(disclosedIndex, args);
+  inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
+    action: Action.approve,
+    nonceIsVault: true,
+    evmNonce: 0 as Uint<64>,
+    inIndex: inIndex,
+    commitment: ownershipCommitment(inIndex, callerSecretKey()),
+    argsHash: approveArgsHash(args),
+  }));
+}
+
+// Queues the vault's approval of the pinned Uniswap router to spend erc20Address, which
+// a swap of that token needs, under inIndex, a caller-chosen random index.
+// Deployer-gated.
+export circuit startApproveRouter(inIndex: Uint<64>, erc20Address: Bytes<20>): [] {
+  requireInitialised();
+  assert(erc20Address as Field != 0 as Field, "ERC20 address cannot be zero");
+  queueApprove(inIndex, ApproveRequest {
+    erc20Address: erc20Address,
+    spender: uniswapRouter,
+  });
+}
+
+// Queues the vault's approval of the pinned stataToken wrapper to spend
+// stataUnderlying, which a supply needs, under inIndex, a caller-chosen random index.
+// Deployer-gated.
+export circuit startApproveStata(inIndex: Uint<64>): [] {
+  requireInitialised();
+  queueApprove(inIndex, ApproveRequest {
+    erc20Address: stataUnderlying,
+    spender: stataToken,
+  });
+}
+
+// Records the flushed approval's SignBidirectionalEvent and notifies the MPC.
+// Permissionless: the entry and its args fix every byte of the EVM transaction, so a
+// second send of the same entry names the same request id and is refused.
+export circuit sendApprove(outKey: Bytes<32>): [] {
+  requireInitialised();
+  const disclosedKey = disclose(outKey);
+  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  assert(entry.action == Action.approve, "Wrong action");
+  const args = approveArgsMap.lookup(entry.inIndex);
+  const calldata = EvmCalldata<2> {
+    selector: Bytes [0x09, 0x5e, 0xa7, 0xb3], // approve(address,uint256)
+    noWords: 2 as Uint<16>,
+    words: [
+      evmAddressAbiWord(args.request.spender),
+      numericAbiWord(unlimitedAllowance()),
+    ]
+  };
+  const txParams = EvmType2TxParams<2, 0, 0> {
+    chainId: evmChainId,
+    nonce: entry.evmNonce,
+    maxPriorityFeePerGas: args.gas.maxPriorityFeePerGas,
+    maxFeePerGas: args.gas.maxFeePerGas,
+    gasLimit: args.gas.gasLimit,
+    to: args.request.erc20Address,
+    value: 0 as Uint<128>,
+    calldata: some<EvmCalldata<2>>(calldata),
+    accessListEntryCount: 0,
+    accessList: []
+  };
+  const schema = vaultResponseSchema();
+  const request = constructSignBidirectionalEventV1<EvmType2TxParams<2, 0, 0>, 34, 34>(
+    mpcKeyVersion, kernel.self(), pad(32, "vault"),
+    MPCSignatureAlgorithm.ecdsa, TxParamType.evmType2, txParams, ethereumCaip2Id(),
+    MPCDestination.unused, pad(64, ""), schema, schema
+  );
+  const requestId = calculateEvmType2RequestIdV1<2, 0, 0, 34, 34>(request);
+  assert(!bidirectionalApproveMap.member(requestId), "Request already sent");
+  bidirectionalApproveMap.insert(requestId, request);
+  evictionMap.insert(requestId, disclosedKey);
+
+  // Notify the MPC (bidirectionalApproveMap's compiled ledger path, [1, 13]).
+  signetSigner.signBidirectional(
+    requestId,
+    constructSignBidirectionalEventNotificationV1(
+      kernel.self(), 2 as Uint<8>, [1, 13, 0, 0] as Vector<4, Uint<8>>,
+    ),
+  );
+}
+
+// Settles an approval on any verdict. Executed: checks the output against the
+// attestation. An approval surrendered nothing, so every verdict only closes the
+// request, and on a failure serializedOutput is ignored. Requester-gated (the deployer
+// who started it), one settle per request.
+export circuit completeApprove(requestId: RequestId, serializedOutput: Bytes<1>): [] {
+  requireInitialised();
+  const disclosedId = disclose(requestId);
+  const settled = settleRequest(disclosedId, Action.approve);
+  const entry = settled[0];
+  const record = settled[1];
+  approveArgsMap.remove(entry.inIndex);
+  assert(bidirectionalApproveMap.member(disclosedId), "Request event missing");
+  bidirectionalApproveMap.remove(disclosedId);
+
+  if (record.outputKind == OutputKind.executed) {
+    assert(
+      calculateSignetAttestationDigestV1<1>(
+        disclosedId, record.blockHeight, record.outputKind, disclose(serializedOutput)
+      ) == record.digest,
+      "Output does not match the attestation"
     );
   }
 }
