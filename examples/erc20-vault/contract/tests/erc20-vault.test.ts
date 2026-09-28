@@ -165,10 +165,9 @@ const EXPECTED_ROUTING = {
 };
 
 /**
- * A deposit's arguments across its two calls: `startDeposit` takes the input
- * index, the caller's EVM nonce and the `DepositRequest`, `sendDeposit` takes
- * the gas envelope. The derivation path IS the caller's identity commitment,
- * recomputed in-circuit from the secret-key witness.
+ * A deposit's `startDeposit` arguments: the input index, the caller's EVM nonce,
+ * the gas envelope and the `DepositRequest`. The derivation path IS the caller's
+ * identity commitment, recomputed in-circuit from the secret-key witness.
  */
 interface DepositCallArgs {
   inIndex: bigint;
@@ -266,35 +265,31 @@ const deployInitialised = async () => {
   return { contract, ctx: next };
 };
 
-/** One flushQueue call carrying the given request indexes and attestation digests. */
+/** One flushQueue call carrying the given request indexes and attestation request ids. */
 const flush = async (
   contract: Contract<VaultPrivateState>,
   ctx: CircuitContext<VaultPrivateState>,
   inIndexes: readonly bigint[],
-  digests: readonly Uint8Array[],
+  requestIds: readonly Uint8Array[],
 ): Promise<CircuitContext<VaultPrivateState>> =>
-  (await contract.circuits.flushQueue(ctx, flushSlots(inIndexes, digests))).context;
+  (await contract.circuits.flushQueue(ctx, flushSlots(inIndexes, requestIds))).context;
 
 /** Queue a deposit: startDeposit with its args in circuit order. */
 const queueDeposit = (
   contract: Contract<VaultPrivateState>,
   ctx: Parameters<Contract<VaultPrivateState>["circuits"]["startDeposit"]>[0],
   args: DepositCallArgs,
-) => contract.circuits.startDeposit(ctx, args.inIndex, args.evmNonce, args.deposit);
-
-/** Send a flushed deposit: sendDeposit with its gas args in circuit order. */
-const sendDeposit = (
-  contract: Contract<VaultPrivateState>,
-  ctx: Parameters<Contract<VaultPrivateState>["circuits"]["sendDeposit"]>[0],
-  outKey: Uint8Array,
-  args: DepositCallArgs,
 ) =>
-  contract.circuits.sendDeposit(
+  contract.circuits.startDeposit(
     ctx,
-    outKey,
-    args.gasLimit,
-    args.maxFeePerGas,
-    args.maxPriorityFeePerGas,
+    args.inIndex,
+    args.evmNonce,
+    {
+      gasLimit: args.gasLimit,
+      maxFeePerGas: args.maxFeePerGas,
+      maxPriorityFeePerGas: args.maxPriorityFeePerGas,
+    },
+    args.deposit,
   );
 
 /** Queue, flush and send a deposit, returning the send's context and the request key. */
@@ -306,7 +301,7 @@ const deposit = async (
   const queued = (await queueDeposit(contract, ctx, args)).context;
   const outKey = queuedRequestKey(ledgerOf(queued), args.inIndex);
   const flushed = await flush(contract, queued, [args.inIndex], []);
-  const sent = await sendDeposit(contract, flushed, outKey, args);
+  const sent = await contract.circuits.sendDeposit(flushed, outKey);
   return { context: sent.context, outKey };
 };
 
@@ -479,7 +474,7 @@ describe("deposit round-trip", () => {
     expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
       version: 1,
       callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
-      requestsPath: [0, 0],
+      requestsPath: [1, 12],
     });
 
     // The contract-composed envelope: the deposit's token on the
@@ -532,20 +527,28 @@ describe("deposit round-trip", () => {
     expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
 
     // The flushed entry sits under its request key with the height the flush
-    // recorded, and the send mapped the request id back to that key.
-    expect(ledger(state).outputRequestBuffer.lookup(outKey)).toEqual({
-      entry: {
-        action: Action.deposit,
-        nonceIsVault: false,
-        evmNonce: VALID_DEPOSIT.evmNonce,
-        inIndex: VALID_DEPOSIT.inIndex,
-        commitment: pureCircuits.ownershipCommitment(VALID_DEPOSIT.inIndex, SECRET_KEY),
-        depositArgs: { request: VALID_DEPOSIT.deposit, path: DEPLOYER_COMMITMENT },
+    // recorded, its arguments sit in depositArgsMap under its input index, and
+    // the send mapped the request id back to that key.
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    expect(entry).toEqual({
+      action: Action.deposit,
+      nonceIsVault: false,
+      evmNonce: VALID_DEPOSIT.evmNonce,
+      inIndex: VALID_DEPOSIT.inIndex,
+      commitment: pureCircuits.ownershipCommitment(VALID_DEPOSIT.inIndex, SECRET_KEY),
+      argsHash: expect.any(Uint8Array) as Uint8Array,
+    });
+    expect(lastSeen).toBe(EVM_START_HEIGHT);
+    expect(ledger(state).depositArgsMap.lookup(VALID_DEPOSIT.inIndex)).toEqual({
+      request: VALID_DEPOSIT.deposit,
+      path: DEPLOYER_COMMITMENT,
+      gas: {
+        gasLimit: VALID_DEPOSIT.gasLimit,
+        maxFeePerGas: VALID_DEPOSIT.maxFeePerGas,
+        maxPriorityFeePerGas: VALID_DEPOSIT.maxPriorityFeePerGas,
       },
-      lastSeen: EVM_START_HEIGHT,
     });
     expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
-    expect(ledger(state).sentRequestKeys.member(outKey)).toBe(true);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
   });
 });
@@ -605,7 +608,7 @@ describe("deposit validation", () => {
 
     expect(ledgerOf(flushed).inputRequestBuffer.member(repeat.inIndex)).toBe(true);
     expect(ledgerOf(flushed).outputRequestBuffer.size()).toBe(1n);
-    await expect(sendDeposit(contract, flushed, outKey, repeat)).rejects.toThrow(
+    await expect(contract.circuits.sendDeposit(flushed, outKey)).rejects.toThrow(
       /Request already sent/,
     );
   });
@@ -649,6 +652,12 @@ const OUTPUT_SUCCESS = serializeRespondOutput(VAULT_RESPONSE_SCHEMA, { success: 
 // An EXECUTED transfer that returned false: one 0x00 byte.
 const OUTPUT_FALSE = serializeRespondOutput(VAULT_RESPONSE_SCHEMA, { success: false });
 
+// A failed or unviable execution attests an empty output (queueAttestation0).
+const OUTPUT_EMPTY = new Uint8Array(0);
+
+// completeDeposit takes a 1-byte output on every verdict and ignores it on a failure.
+const OUTPUT_IGNORED = new Uint8Array(1);
+
 /**
  * Sign a REAL RespondBidirectionalEvent for (requestId, blockHeight,
  * outputKind, serializedOutput) with `secretKey`: the record comes from the
@@ -672,22 +681,16 @@ const respond = (
     attestRespondBidirectional({ requestId, blockHeight, outputKind, serializedOutput }, secretKey),
   );
 
-/**
- * Queue a 1-byte attestation and flush it: the arrange step before a settle.
- * Returns the flushed context and the digest the vault holds the record under.
- */
+/** Queue a 1-byte attestation and flush it: the arrange step before a settle. */
 const attest = async (
   contract: Contract<VaultPrivateState>,
   ctx: CircuitContext<VaultPrivateState>,
   attestation: RespondBidirectionalEvent,
   serializedOutput: Uint8Array,
-) => {
+): Promise<CircuitContext<VaultPrivateState>> => {
   const queued = (await contract.circuits.queueAttestation1(ctx, attestation, serializedOutput))
     .context;
-  return {
-    ctx: await flush(contract, queued, [], [attestation.digest]),
-    digest: attestation.digest,
-  };
+  return flush(contract, queued, [], [attestation.requestId]);
 };
 
 // ---- Settle fixtures ----
@@ -760,9 +763,8 @@ describe("completeDeposit settle", () => {
 
     const next = (
       await contract.circuits.completeDeposit(
-        attested.ctx,
+        attested,
         requestId,
-        attested.digest,
         OUTPUT_SUCCESS,
         MINT_NONCE,
         recipient,
@@ -775,7 +777,7 @@ describe("completeDeposit settle", () => {
     expect(state.outputRequestBuffer.isEmpty()).toBe(true);
     expect(state.outputAttestationBuffer.isEmpty()).toBe(true);
     expect(state.evictionMap.isEmpty()).toBe(true);
-    expect(state.sentRequestKeys.isEmpty()).toBe(true);
+    expect(state.depositArgsMap.isEmpty()).toBe(true);
   });
 
   it("queueAttestation1 rejects a response signed by a key other than the stored MPC response key", async () => {
@@ -800,9 +802,8 @@ describe("completeDeposit settle", () => {
 
     const next = (
       await contract.circuits.completeDeposit(
-        attested.ctx,
+        attested,
         requestId,
-        attested.digest,
         OUTPUT_FALSE,
         MINT_NONCE,
         CALLER_RECIPIENT,
@@ -815,7 +816,7 @@ describe("completeDeposit settle", () => {
     expect(state.outputRequestBuffer.isEmpty()).toBe(true);
     expect(state.outputAttestationBuffer.isEmpty()).toBe(true);
     expect(state.evictionMap.isEmpty()).toBe(true);
-    expect(state.sentRequestKeys.isEmpty()).toBe(true);
+    expect(state.depositArgsMap.isEmpty()).toBe(true);
   });
 
   it("queueAttestation1 rejects presented output bytes that differ from what was signed", async () => {
@@ -846,9 +847,8 @@ describe("completeDeposit settle", () => {
     );
     await expect(
       contract.circuits.completeDeposit(
-        attested.ctx,
+        attested,
         requestId,
-        attested.digest,
         OUTPUT_SUCCESS,
         MINT_NONCE,
         CALLER_RECIPIENT,
@@ -856,26 +856,34 @@ describe("completeDeposit settle", () => {
     ).rejects.toThrow(/Output does not match the attestation/);
   });
 
-  it("rejects a genuinely signed failure kind at the executed width", async () => {
+  it("closes a genuinely signed failed sweep without minting", async () => {
     const { contract, ctx, requestId } = await depositRequested();
-    // The kind is inside the signed digest: a failure attestation over a
-    // 1-byte success output never claims.
-    const attested = await attest(
-      contract,
-      ctx,
-      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.failed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
-      OUTPUT_SUCCESS,
-    );
-    await expect(
-      contract.circuits.completeDeposit(
-        attested.ctx,
+    const queued = (
+      await contract.circuits.queueAttestation0(
+        ctx,
+        respond(MPC_RESPONSE_SECRET, requestId, OutputKind.failed, OUTPUT_EMPTY, ATTESTED_HEIGHT),
+        OUTPUT_EMPTY,
+      )
+    ).context;
+    const flushed = await flush(contract, queued, [], [requestId]);
+
+    const next = (
+      await contract.circuits.completeDeposit(
+        flushed,
         requestId,
-        attested.digest,
-        OUTPUT_SUCCESS,
+        OUTPUT_IGNORED,
         MINT_NONCE,
         CALLER_RECIPIENT,
-      ),
-    ).rejects.toThrow(/Attestation is not an execution/);
+      )
+    ).context;
+
+    expect(next.callContext.currentQueryContext.effects.shieldedMints.size).toBe(0);
+    const state = ledgerOf(next);
+    expect(state.bidirectionalDepositMap.isEmpty()).toBe(true);
+    expect(state.outputRequestBuffer.isEmpty()).toBe(true);
+    expect(state.outputAttestationBuffer.isEmpty()).toBe(true);
+    expect(state.evictionMap.isEmpty()).toBe(true);
+    expect(state.depositArgsMap.isEmpty()).toBe(true);
   });
 
   it("queueAttestation1 rejects a genuinely signed id this vault never sent", async () => {
@@ -906,9 +914,8 @@ describe("completeDeposit settle", () => {
     );
     const next = (
       await contract.circuits.completeDeposit(
-        attested.ctx,
+        attested,
         requestId,
-        attested.digest,
         OUTPUT_SUCCESS,
         MINT_NONCE,
         CALLER_RECIPIENT,
@@ -918,7 +925,6 @@ describe("completeDeposit settle", () => {
       contract.circuits.completeDeposit(
         next,
         requestId,
-        attested.digest,
         OUTPUT_SUCCESS,
         MINT_NONCE,
         CALLER_RECIPIENT,
@@ -939,9 +945,8 @@ describe("completeDeposit settle", () => {
     );
     await expect(
       contract.circuits.completeDeposit(
-        await strangerContext("completeDeposit", attested.ctx),
+        await strangerContext("completeDeposit", attested),
         requestId,
-        attested.digest,
         OUTPUT_SUCCESS,
         MINT_NONCE,
         OTHER_WALLET_RECIPIENT,
@@ -1249,7 +1254,7 @@ describe("attested block heights", () => {
       respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, settledAt),
       OUTPUT_SUCCESS,
     );
-    expect(ledgerOf(attested.ctx).globalLastSeen).toBe(settledAt);
+    expect(ledgerOf(attested).globalLastSeen).toBe(settledAt);
   });
 
   it("a re-issued deposit cannot reuse the attestation of its first execution", async () => {
@@ -1265,9 +1270,8 @@ describe("attested block heights", () => {
     const attested = await attest(contract, ctx, attestation, OUTPUT_SUCCESS);
     const settled = (
       await contract.circuits.completeDeposit(
-        attested.ctx,
+        attested,
         requestId,
-        attested.digest,
         OUTPUT_SUCCESS,
         MINT_NONCE,
         CALLER_RECIPIENT,
@@ -1302,14 +1306,12 @@ describe("attested block heights", () => {
       const queuedBoth = (
         await contract.circuits.queueAttestation1(queuedRepeat, attestation, OUTPUT_SUCCESS)
       ).context;
-      const digest = attestation.digest;
-
       // Whatever the slot order, the first request is still open, so the
       // repeat's slot is skipped and the repeat stays queued.
       const slotFor = (channel: FlushChannel) =>
         channel === FlushChannel.request
-          ? { channel, inIndex: repeat.inIndex, digest: new Uint8Array(32) }
-          : { channel, inIndex: 0n, digest };
+          ? { channel, inIndex: repeat.inIndex, requestId: new Uint8Array(32) }
+          : { channel, inIndex: 0n, requestId };
       const slots = [...order.map(slotFor), ...flushSlots([], []).slice(order.length)];
       const oneFlush = (await contract.circuits.flushQueue(queuedBoth, slots)).context;
       expect(ledgerOf(oneFlush).inputRequestBuffer.member(repeat.inIndex)).toBe(true);
@@ -1319,7 +1321,6 @@ describe("attested block heights", () => {
         await contract.circuits.completeDeposit(
           oneFlush,
           requestId,
-          digest,
           OUTPUT_SUCCESS,
           MINT_NONCE,
           CALLER_RECIPIENT,
@@ -1328,24 +1329,22 @@ describe("attested block heights", () => {
       const outKey = queuedRequestKey(ledgerOf(settled), repeat.inIndex);
       const flushed = await flush(contract, settled, [repeat.inIndex], []);
       expect(ledgerOf(flushed).outputRequestBuffer.lookup(outKey).lastSeen).toBe(settledAt);
-      const resent = (await sendDeposit(contract, flushed, outKey, repeat)).context;
+      const resent = (await contract.circuits.sendDeposit(flushed, outKey)).context;
       await expect(
         contract.circuits.queueAttestation1(resent, attestation, OUTPUT_SUCCESS),
       ).rejects.toThrow(/Stale attestation/);
     },
   );
 
-  it("sendDeposit is requester-gated: the depositor's account pays the gas it sets", async () => {
+  it("sendDeposit is permissionless: a stranger sends the depositor's request as queued", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
     const outKey = queuedRequestKey(ledgerOf(queued), VALID_DEPOSIT.inIndex);
     const flushed = await flush(contract, queued, [VALID_DEPOSIT.inIndex], []);
 
-    await expect(
-      sendDeposit(contract, await strangerContext("sendDeposit", flushed), outKey, VALID_DEPOSIT),
-    ).rejects.toThrow(/Not the requester/);
-
-    const sent = (await sendDeposit(contract, flushed, outKey, VALID_DEPOSIT)).context;
+    const sent = (
+      await contract.circuits.sendDeposit(await strangerContext("sendDeposit", flushed), outKey)
+    ).context;
     const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalDepositMap);
     expect(index.size).toBe(1);
     const record = first(index.values(), "deposit request");

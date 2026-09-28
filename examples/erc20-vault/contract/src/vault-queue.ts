@@ -40,27 +40,35 @@ export const FLUSH_WIDTH = 10;
  * behind them record those heights as their `lastSeen`, then empty slots to the width.
  *
  * @param inIndexes - The input buffer indexes of the requests to flush.
- * @param digests - The digests of the attestations to flush.
+ * @param requestIds - The request ids of the queued attestations to flush.
  * @returns The padded slot vector.
  * @throws {Error} When more items than the flush width are given.
  */
 export function flushSlots(
   inIndexes: readonly bigint[],
-  digests: readonly Uint8Array[],
+  requestIds: readonly Uint8Array[],
 ): FlushSlot[] {
-  if (inIndexes.length + digests.length > FLUSH_WIDTH) {
+  if (inIndexes.length + requestIds.length > FLUSH_WIDTH) {
     throw new Error(
-      `a flush takes at most ${String(FLUSH_WIDTH)} items; got ${String(inIndexes.length + digests.length)}`,
+      `a flush takes at most ${String(FLUSH_WIDTH)} items; got ${String(inIndexes.length + requestIds.length)}`,
     );
   }
   const empty = new Uint8Array(32);
   return [
-    ...digests.map((digest) => ({ channel: FlushChannel.attestation, inIndex: 0n, digest })),
-    ...inIndexes.map((inIndex) => ({ channel: FlushChannel.request, inIndex, digest: empty })),
-    ...Array.from({ length: FLUSH_WIDTH - inIndexes.length - digests.length }, () => ({
+    ...requestIds.map((requestId) => ({
+      channel: FlushChannel.attestation,
+      inIndex: 0n,
+      requestId,
+    })),
+    ...inIndexes.map((inIndex) => ({
+      channel: FlushChannel.request,
+      inIndex,
+      requestId: empty,
+    })),
+    ...Array.from({ length: FLUSH_WIDTH - inIndexes.length - requestIds.length }, () => ({
       channel: FlushChannel.empty,
       inIndex: 0n,
-      digest: empty,
+      requestId: empty,
     })),
   ];
 }
@@ -151,27 +159,27 @@ async function submitFlush(
 export interface FlushItems {
   /** Input buffer indexes of queued requests. */
   readonly inIndexes: readonly bigint[];
-  /** Digests of queued attestations. */
-  readonly digests: readonly Uint8Array[];
+  /** Request ids of queued attestations. */
+  readonly requestIds: readonly Uint8Array[];
 }
 
 // Up to FLUSH_WIDTH items that would move: `first` ahead of the rest, attestations ahead
 // of requests. A request whose request key is open, or taken by an earlier request in
 // the batch, would be skipped by the flush, so it is left out.
 function movableItems(state: VaultLedgerState, first: FlushItems): FlushItems {
-  const digests: Uint8Array[] = [];
+  const requestIds: Uint8Array[] = [];
   const inIndexes: bigint[] = [];
-  const takenDigests = new Set<string>();
+  const takenRequestIds = new Set<string>();
   const takenRequestKeys = new Set<string>();
-  const addDigest = (digest: Uint8Array): void => {
-    const hex = bytesToHex(digest);
-    if (digests.length + inIndexes.length === FLUSH_WIDTH || takenDigests.has(hex)) return;
-    if (!state.inputAttestationBuffer.member(digest)) return;
-    takenDigests.add(hex);
-    digests.push(digest);
+  const addAttestation = (requestId: Uint8Array): void => {
+    const hex = bytesToHex(requestId);
+    if (requestIds.length + inIndexes.length === FLUSH_WIDTH || takenRequestIds.has(hex)) return;
+    if (!state.inputAttestationBuffer.member(requestId)) return;
+    takenRequestIds.add(hex);
+    requestIds.push(requestId);
   };
   const addRequest = (inIndex: bigint): void => {
-    if (digests.length + inIndexes.length === FLUSH_WIDTH) return;
+    if (requestIds.length + inIndexes.length === FLUSH_WIDTH) return;
     if (!state.inputRequestBuffer.member(inIndex)) return;
     const key = pureCircuits.requestKey(state.inputRequestBuffer.lookup(inIndex));
     const hex = bytesToHex(key);
@@ -179,11 +187,11 @@ function movableItems(state: VaultLedgerState, first: FlushItems): FlushItems {
     takenRequestKeys.add(hex);
     inIndexes.push(inIndex);
   };
-  first.digests.forEach(addDigest);
+  first.requestIds.forEach(addAttestation);
   first.inIndexes.forEach(addRequest);
-  for (const [digest] of state.inputAttestationBuffer) addDigest(digest);
+  for (const [requestId] of state.inputAttestationBuffer) addAttestation(requestId);
   for (const [inIndex] of state.inputRequestBuffer) addRequest(inIndex);
-  return { inIndexes, digests };
+  return { inIndexes, requestIds };
 }
 
 /**
@@ -205,18 +213,18 @@ export async function flushPending(
   providers: VaultProviders,
   compiledContract: VaultCompiledContract,
   vaultContractAddress: string,
-  first: FlushItems = { inIndexes: [], digests: [] },
+  first: FlushItems = { inIndexes: [], requestIds: [] },
 ): Promise<number> {
   const state = await readVaultLedger(providers.publicDataProvider, vaultContractAddress);
-  const { inIndexes, digests } = movableItems(state, first);
-  if (inIndexes.length + digests.length === 0) return 0;
+  const { inIndexes, requestIds } = movableItems(state, first);
+  if (inIndexes.length + requestIds.length === 0) return 0;
   await submitFlush(
     providers,
     compiledContract,
     vaultContractAddress,
-    flushSlots(inIndexes, digests),
+    flushSlots(inIndexes, requestIds),
   );
-  return digests.length + inIndexes.length;
+  return requestIds.length + inIndexes.length;
 }
 
 /**

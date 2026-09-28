@@ -54,10 +54,10 @@ export interface StartDepositOptions {
  * the output buffer, send it with `sendDeposit`, and return the resulting
  * request id.
  *
- * The circuits take only what the caller genuinely chooses: their derived
- * account's nonce and the deposit itself at start, the gas envelope at send
- * (this flow uses the shared `ERC20_TRANSFER_*` defaults, and the caller's
- * account pays). Everything else (chain, calldata, routing,
+ * The circuits take only what the caller genuinely chooses, all at start: their
+ * derived account's nonce, the gas envelope (this flow uses the shared
+ * `ERC20_TRANSFER_*` defaults, and the caller's account pays) and the deposit
+ * itself. Everything else (chain, calldata, routing,
  * and even the derivation path, which is the caller's identity commitment
  * recomputed in-circuit) is contract-composed from the initialise-pinned
  * config. The expected event record is reconstructed off-chain (chain fields
@@ -170,10 +170,12 @@ export async function startDeposit(
   );
 
   const inIndex = newInputIndex();
-  const queued = await context.vault.callTx.startDeposit(inIndex, options.evmNonce, {
-    erc20Address: erc20,
-    amount: options.amount,
-  });
+  const queued = await context.vault.callTx.startDeposit(
+    inIndex,
+    options.evmNonce,
+    { gasLimit, maxFeePerGas, maxPriorityFeePerGas },
+    { erc20Address: erc20, amount: options.amount },
+  );
   console.log(`deposit queued in tx ${queued.public.txId}`);
   const outKey = queuedRequestKey(
     await readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress),
@@ -181,14 +183,9 @@ export async function startDeposit(
   );
   await flushUntil(context, (state) => state.outputRequestBuffer.member(outKey), {
     inIndexes: [inIndex],
-    digests: [],
+    requestIds: [],
   });
-  const result = await context.vault.callTx.sendDeposit(
-    outKey,
-    gasLimit,
-    maxFeePerGas,
-    maxPriorityFeePerGas,
-  );
+  const result = await context.vault.callTx.sendDeposit(outKey);
   console.log(`deposit sent in tx ${result.public.txId}`);
 
   // The bidirectionalDepositMap key IS the record's transientHash digest: recomputing

@@ -11,7 +11,7 @@ them writes it always can.
 Some vault state is genuinely shared by every request. The vault's rule is
 that such state has exactly one writer: `flushQueue`. Every other circuit works
 only on entries keyed by its own request, so the circuits users call (start,
-send, queue an attestation, settle) never conflict with the flush, and calls
+send, queue an attestation, complete) never conflict with the flush, and calls
 for different requests never conflict with each other. All contention is
 concentrated in the flush, where it is cheap to
 handle: a flush carries no user funds or secrets, anyone may submit one, and a
@@ -37,86 +37,94 @@ the vault's next EVM nonce (see [Vault-signed requests](#vault-signed-requests))
 
 Requests and attestations each pass through a pair of buffers: an input buffer
 that users write to and an output buffer that only the flush inserts into.
-Settlement removes the entries it consumes from both output buffers. Each entry
+Completion removes the entries it consumes from both output buffers. Each entry
 lives under its own key, so writes by different users never collide.
 
-| Ledger field              | Key                                   | Written by         | Removed by        |
-| ------------------------- | ------------------------------------- | ------------------ | ----------------- |
-| `inputRequestBuffer`      | a caller-chosen random index          | `startDeposit`     | the flush         |
-| `outputRequestBuffer`     | the request key of the flushed entry  | the flush          | settlement        |
-| `inputAttestationBuffer`  | the attestation digest                | `queueAttestation*` | the flush        |
-| `outputAttestationBuffer` | the attestation digest                | the flush          | settlement        |
-| `evictionMap`             | the request id                        | `sendDeposit`      | settlement        |
-| `sentRequestKeys`         | the request key                       | `sendDeposit`      | settlement        |
+| Ledger field              | Key                                  | Written by          | Removed by          |
+| ------------------------- | ------------------------------------ | ------------------- | ------------------- |
+| `inputRequestBuffer`      | a caller-chosen random index         | the start circuit   | the flush           |
+| `outputRequestBuffer`     | the request key of the flushed entry | the flush           | the complete circuit |
+| `inputAttestationBuffer`  | the request id                       | `queueAttestation*` | the flush           |
+| `outputAttestationBuffer` | the request id                       | the flush           | the complete circuit |
+| `evictionMap`             | the request id                       | the send circuit    | the complete circuit |
 
-A request entry (`RequestBufferEntry`) carries:
+A request entry (`RequestBufferEntry`) has one size for every action. It
+carries:
 
-- **The action and its arguments.** A deposit's `DepositArgs` hold the
-  `DepositRequest` (token and amount) and the MPC derivation path of the
-  depositor's EVM account.
+- **The action.**
 - **The nonce.** `nonceIsVault` is `false` for a deposit: `evmNonce` is the
   depositor's own account nonce, taken verbatim.
 - **The input index** it was queued under, which is public already.
-- **An ownership commitment**, `ownershipCommitment(inIndex, secret key)`. Send
-  and settle recompute it from the stored index and the caller's secret, so
-  only the requester can send or settle.
+- **An ownership commitment**, `ownershipCommitment(inIndex, secret key)`. The
+  complete circuit recomputes it from the stored index and the caller's
+  secret, so only the requester can complete.
+- **An args hash**, committing to the action's own arguments.
 
-The gas envelope is not part of the entry: the send chooses it, as the account
-that pays the gas is the requester's.
+The arguments themselves live in the action's own args map, keyed by the input
+index: `depositArgsMap` holds each deposit's `DepositArgs` (the
+`DepositRequest`, the MPC derivation path of the depositor's EVM account, and
+the gas envelope). The start circuit writes them, the send and complete
+circuits read them, and the complete circuit removes them. The flush never
+touches them, so its cost does not grow with the actions the vault supports.
+The start circuit refuses an index that either the input buffer or its args
+map already holds.
 
 The flush stores the entry in `outputRequestBuffer` together with the
 `lastSeen` height at that moment, under the entry's **request key**
 (`requestKey`): a hash of every buffered field that determines the EVM
-transaction (the action, the nonce flag, the nonce and the action's
-arguments). It deliberately leaves out the input index and the ownership
-commitment, so two identical requests share one request key.
+transaction (the action, the nonce flag, the nonce and the args hash). It
+deliberately leaves out the input index and the ownership commitment, so two
+identical requests share one request key.
 
-The send never writes to an output buffer. It records the request id it
-produced in `evictionMap` (request id to request key), which is how the queue
-and settle circuits find the entry from an attestation, and adds the request
-key to `sentRequestKeys`, which makes each entry sendable exactly once.
+The entry and its arguments fix every byte of the EVM transaction, gas
+included, so sending is permissionless and chooses nothing. The send never
+writes to an output buffer. It records the request in the action's event map
+and the request id in `evictionMap` (request id to request key), which is how
+the queue and complete circuits find the entry from an attestation. A second
+send of the same entry builds the same request id, which the event map already
+holds, so each entry is sent exactly once.
 
-An attestation record (`AttestationRecord`) holds the request id, block height
-and output kind, stored under its digest. It holds no output: settlement
-passes the serialised output again and checks it against the digest, so one
-record type and one pair of buffers serve every output width.
+An attestation record (`AttestationRecord`) holds the block height, the output
+kind and the attestation digest, stored under its request id. It holds no
+output: the complete circuit passes the serialised output again and checks it
+against the digest, so one record type and one pair of buffers serve every
+output width.
 
 ## The deposit lifecycle
 
-A deposit takes six transactions from start to settlement. Only the two
+A deposit takes six transactions from start to completion. Only the two
 flushes touch shared state.
 
 1. **Start.** The depositor calls `startDeposit` with a random input index,
-   their account's nonce and the `DepositRequest`. It writes the entry into
-   `inputRequestBuffer`.
+   their account's nonce, the gas envelope and the `DepositRequest`. It writes
+   the arguments into `depositArgsMap` and the entry into `inputRequestBuffer`.
 2. **Flush the request.** A flush moves the entry to `outputRequestBuffer`
    under its request key and records the current `globalLastSeen` as its
    `lastSeen`.
-3. **Send.** The depositor calls `sendDeposit` with the request key and the gas
-   envelope. It builds the sign bidirectional request, records it in
-   `bidirectionalDepositMap`, writes `evictionMap` and `sentRequestKeys`, and
-   notifies the MPC.
+3. **Send.** Anyone calls `sendDeposit` with the request key. It builds the
+   sign bidirectional request from the entry and its arguments, records it in
+   `bidirectionalDepositMap`, writes `evictionMap`, and notifies the MPC.
 4. **Queue the attestation.** Once the MPC has attested the EVM outcome,
    anyone calls the queue circuit for the output's width (`queueAttestation1`
    for an executed transfer, `queueAttestation0` for a failed or unviable one).
    It verifies the MPC's signature, finds the entry through `evictionMap`,
    checks that the attestation's block height is above the entry's
-   `lastSeen`, and writes the record into `inputAttestationBuffer` under its
-   digest.
+   `lastSeen`, and writes the record into `inputAttestationBuffer` under the
+   request id.
 5. **Flush the attestation.** A flush moves the record to
    `outputAttestationBuffer` and raises `globalLastSeen` to its block height if
    that height is higher.
-6. **Settle.** The depositor calls `completeDeposit` with the request id, the
-   digest and the serialised output, or `closeFailedDeposit` with the request
-   id and the digest. Settlement checks that the record names the request id,
-   that its block height is strictly above the entry's `lastSeen`, that its
-   verdict fits the circuit (executed for a complete, failed or unviable for a
-   close) and that the caller owns the entry. `completeDeposit` also checks
-   that the output hashes to the digest. Settlement then removes the request's
-   event, its `evictionMap` and `sentRequestKeys` entries, the attestation and
-   the output entry. `completeDeposit` mints the deposited amount when the
-   attested transfer returned true, and only closes the request when it
-   returned false.
+6. **Complete.** The depositor calls `completeDeposit` with the request id, the
+   serialised output, a mint nonce and an optional recipient. It checks that
+   the record's block height is strictly above the entry's `lastSeen` and that
+   the caller owns the entry, then removes the request's event, its arguments,
+   its `evictionMap` entry, the attestation and the output entry. It then
+   branches on the verdict:
+   - **Executed:** it checks that the output hashes to the record's digest,
+     and mints the deposited amount when the attested transfer returned true.
+     A transfer that returned false only closes the request.
+   - **Failed or unviable:** nothing was surrendered, so it only closes the
+     request, and the output it was passed is ignored.
 
 ## The flush
 
@@ -135,8 +143,8 @@ stays in `inputRequestBuffer`, and a later flush moves it once the open request
 settles. The twin check comes before the entry is removed from the input
 buffer, as a skipped slot is part of a transaction that succeeds and commits
 whatever the slot already did. Nothing a user queues can therefore make a flush
-fail. A settle can still make a flush built before it fail: a flush that
-skipped a twin read the open entry the settle removes, so that flush is
+fail. A complete can still make a flush built before it fail: a flush that
+skipped a twin read the open entry the complete removes, so that flush is
 rebuilt, like any flush that loses a race.
 
 Slots run in order, so within one flush a request slot placed after an
@@ -187,9 +195,9 @@ without exception.
 
 The guarantee rests on three orderings the design enforces:
 
-- **An attestation is consumed only after its height is folded.** Settlement
-  reads from `outputAttestationBuffer`, which only the flush fills, and the
-  flush raises `globalLastSeen` as it does.
+- **An attestation is consumed only after its height is folded.** The
+  complete circuit reads from `outputAttestationBuffer`, which only the flush
+  fills, and the flush raises `globalLastSeen` as it does.
 - **An entry's bound is taken when it is flushed.** Its `lastSeen` is
   `globalLastSeen` at that moment, so it is at least the height of every
   attestation the vault had folded before accepting the request.
@@ -216,12 +224,9 @@ MPC attests the request unviable at that transaction's block, which can lie at
 or below the entry's `lastSeen`. Such a deposit stays open, with nothing lost,
 as a deposit surrenders nothing at start.
 
-The bound assumes the MPC attests each request id at one height, the height of
+The vault trusts the MPC: it attests each request id once, at the height of
 the finalised block holding the transaction the attestation describes, as the
-Signet protocol defines it. Two validly signed attestations of one request id
-at different heights would defeat it: a repeat flushed while the higher one was
-still in `inputAttestationBuffer` takes the lower height as its `lastSeen`, and
-the higher one then settles that repeat, minting twice for one transfer.
+Signet protocol defines it.
 
 ## Why the queue takes the full output
 
@@ -243,23 +248,26 @@ the record's storage is width-independent.
 
 - **Only the flush writes shared state.** No circuit other than `flushQueue`
   and `initialise` reads or writes `globalLastSeen`.
-- **Only the flush inserts into an output buffer.** Send writes
-  `evictionMap` and `sentRequestKeys`, and settlement only removes.
-- **A request is sent at most once.** `sendDeposit` refuses a request key in
-  `sentRequestKeys`. The gas is chosen at send, so a second send of the same
-  entry would carry a different request id at the same nonce, and closing the
-  entry with one of the two attestations could leave the other unsettleable.
-- **An attestation settles at most once.** Settlement removes the output
-  entry, the `evictionMap` entry and the attestation, and fails when any of
-  them is absent. Attestations are public and stay validly signed forever, so
-  anything less would let one be queued and settled again.
+- **Only the flush inserts into an output buffer.** Send writes the event map
+  and `evictionMap`, and the complete circuit only removes.
+- **The flush never touches arguments.** An action's arguments go into its
+  args map at start and leave it at complete, so the flush moves a small entry
+  of one size whatever the action.
+- **A request is sent at most once.** The entry and its arguments fix the
+  whole EVM transaction, so a second send builds the same request id, and the
+  send refuses an id the action's event map already holds.
+- **An attestation settles at most once.** The complete circuit removes the
+  output entry, the `evictionMap` entry and the attestation, and fails when
+  any of them is absent. Attestations are public and stay validly signed
+  forever, so anything less would let one be queued and settled again.
 - **Only attestations for sent, open requests are queued.** The queue circuits
   find the entry through `evictionMap` and check its `lastSeen`, which keeps
   junk and stale attestations out of the flush's slots.
 - **Queued attestations never overwrite each other.** Both attestation buffers
-  are keyed by digest, and queueing refuses a digest either already holds.
-- **Sending costs only the requester.** `sendDeposit` is requester-gated, as the
-  depositor's own account pays whatever gas the send chooses.
+  are keyed by request id, and queueing refuses a request id either already
+  holds.
+- **Sending is permissionless.** The send chooses nothing: the requester fixed
+  the gas at start, so whoever sends only pays the Midnight fee.
 
 ## Vault-signed requests
 
@@ -293,9 +301,10 @@ flush is its only reader and writer.
   (see [The flush](#the-flush)), so under load flushes land one after another,
   and throughput is bounded by the flush width and the flush rate, not by the
   number of users.
-- **No gas bump.** A request is sent once, so a deposit sent with too little gas
-  to be mined stays pending until the network fee falls to meet it.
+- **No gas bump.** A request's gas is fixed at start, so a deposit queued with
+  too little gas to be mined stays pending until the network fee falls to meet
+  it.
 - **No cancel.** No circuit closes an open request without an attestation that
-  passes the bound. A request that is flushed but never sent, sent but never
-  mined, or attested stale stays in `outputRequestBuffer`, and it keeps its
-  identical repeats in `inputRequestBuffer`.
+  passes the bound. A request that is sent but never mined, or attested stale,
+  stays in `outputRequestBuffer`, and it keeps its identical repeats in
+  `inputRequestBuffer`.

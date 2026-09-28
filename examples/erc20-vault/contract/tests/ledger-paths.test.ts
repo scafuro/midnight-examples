@@ -32,7 +32,7 @@ const compiledFieldIndex = (name: string): readonly number[] => {
 
 describe("exported ledger paths match the compiled contract-info.json", () => {
   it.each([
-    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [0, 0]],
+    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [1, 12]],
     // The literal column is deliberate: the notification vectors in
     // erc20-vault.compact are hand-written, so a re-chunk that moves a path
     // must fail here even when the exported constant was updated with it.
@@ -44,9 +44,9 @@ describe("exported ledger paths match the compiled contract-info.json", () => {
 
 describe("the admin-updateable gas parameters sit in chunk 0", () => {
   it.each([
-    ["vaultMaxFeePerGas", [0, 3]],
-    ["vaultMaxPriorityFeePerGas", [0, 4]],
-    ["vaultGasLimits", [0, 5]],
+    ["vaultMaxFeePerGas", [0, 2]],
+    ["vaultMaxPriorityFeePerGas", [0, 3]],
+    ["vaultGasLimits", [0, 4]],
   ] as const)("%s", (fieldName, compiledPath) => {
     expect(compiledFieldIndex(fieldName)).toEqual(compiledPath);
   });

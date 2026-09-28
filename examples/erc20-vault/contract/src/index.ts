@@ -58,8 +58,8 @@ export function deriveVaultEvmAddress(
 // path is [chunk, offset] (depth 2).
 
 /**
- * Resolved ledger-tree path of `bidirectionalDepositMap` (ledger field 0), which
- * holds the deposit requests. Matches the depth 2 + `requestsPath` [0, 0, 0, 0]
- * the `sendDeposit` circuit packs.
+ * Resolved ledger-tree path of `bidirectionalDepositMap`, which holds the deposit
+ * requests, as the compiled `contract-info.json` lists it. Matches the depth 2 +
+ * `requestsPath` [1, 12, 0, 0] the `sendDeposit` circuit packs.
  */
-export const VAULT_DEPOSIT_REQUESTS_PATH: readonly number[] = [0, 0];
+export const VAULT_DEPOSIT_REQUESTS_PATH: readonly number[] = [1, 12];

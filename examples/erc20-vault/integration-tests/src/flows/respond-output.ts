@@ -26,8 +26,8 @@
 // response key the vault pinned at initialise: a post's declared kind, the
 // observation's own success flag and the cache's contents are all
 // unauthenticated, they only decide which bytes get checked. The verified
-// kind and bytes route settlement: an executed sweep settles through
-// `completeDeposit`, a failed or unviable one through `closeFailedDeposit`.
+// kind and bytes route settlement: the kind picks the queue circuit's width,
+// and `completeDeposit` branches on it.
 // The fetched output is UNTRUSTED until that check: the verified bytes go into
 // the queue circuit as an argument, where `verifyRespondBidirectionalEventV1<N>`
 // re-hashes them and verifies the same signature in-circuit. That in-circuit
