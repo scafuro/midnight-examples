@@ -21,6 +21,7 @@ const FILE_ORDER = [
   "deposit-claimant-not-caller.test.ts",
   "false-claimer.test.ts",
   "bearer-transfer.test.ts",
+  "admin-replace-nonce-e2e.test.ts",
 ];
 
 const rank = (moduleId: string): number => {
