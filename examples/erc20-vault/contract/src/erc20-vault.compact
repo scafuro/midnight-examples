@@ -244,18 +244,6 @@ circuit settleHeight(disclosedRequestId: RequestId, knownHeight: Uint<64>, block
   seenEvmHeights.insert(disclosedRequestId, disclose(blockHeight));
 }
 
-circuit depositKnownHeight(requestId: RequestId): Uint<64> {
-  if (seenEvmHeights.member(requestId)) {
-    if (seenEvmHeights.lookup(requestId) > lastSeenEvmHeight) {
-      return seenEvmHeights.lookup(requestId);
-    } else {
-      return lastSeenEvmHeight;
-    }
-  } else {
-    return lastSeenEvmHeight;
-  }
-}
-
 // Pins WHO may configure. Everything needing the contract's own address waits for
 // initialise().
 constructor(
@@ -443,13 +431,9 @@ struct DepositRequest {
   amount: Uint<128>;       // token amount to move into the vault
 }
 
-export pure circuit depositBinder(evmNonce: Uint<64>): Bytes<32> {
-  return upgradeFromTransient(transientHash<Vector<2, Bytes<32>>>([pad(32, "vault:deposit"), evmNonce as Field as Bytes<32>]));
-}
-
-// Queues transfer(vaultEvmAddress, amount) on the ERC20 under the caller's key; sendDeposit
-// records it, signed by the MPC with the CALLER's derived account (the path is the caller's
-// commitment, stored at queue time).
+// Queues transfer(vaultEvmAddress, amount) on the ERC20 under its own request id, which is
+// fixed here because every input to the hash is known at queue time; sendDeposit records it,
+// signed by the MPC with the CALLER's derived account (the path is the caller's commitment).
 export circuit startDeposit(
   evmNonce: Uint<64>,
   gasLimit: Uint<64>,
@@ -463,8 +447,15 @@ export circuit startDeposit(
   // completeDeposit mints via a Uint<64> API, so reject unclaimable amounts.
   assert(depositRequest.amount <= 18446744073709551615 as Uint<128>, "Amount exceeds Uint<64> max");
   assert(gasLimit > 0 as Uint<64>, "Gas limit must be positive");
-  const key = disclose(refundCommitment(callerSecretKey(), depositBinder(evmNonce)));
+  const requester = userCommitment(callerSecretKey());
+  const requestId = disclose(calculateRequestId<EvmType2TxParams<2, 0, 0>, 34, 34>(depositSignRequest(
+    depositRequest.erc20Address, depositRequest.amount, requester,
+    evmNonce, gasLimit, maxFeePerGas, maxPriorityFeePerGas
+  )));
+  const key = requestId as Bytes<32>;
   assert(!pendingVaultRequests.member(key), "Request already queued");
+  assert(!depositEventMap.member(requestId), "Request already exists");
+  assert(!seenEvmHeights.member(requestId), "Request already settled");
   pendingVaultRequests.insert(key, disclose(PendingVaultRequest {
     kind: PendingRequestKind.deposit,
     addressA: depositRequest.erc20Address,
@@ -473,7 +464,7 @@ export circuit startDeposit(
     amountA: depositRequest.amount,
     amountB: 0 as Uint<128>,
     commitment: key,
-    requester: userCommitment(callerSecretKey()),
+    requester: requester,
     evmNonce: evmNonce,
     gasLimit: gasLimit,
     maxFeePerGas: maxFeePerGas,
@@ -482,46 +473,60 @@ export circuit startDeposit(
   unflushed.increment(1);
 }
 
-export circuit sendDeposit(key: Bytes<32>): [] {
-  assert(initialised >= 1, "Not initialised");
-  const disclosedKey = disclose(key);
-  const pending = takePending(disclosedKey, PendingRequestKind.deposit);
-  takeStamp(disclosedKey, PendingRequestKind.deposit);
+circuit depositSignRequest(
+  erc20Address: Bytes<20>,
+  amount: Uint<128>,
+  requester: Bytes<32>,
+  evmNonce: Uint<64>,
+  gasLimit: Uint<64>,
+  maxFeePerGas: Uint<128>,
+  maxPriorityFeePerGas: Uint<128>
+): SignBidirectionalEvent<EvmType2TxParams<2, 0, 0>, 34, 34> {
   // The pinned recipient stops a client having the MPC sign a transfer to themselves.
   const calldata = EvmCalldata<2> {
     selector: Bytes [0xa9, 0x05, 0x9c, 0xbb], // transfer(address,uint256)
     noWords: 2 as Uint<16>,
     words: [
-      evmAddressAbiWord(pending.addressB),
-      numericAbiWord(pending.amountA),
+      evmAddressAbiWord(vaultEvmAddress),
+      numericAbiWord(amount),
     ]
   };
   const txParams = EvmType2TxParams<2, 0, 0> {
     chainId: evmChainId,
-    nonce: pending.evmNonce,
-    maxPriorityFeePerGas: pending.maxPriorityFeePerGas,
-    maxFeePerGas: pending.maxFeePerGas,
-    gasLimit: pending.gasLimit,
-    to: pending.addressA,
+    nonce: evmNonce,
+    maxPriorityFeePerGas: maxPriorityFeePerGas,
+    maxFeePerGas: maxFeePerGas,
+    gasLimit: gasLimit,
+    to: erc20Address,
     value: 0 as Uint<128>,
     calldata: some<EvmCalldata<2>>(calldata),
     accessListEntryCount: 0,
     accessList: []
   };
   const schema = vaultResponseSchema();
-  const request = constructSignBidirectionalEvent<EvmType2TxParams<2, 0, 0>, 34, 34>(
-    kernel.self(), mpcKeyVersion, pending.requester,
+  return constructSignBidirectionalEvent<EvmType2TxParams<2, 0, 0>, 34, 34>(
+    kernel.self(), mpcKeyVersion, requester,
     MPCSignatureAlgorithm.ecdsa, MPCDestination.unused, pad(64, ""),
     TxParamType.evmType2, txParams, ethereumCaip2Id(), schema, schema
   );
-  const requestId = calculateRequestId<EvmType2TxParams<2, 0, 0>, 34, 34>(request);
+}
+
+export circuit sendDeposit(key: Bytes<32>): [] {
+  assert(initialised >= 1, "Not initialised");
+  const disclosedKey = disclose(key);
+  const pending = takePending(disclosedKey, PendingRequestKind.deposit);
+  const stamp = takeStamp(disclosedKey, PendingRequestKind.deposit);
+  const requestId = disclosedKey as RequestId;
   assert(!depositEventMap.member(requestId), "Request already exists");
-  depositEventMap.insert(requestId, request);
+  depositEventMap.insert(requestId, depositSignRequest(
+    pending.addressA, pending.amountA, pending.requester,
+    pending.evmNonce, pending.gasLimit, pending.maxFeePerGas, pending.maxPriorityFeePerGas
+  ));
   depositSettleViews.insert(requestId, DepositSettleView {
     commitment: pending.requester,
     erc20: pending.addressA,
     amount: pending.amountA as Uint<64>,
-    knownHeight: depositKnownHeight(requestId),
+    knownHeight: stamp.knownHeight,
   });
   // Notify the MPC (depositEventMap's compiled ledger path, [1,3]).
   signetSigner.signBidirectional(

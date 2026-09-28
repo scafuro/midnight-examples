@@ -16,11 +16,7 @@ import {
   toSignBidirectionalEventIndex,
   TxParamType,
 } from "@sig-net/midnight";
-import {
-  evmAddressBytes,
-  pureCircuits,
-  readVaultLedger,
-} from "@sig-net/midnight-examples-erc20-vault-contract";
+import { evmAddressBytes, readVaultLedger } from "@sig-net/midnight-examples-erc20-vault-contract";
 import { getErc20Balance } from "@sig-net/midnight-examples-test-harness";
 
 import { fundingSummary, logEvmFeeCap, logTokenAmount } from "../evm-logging.ts";
@@ -158,7 +154,8 @@ export async function startDeposit(
       },
     },
   };
-  const expectedIdHex = requestIdHex(calculateRequestId(expectedRecord));
+  const expectedId = calculateRequestId(expectedRecord);
+  const expectedIdHex = requestIdHex(expectedId);
   logEvmFeeCap(
     expectedIdHex,
     context.evmUserAddress,
@@ -167,10 +164,7 @@ export async function startDeposit(
     expectedRecord.txParams.maxPriorityFeePerGas,
   );
 
-  const key = pureCircuits.refundCommitment(
-    context.identity.secretKey,
-    pureCircuits.depositBinder(options.evmNonce),
-  );
+  const key = expectedId;
   const queued = await context.vault.callTx.startDeposit(
     options.evmNonce,
     gasLimit,
