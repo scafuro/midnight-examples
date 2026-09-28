@@ -8,13 +8,7 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import {
-  VAULT_DEPOSIT_REQUESTS_PATH,
-  VAULT_REDEEM_REQUESTS_PATH,
-  VAULT_REQUESTS_PATH,
-  VAULT_SUPPLY_REQUESTS_PATH,
-  VAULT_SWAP_REQUESTS_PATH,
-} from "../src/index.ts";
+import { VAULT_DEPOSIT_REQUESTS_PATH } from "../src/index.ts";
 
 interface LedgerFieldInfo {
   readonly name: string;
@@ -38,11 +32,7 @@ const compiledFieldIndex = (name: string): readonly number[] => {
 
 describe("exported ledger paths match the compiled contract-info.json", () => {
   it.each([
-    ["signBidirectionalEventMap", VAULT_REQUESTS_PATH, [0, 0]],
-    ["depositEventMap", VAULT_DEPOSIT_REQUESTS_PATH, [1, 3]],
-    ["swapEventMap", VAULT_SWAP_REQUESTS_PATH, [1, 7]],
-    ["supplyEventMap", VAULT_SUPPLY_REQUESTS_PATH, [1, 11]],
-    ["redeemEventMap", VAULT_REDEEM_REQUESTS_PATH, [1, 13]],
+    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [0, 0]],
     // The literal column is deliberate: the notification vectors in
     // erc20-vault.compact are hand-written, so a re-chunk that moves a path
     // must fail here even when the exported constant was updated with it.
@@ -73,41 +63,5 @@ describe("the state tree stays TWO chunks deep", () => {
 
     expect([...chunks].sort()).toEqual([0, 1]);
     expect([...depths]).toEqual([2]);
-  });
-});
-
-describe("the chunk-1 block holds the event maps at their pinned offsets", () => {
-  it("holds the same 15 fields at the same offsets", () => {
-    const chunkOne = contractInfo.ledger
-      .filter((field) => field.index[0] === 1)
-      .map((field) => [field.name, [...field.index]] as const);
-
-    expect(chunkOne).toEqual([
-      ["pendingVaultRequests", [1, 0]],
-      ["stamps", [1, 1]],
-      ["nonceOwners", [1, 2]],
-      ["depositEventMap", [1, 3]],
-      ["depositSettleViews", [1, 4]],
-      ["withdrawSettleViews", [1, 5]],
-      ["uniswapRouter", [1, 6]],
-      ["swapEventMap", [1, 7]],
-      ["swapSettleViews", [1, 8]],
-      ["stataUnderlying", [1, 9]],
-      ["stataToken", [1, 10]],
-      ["supplyEventMap", [1, 11]],
-      ["supplySettleViews", [1, 12]],
-      ["redeemEventMap", [1, 13]],
-      ["redeemSettleViews", [1, 14]],
-    ]);
-  });
-
-  it("is exactly the last 15 declared fields, so nothing may be appended", () => {
-    const names = contractInfo.ledger.map((field) => field.name);
-    const chunkOneNames = contractInfo.ledger
-      .filter((field) => field.index[0] === 1)
-      .map((field) => field.name);
-
-    expect(chunkOneNames).toHaveLength(15);
-    expect(names.slice(-15)).toEqual(chunkOneNames);
   });
 });

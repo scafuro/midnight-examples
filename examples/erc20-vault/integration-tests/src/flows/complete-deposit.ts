@@ -1,6 +1,7 @@
-// Settle side of the deposit flow: hand the verified attestation of the EVM
-// sweep and the output bytes it signs to the vault's `completeDeposit`
-// circuit, with a fresh RANDOM mint nonce so the minted coin cannot be linked
+// Settle side of the deposit flow: queue the MPC's attestation of the EVM sweep
+// with `queueAttestation1`, flush it, then settle through `completeDeposit` with
+// the request id, the attestation's digest and the output bytes it signs, and a
+// fresh RANDOM mint nonce so the minted coin cannot be linked
 // back to the request, and the recipient wallet when the caller names one.
 
 import { type CoinPublicKey, encodeCoinPublicKey } from "@midnight-ntwrk/compact-runtime";
@@ -12,12 +13,17 @@ import {
   respondBidirectionalEventToCircuitInput,
 } from "@sig-net/midnight";
 import type { EncPublicKey } from "@sig-net/midnight-contract-deploy";
-import { VAULT_DEPOSIT_REQUESTS_PATH } from "@sig-net/midnight-examples-erc20-vault-contract";
+import {
+  attestationDigestsFor,
+  readVaultLedger,
+  VAULT_DEPOSIT_REQUESTS_PATH,
+} from "@sig-net/midnight-examples-erc20-vault-contract";
 
 import { POLL_TIMEOUT_MS } from "../poll-timeout.ts";
 import type { VaultContext } from "../vault-context.ts";
 import { pollRespondBidirectional } from "./poll-respond-bidirectional.ts";
 import type { RespondOutcome } from "./respond-output.ts";
+import { flushUntil } from "./vault-queue.ts";
 
 /**
  * A shielded wallet the vault can mint to. Both halves of the key pair are
@@ -34,10 +40,13 @@ export interface ShieldedTokenRecipient {
 }
 
 /**
- * Settle a resolved deposit outcome through the vault's `completeDeposit`
- * circuit. This caller supplies the event in circuit-input form, the output
- * bytes its signature verified over, a random mint nonce, and the wallet
- * the mint goes to: `recipient` when given, otherwise the caller's own. The
+ * Settle a resolved deposit outcome: queue the attestation (the event in
+ * circuit-input form and the output bytes its signature verified over), flush
+ * it until the vault holds it under its digest, then call `completeDeposit`
+ * with the request id, that digest, the output bytes, a random mint nonce, and
+ * the wallet the mint goes to: `recipient` when given, otherwise the caller's
+ * own. A rerun finds an attestation already queued or flushed and carries on
+ * from there. The
  * mint's coin handling is midnight-js's job: the callTx balances the
  * resulting offer like any other call.
  *
@@ -67,6 +76,30 @@ export async function settleDeposit(
         `${outcome.event.outputKind === OutputKind.executed ? "returned false" : OutputKind[outcome.event.outputKind]}: ` +
         `a failed sweep mints nothing`,
     );
+  }
+
+  const requestIdOnLedger = outcome.event.requestId;
+  const ledger = await readVaultLedger(
+    context.providers.publicDataProvider,
+    context.vaultContractAddress,
+  );
+  if (
+    attestationDigestsFor(ledger.inputAttestationBuffer, requestIdOnLedger).length === 0 &&
+    attestationDigestsFor(ledger.outputAttestationBuffer, requestIdOnLedger).length === 0
+  ) {
+    const queued = await context.vault.callTx.queueAttestation1(
+      respondBidirectionalEventToCircuitInput(outcome.event),
+      outcome.serializedOutput,
+    );
+    console.log(`attestation queued in tx ${queued.public.txId}`);
+  }
+  const flushed = await flushUntil(
+    context,
+    (state) => attestationDigestsFor(state.outputAttestationBuffer, requestIdOnLedger).length > 0,
+  );
+  const digest = attestationDigestsFor(flushed.outputAttestationBuffer, requestIdOnLedger).at(0);
+  if (digest === undefined) {
+    throw new Error(`no flushed attestation for request ${requestId}`);
   }
 
   // A fresh random mint nonce per settle: the circuit threads it into the
@@ -102,7 +135,8 @@ export async function settleDeposit(
           async (txCtx) => {
             await context.vault.callTx.completeDeposit(
               txCtx,
-              respondBidirectionalEventToCircuitInput(outcome.event),
+              requestIdOnLedger,
+              digest,
               outcome.serializedOutput,
               mintNonce,
               mintRecipient,
@@ -115,7 +149,8 @@ export async function settleDeposit(
           },
         )
       : await context.vault.callTx.completeDeposit(
-          respondBidirectionalEventToCircuitInput(outcome.event),
+          requestIdOnLedger,
+          digest,
           outcome.serializedOutput,
           mintNonce,
           mintRecipient,

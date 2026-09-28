@@ -1,5 +1,5 @@
-// `startDeposit`: record a deposit SignBidirectionalEvent in the vault's depositEventMap. It
-// asks the MPC to sign an EVM `transfer(vault, amount)` on the ERC20, sent from the user's
+// `startDeposit` then `sendDeposit`: queue a deposit, flush it, and record its
+// SignBidirectionalEvent in the vault's bidirectionalDepositMap. It asks the MPC to sign an EVM `transfer(vault, amount)` on the ERC20, sent from the user's
 // derived address. The request id is recomputed off-chain with the library's TS twin of the
 // request-id circuit and asserted against the ledger map key before it is returned. The
 // settle side lives in complete-deposit.ts.
@@ -18,7 +18,8 @@ import {
 } from "@sig-net/midnight";
 import {
   evmAddressBytes,
-  pureCircuits,
+  newInputIndex,
+  queuedRequestKey,
   readVaultLedger,
 } from "@sig-net/midnight-examples-erc20-vault-contract";
 import { getErc20Balance } from "@sig-net/midnight-examples-test-harness";
@@ -32,7 +33,7 @@ import {
 } from "../evm-transfer.ts";
 import { VAULT_MPC_ROUTING } from "../mpc-routing.ts";
 import type { VaultContext } from "../vault-context.ts";
-import { flushUntilStamped } from "./vault-queue.ts";
+import { flushUntil } from "./vault-queue.ts";
 
 /** Options for {@link startDeposit}. */
 export interface StartDepositOptions {
@@ -49,13 +50,14 @@ export interface StartDepositOptions {
 }
 
 /**
- * Call the vault's `startDeposit` circuit on the deployed contract and return
- * the resulting request id.
+ * Queue a deposit with `startDeposit` under a fresh input index, flush it into
+ * the output buffer, send it with `sendDeposit`, and return the resulting
+ * request id.
  *
- * The circuit takes only what the caller genuinely chooses: their derived
- * account's nonce, the gas envelope (this flow uses the shared
- * `ERC20_TRANSFER_*` defaults, and the caller's account pays), the MPC key
- * version, and the deposit itself. Everything else (chain, calldata, routing,
+ * The circuits take only what the caller genuinely chooses: their derived
+ * account's nonce and the deposit itself at start, the gas envelope at send
+ * (this flow uses the shared `ERC20_TRANSFER_*` defaults, and the caller's
+ * account pays). Everything else (chain, calldata, routing,
  * and even the derivation path, which is the caller's identity commitment
  * recomputed in-circuit) is contract-composed from the initialise-pinned
  * config. The expected event record is reconstructed off-chain (chain fields
@@ -167,33 +169,33 @@ export async function startDeposit(
     expectedRecord.txParams.maxPriorityFeePerGas,
   );
 
-  const key = pureCircuits.refundCommitment(
-    context.identity.secretKey,
-    pureCircuits.depositBinder(options.evmNonce),
+  const inIndex = newInputIndex();
+  const queued = await context.vault.callTx.startDeposit(inIndex, options.evmNonce, {
+    erc20Address: erc20,
+    amount: options.amount,
+  });
+  console.log(`deposit queued in tx ${queued.public.txId}`);
+  const outKey = queuedRequestKey(
+    await readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress),
+    inIndex,
   );
-  const queued = await context.vault.callTx.startDeposit(
-    options.evmNonce,
+  await flushUntil(context, (state) => state.outputRequestBuffer.member(outKey));
+  const result = await context.vault.callTx.sendDeposit(
+    outKey,
     gasLimit,
     maxFeePerGas,
     maxPriorityFeePerGas,
-    {
-      erc20Address: erc20,
-      amount: options.amount,
-    },
   );
-  console.log(`deposit queued in tx ${queued.public.txId}`);
-  await flushUntilStamped(context, key);
-  const result = await context.vault.callTx.sendDeposit(key);
   console.log(`deposit sent in tx ${result.public.txId}`);
 
-  // The depositEventMap key IS the record's transientHash digest: recomputing
+  // The bidirectionalDepositMap key IS the record's transientHash digest: recomputing
   // it off-chain and finding it on the ledger proves both sides agree on every
   // byte of the event.
   const after = await readVaultLedger(
     context.providers.publicDataProvider,
     context.vaultContractAddress,
   );
-  const index = toSignBidirectionalEventIndex(after.depositEventMap);
+  const index = toSignBidirectionalEventIndex(after.bidirectionalDepositMap);
   if (!index.has(expectedIdHex)) {
     throw new Error(
       `recomputed request id ${expectedIdHex} not found in the vault's deposit map ` +

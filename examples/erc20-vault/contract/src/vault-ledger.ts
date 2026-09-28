@@ -32,8 +32,8 @@ export async function readVaultLedger(
 /**
  * Read and print the vault's public ledger state: initialisation status, the
  * configured vault EVM address, the pinned EVM chain, and the pending signet
- * signature requests of the deposit and approve/withdraw maps. No proving keys
- * or transactions involved.
+ * signature requests of the deposit map. No proving keys or transactions
+ * involved.
  *
  * @param publicDataProvider - The provider to query raw contract state through.
  * @param vaultContractAddress - The deployed vault contract address, as bare hex.
@@ -54,8 +54,7 @@ export async function printVaultState(
   console.log(`vault EVM address: 0x${bytesToHex(state.vaultEvmAddress)}`);
   console.log(`EVM chain id:      ${String(state.evmChainId)}`);
 
-  printRequestMap("deposit", state.depositEventMap);
-  printRequestMap("approve/withdraw", state.signBidirectionalEventMap);
+  printRequestMap("deposit", state.bidirectionalDepositMap);
 }
 
 /**

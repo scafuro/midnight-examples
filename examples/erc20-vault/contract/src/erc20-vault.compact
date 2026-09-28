@@ -19,7 +19,10 @@ import "@sig-net/midnight/src/Signet";
 
 // ---- Types --------------------------------------------------------------------------
 
-export enum Action { deposit }
+// `reserved` keeps the enum at two variants: a one-variant enum in a hashed struct
+// compiles to a field element the ledger parses as zero bytes, and proofs then fail
+// the proof server's alignment check.
+export enum Action { deposit, reserved }
 
 export struct DepositRequest {
   erc20Address: Bytes<20>;
@@ -127,6 +130,7 @@ export ledger evictionMap: Map<RequestId, Bytes<32>>;
 
 // outputRequestBuffer keys already sent: gas is chosen at send, so a second send of
 // one entry would carry a different request id at the same nonce.
+// FIXME: can we remove this??
 export ledger sentRequestKeys: Set<Bytes<32>>;
 
 circuit requireInitialised(): [] {
@@ -281,7 +285,7 @@ export circuit setGasParams(
 
 // Permissionless. Slots run in order: a request slot sees the heights of the
 // attestation slots before it.
-export circuit flushQueue(slots: Vector<20, FlushSlot>): [] {
+export circuit flushQueue(slots: Vector<10, FlushSlot>): [] {
   requireInitialised();
   for (const slot of slots) {
     const disclosedSlot = disclose(slot);

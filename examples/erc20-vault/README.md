@@ -526,8 +526,7 @@ What differs from the local loop:
   is enough for the deposit and withdraw specs. The swap, supply and redeem
   polls always trace, so their specs still need a tracing endpoint and fail
   at the poll without one.
-- **Only the specs that never sign as the vault run here:** `happy-day-e2e`,
-  `bearer-transfer`, `swap-e2e`, `supply-redeem-e2e` and `swap-refund-e2e`.
+- **Only the specs that never sign as the vault run here:** `happy-day-e2e`.
   The others force reverts with a vault key re-derived from `MPC_ROOT_KEY`
   ([`integration-tests/src/fakenet-vault-account.ts`](integration-tests/src/fakenet-vault-account.ts))
   and are fakenet-only.
@@ -664,32 +663,21 @@ failed after that point, the PR says to run it by hand before merging).
 
 ## The e2e suite
 
-Fourteen e2e specs run serially in a pinned order (see
+Three e2e specs run serially in a pinned order (see
 `integration-tests/vitest.config.ts`). `happy-day-e2e` runs first because it
-initialises the vault and cycles the funds that the later flows build on.
+initialises the vault that the later flows build on.
 Each spec is rerun-tolerant against kept contract addresses and prints resume
 ids in banners as it goes, for recovering a run that died mid-flow.
 
 | Spec | Tests | What it proves | Resume var(s) |
 |---|---|---|---|
-| `happy-day-e2e` | 15 | Full deposit + withdraw round trips, every leg asserted (incl. the MPC-convention reads a responder does) | `DEPOSIT_REQUEST_ID`, `WITHDRAW_REQUEST_ID` |
-| `deposit-withdrawal-failure-refund` | 9 | A withdraw whose EVM transfer reverts ends in an in-circuit REFUND of the escrowed shielded value | `FAILURE_REFUND_DEPOSIT_REQUEST_ID`, `FAILURE_REFUND_WITHDRAW_REQUEST_ID` |
+| `happy-day-e2e` | 8 | Full deposit round trip, every leg asserted (incl. the MPC-convention reads a responder does) | `DEPOSIT_REQUEST_ID` |
 | `deposit-claimant-not-caller` | 6 | `completeDeposit` can direct the mint to a different wallet's coin public key, discovered from chain data alone | `DEPOSIT_CLAIMANT_NOT_CALLER_DEPOSIT_REQUEST_ID` |
-| `benchmark` | 43 | Per-leg wall-clock report covering every vault circuit: initialise (fresh deploys), approveRouter, startDeposit/completeDeposit, startWithdraw/completeWithdraw, startSwap/completeSwap, approveStata, startSupply/completeSupply, startRedeem/completeRedeem, and forced-revert refunds (`BENCHMARK_TIMINGS_JSON` greppable line) | `BENCHMARK_DEPOSIT_REQUEST_ID`, `BENCHMARK_WITHDRAW_REQUEST_ID`, `BENCHMARK_SWAP_REQUEST_ID`, `BENCHMARK_SUPPLY_REQUEST_ID`, `BENCHMARK_REDEEM_REQUEST_ID`, `BENCHMARK_REFUND_DEPOSIT_REQUEST_ID`, `BENCHMARK_REFUND_WITHDRAW_REQUEST_ID` |
 | `false-claimer` | 6 | A deposit recorded for identity A is NOT claimable by identity B, even with the valid MPC attestation | `FALSE_CLAIMER_DEPOSIT_REQUEST_ID` |
-| `bearer-transfer` | 11 | Shielded vault tokens are bearer assets: a plain Midnight transfer hands the claim to wallet B, the emptied wallet A cannot withdraw, and B completes a full withdraw on the transferred balance | `BEARER_TRANSFER_DEPOSIT_REQUEST_ID`, `BEARER_TRANSFER_WITHDRAW_REQUEST_ID` |
-| `swap-e2e` | 2 | A deposit-funded `exactOutputSingle` swap mints exactly the requested `amountOut` of tokenOut plus the unspent tokenIn as change | `SWAP_E2E_DEPOSIT_REQUEST_ID`, `SWAP_E2E_SWAP_REQUEST_ID` |
-| `supply-redeem-e2e` | 2 | A deposit-funded Aave supply mints the attested stataUSDC shares, and redeeming them mints back the attested USDC (principal + interest) | `SUPPLY_REDEEM_DEPOSIT_REQUEST_ID`, `SUPPLY_REDEEM_SUPPLY_REQUEST_ID`, `SUPPLY_REDEEM_REDEEM_REQUEST_ID` |
-| `supply-refund-e2e` | 2 | A supply whose wrapper deposit reverts on-chain (drained vault balance) ends in an in-circuit REFUND of the surrendered USDC | `SUPPLY_REFUND_DEPOSIT_REQUEST_ID`, `SUPPLY_REFUND_SUPPLY_REQUEST_ID` |
-| `swap-refund-e2e` | 2 | A swap whose `amountInMaximum` is below the real cost reverts on-chain and the settle re-mints the surrendered tokenIn | `SWAP_REFUND_DEPOSIT_REQUEST_ID`, `SWAP_REFUND_SWAP_REQUEST_ID` |
-| `redeem-refund-e2e` | 2 | A redeem whose wrapper burn reverts on-chain (drained vault stataUSDC balance) ends in an in-circuit REFUND of the surrendered shares | `REDEEM_REFUND_DEPOSIT_REQUEST_ID`, `REDEEM_REFUND_SUPPLY_REQUEST_ID`, `REDEEM_REFUND_REDEEM_REQUEST_ID` |
-| `vault-queue-e2e` | 5 | One flush numbers every queued request and their sends mine in nonce order, a stranger flushes and sends a request the owner queued, a higher nonce signed first still mines after the lower one, two flushes in one block leave exactly one winner, and a flush proven before another request lands is refused unless it numbered every waiting request | none |
-| `vault-queue-benchmark` | 4 | Reporting benchmark of the queue: flush proof cost with 0 and 1 live keys, a burst of 20 queued requests from one wallet numbered by one flush and sent, two colliding flushes of which exactly one wins, and 20 wallets that pre-prove and submit together so their requests share a block | none |
-| `admin-replace-nonce-e2e` | 1 | A signed-but-unbroadcast vault transaction strands the account's nonce, and `adminReplaceEvmNonce` replaces it with an empty self-transfer so the transaction queued behind it mines | none |
 
-100 tests total across these specs. The offline `benchmark-tooling` spec (6
+20 tests total across these specs. The offline `benchmark-tooling` spec (6
 tests, no stack needed) is not pinned and runs last, so a full run reports
-106. The suite runs against a Sepolia fork, and the setup pipeline
+26. The suite runs against a Sepolia fork, and the setup pipeline
 verifies that the Uniswap router and the stataUSDC wrapper are deployed on it
 before any spec runs, so a fork missing either fails the run at setup with an
 error naming the missing contract. A rerun

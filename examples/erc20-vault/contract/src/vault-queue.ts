@@ -1,171 +1,225 @@
-import { CallTxFailedError } from "@midnight-ntwrk/midnight-js/contracts";
-import { FailFallible, type PublicDataProvider } from "@midnight-ntwrk/midnight-js/types";
+import {
+  CallTxFailedError,
+  createCallTxOptions,
+  createUnprovenCallTx,
+  submitTx,
+} from "@midnight-ntwrk/midnight-js/contracts";
+import { getNetworkId } from "@midnight-ntwrk/midnight-js/network-id";
+import {
+  encodeContractKeyLocation,
+  FailFallible,
+  hashVerifierKey,
+  SucceedEntirely,
+} from "@midnight-ntwrk/midnight-js/types";
+import {
+  communicationCommitmentRandomness,
+  ContractCallPrototype,
+  Intent,
+  Transaction,
+} from "@midnight-ntwrk/midnight-js-protocol/ledger";
 
-import type { DeployedVaultContract } from "./contract-surface.ts";
-import { pureCircuits, type Stamp } from "./managed/erc20-vault/contract/index.js";
+import {
+  VAULT_PRIVATE_STATE_ID,
+  type VaultCompiledContract,
+  type VaultProviders,
+} from "./contract-surface.ts";
+import {
+  FlushChannel,
+  type FlushSlot,
+  pureCircuits,
+} from "./managed/erc20-vault/contract/index.js";
 import { readVaultLedger, type VaultLedgerState } from "./vault-ledger.ts";
 
-/** Keys one `flush` call carries. */
-export const FLUSH_WIDTH = 20;
+/** Slots one `flushQueue` call carries. */
+export const FLUSH_WIDTH = 10;
 
 /**
- * Pads a key batch with zero keys to the flush width.
+ * The slot vector `flushQueue` takes: attestation slots first, so the request slots
+ * behind them record those heights as their `lastSeen`, then empty slots to the width.
  *
- * @param keys - The queue keys to flush.
- * @returns The vector the flush circuit takes.
- * @throws {Error} When more keys than the flush width are given.
+ * @param inIndexes - The input buffer indexes of the requests to flush.
+ * @param digests - The digests of the attestations to flush.
+ * @returns The padded slot vector.
+ * @throws {Error} When more items than the flush width are given.
  */
-export function padKeys(keys: readonly Uint8Array[]): Uint8Array[] {
-  if (keys.length > FLUSH_WIDTH) {
+export function flushSlots(
+  inIndexes: readonly bigint[],
+  digests: readonly Uint8Array[],
+): FlushSlot[] {
+  if (inIndexes.length + digests.length > FLUSH_WIDTH) {
     throw new Error(
-      `a flush takes at most ${String(FLUSH_WIDTH)} keys; got ${String(keys.length)}`,
+      `a flush takes at most ${String(FLUSH_WIDTH)} items; got ${String(inIndexes.length + digests.length)}`,
     );
   }
-  return [...keys, ...Array<Uint8Array>(FLUSH_WIDTH - keys.length).fill(new Uint8Array(32))];
+  const empty = new Uint8Array(32);
+  return [
+    ...digests.map((digest) => ({ channel: FlushChannel.attestation, inIndex: 0n, digest })),
+    ...inIndexes.map((inIndex) => ({ channel: FlushChannel.request, inIndex, digest: empty })),
+    ...Array.from({ length: FLUSH_WIDTH - inIndexes.length - digests.length }, () => ({
+      channel: FlushChannel.empty,
+      inIndex: 0n,
+      digest: empty,
+    })),
+  ];
 }
 
 /**
- * A fresh queue key for a withdraw, swap, supply or redeem: 32 random bytes.
+ * A fresh input buffer index for a start circuit: 64 random bits.
  *
- * @returns The key to queue the request under.
+ * @returns The index to queue the request under.
  */
-export function newQueueKey(): Uint8Array {
-  return crypto.getRandomValues(new Uint8Array(32));
+export function newInputIndex(): bigint {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  return new DataView(bytes.buffer).getBigUint64(0);
 }
 
 /**
- * Whether a queued request or settle view belongs to this identity: its
- * commitment is the refund commitment of the secret over its key.
- *
- * @param secretKey - The requester's identity secret key.
- * @param key - The request's queue key.
- * @param commitment - The commitment the ledger stores for the request.
- * @returns True when the secret produced that commitment.
- */
-export function ownsRequest(
-  secretKey: Uint8Array,
-  key: Uint8Array,
-  commitment: Uint8Array,
-): boolean {
-  const mine = pureCircuits.refundCommitment(secretKey, key);
-  return mine.length === commitment.length && mine.every((byte, i) => byte === commitment[i]);
-}
-
-/**
- * The queued keys that belong to this identity, in ledger order.
+ * The output buffer key a queued request moves to when flushed, computed by the
+ * compiled `requestKey` circuit from the entry the start circuit wrote.
  *
  * @param state - The vault ledger state.
- * @param secretKey - The requester's identity secret key.
- * @returns The keys of this identity's queued requests.
+ * @param inIndex - The request's input buffer index.
+ * @returns The request key.
+ * @throws {Error} When no request is queued under the index.
  */
-export function myQueuedKeys(state: VaultLedgerState, secretKey: Uint8Array): Uint8Array[] {
-  const keys: Uint8Array[] = [];
-  for (const [key, entry] of state.pendingVaultRequests) {
-    if (ownsRequest(secretKey, key, entry.commitment)) keys.push(key);
+export function queuedRequestKey(state: VaultLedgerState, inIndex: bigint): Uint8Array {
+  if (!state.inputRequestBuffer.member(inIndex)) {
+    throw new Error(`no request is queued under input index ${String(inIndex)}`);
   }
-  return keys;
+  return pureCircuits.requestKey(state.inputRequestBuffer.lookup(inIndex));
 }
 
 /**
- * Queued keys the flush has not stamped yet, in ledger order.
+ * The digests under which an attestation buffer holds records for a request.
  *
- * @param state - The vault ledger state.
- * @returns The keys a flush can still stamp.
+ * @param buffer - `inputAttestationBuffer` or `outputAttestationBuffer`.
+ * @param requestId - The request the attestations name.
+ * @returns The matching digests, in ledger order.
  */
-export function unstampedKeys(state: VaultLedgerState): Uint8Array[] {
-  const keys: Uint8Array[] = [];
-  for (const [key] of state.pendingVaultRequests) {
-    if (!state.stamps.member(key)) keys.push(key);
+export function attestationDigestsFor(
+  buffer: VaultLedgerState["inputAttestationBuffer"],
+  requestId: Uint8Array,
+): Uint8Array[] {
+  const digests: Uint8Array[] = [];
+  for (const [digest, record] of buffer) {
+    if (
+      record.requestId.length === requestId.length &&
+      record.requestId.every((byte, i) => byte === requestId[i])
+    ) {
+      digests.push(digest);
+    }
   }
-  return keys;
+  return digests;
 }
 
-/**
- * Settled request ids whose attested block height the flush has not folded into the
- * vault's last seen height yet, in ledger order.
- *
- * @param state - The vault ledger state.
- * @returns The request ids a flush can still fold.
- */
-export function seenRequestIds(state: VaultLedgerState): Uint8Array[] {
-  const ids: Uint8Array[] = [];
-  for (const [requestId] of state.seenEvmHeights) ids.push(requestId);
-  return ids;
-}
+const FLUSH_TTL_MS = 5 * 60_000;
 
-/**
- * The stamp a flush put on a queued key: its EVM nonce, zero for a deposit, and the
- * vault's last seen block height at that time.
- *
- * @param state - The vault ledger state.
- * @param key - The queued key.
- * @returns The stamp.
- * @throws {Error} When the key has no stamp yet.
- */
-export function stampOf(state: VaultLedgerState, key: Uint8Array): Stamp {
-  if (!state.stamps.member(key)) {
-    throw new Error("the request key has no stamp; flush first");
+// midnight-js sections a call's transcript before the wallet adds its fee payment, so
+// a flush carrying one item stays in the guaranteed section and the payment then
+// pushes it past the node's time-to-dismiss cap (error 231). With the whole
+// transcript fallible, only the proof check and the payment count toward that cap.
+async function submitFlush(
+  providers: VaultProviders,
+  compiledContract: VaultCompiledContract,
+  vaultContractAddress: string,
+  slots: FlushSlot[],
+): Promise<void> {
+  const call = await createUnprovenCallTx(providers, {
+    ...createCallTxOptions(
+      compiledContract,
+      "flushQueue",
+      vaultContractAddress,
+      VAULT_PRIVATE_STATE_ID,
+      undefined,
+      [slots],
+    ),
+    privateStateId: VAULT_PRIVATE_STATE_ID,
+  });
+  const [guaranteed, fallible] = call.public.partitionedTranscript;
+  const state = await providers.publicDataProvider.queryContractState(vaultContractAddress);
+  const operation = state?.operation("flushQueue");
+  if (!operation?.verifierKey) {
+    throw new Error(`flushQueue has no verifier key on chain at ${vaultContractAddress}`);
   }
-  return state.stamps.lookup(key);
+  const prototype = new ContractCallPrototype(
+    vaultContractAddress,
+    "flushQueue",
+    operation,
+    undefined,
+    guaranteed ?? fallible,
+    call.private.privateTranscriptOutputs,
+    call.private.input,
+    call.private.output,
+    communicationCommitmentRandomness(),
+    encodeContractKeyLocation({
+      contractAddress: vaultContractAddress,
+      circuitId: "flushQueue",
+      verifierKeyHash: hashVerifierKey(operation.verifierKey),
+    }),
+  );
+  const intent = Intent.new(new Date(Date.now() + FLUSH_TTL_MS)).addCall(prototype);
+  const unprovenTx = Transaction.fromPartsRandomized(getNetworkId(), undefined, undefined, intent);
+  const finalized = await submitTx(providers, { unprovenTx, circuitId: "flushQueue" });
+  if (finalized.status !== SucceedEntirely) {
+    throw new CallTxFailedError(finalized, "flushQueue");
+  }
 }
 
 /**
- * The EVM nonce a flush assigned to a queued key.
+ * Flushes up to FLUSH_WIDTH waiting items, whoever queued them: queued attestations
+ * first, then queued requests, in ledger order. The flush's ledger work runs in the
+ * transaction's fallible section, so a flush that loses a race to another flush lands
+ * as a {@link CallTxFailedError} with status `FailFallible` and still pays its fee.
  *
- * @param state - The vault ledger state.
- * @param key - The queued key.
- * @returns The assigned nonce.
- * @throws {Error} When the key has no stamp yet.
- */
-export function assignedNonce(state: VaultLedgerState, key: Uint8Array): bigint {
-  return stampOf(state, key).evmNonce;
-}
-
-/**
- * Folds up to FLUSH_WIDTH settled heights into the last seen height, then stamps the
- * first FLUSH_WIDTH unstamped queued keys on the ledger, whoever queued them.
- *
- * @param vault - The found vault contract to call.
- * @param publicDataProvider - The provider the ledger is read through.
+ * @param providers - The vault's provider set, whose wallet pays for the flush.
+ * @param compiledContract - The vault's compiled contract.
  * @param vaultContractAddress - The vault's contract address.
- * @returns How many keys the flush stamped.
+ * @returns How many slots the flush filled.
+ * @throws {CallTxFailedError} When the flush lands but does not succeed entirely.
  */
 export async function flushPending(
-  vault: DeployedVaultContract,
-  publicDataProvider: PublicDataProvider,
+  providers: VaultProviders,
+  compiledContract: VaultCompiledContract,
   vaultContractAddress: string,
 ): Promise<number> {
-  const state = await readVaultLedger(publicDataProvider, vaultContractAddress);
-  const batch = unstampedKeys(state).slice(0, FLUSH_WIDTH);
-  const seen = seenRequestIds(state).slice(0, FLUSH_WIDTH);
-  await vault.callTx.flush(padKeys(batch), padKeys(seen));
-  return batch.length;
+  const state = await readVaultLedger(providers.publicDataProvider, vaultContractAddress);
+  const digests = [...state.inputAttestationBuffer].map(([digest]) => digest).slice(0, FLUSH_WIDTH);
+  const inIndexes = [...state.inputRequestBuffer]
+    .map(([inIndex]) => inIndex)
+    .slice(0, FLUSH_WIDTH - digests.length);
+  await submitFlush(
+    providers,
+    compiledContract,
+    vaultContractAddress,
+    flushSlots(inIndexes, digests),
+  );
+  return digests.length + inIndexes.length;
 }
 
 /**
- * Flushes until the given queued key carries a stamp. A flush that loses its block to
- * another flush is retried.
+ * Flushes until `flushed` holds for the ledger. A flush that loses its block to another
+ * flush is retried.
  *
- * @param vault - The found vault contract to call.
- * @param publicDataProvider - The provider the ledger is read through.
+ * @param providers - The vault's provider set, whose wallet pays for the flushes.
+ * @param compiledContract - The vault's compiled contract.
  * @param vaultContractAddress - The vault's contract address.
- * @param key - The queued key that needs a stamp.
+ * @param flushed - Whether the ledger shows what the caller waits for.
  * @param attempts - How many flushes to try.
- * @returns The stamp.
- * @throws {Error} On a non-conflict failure, or when the key remains unstamped after the attempts.
+ * @returns The ledger state that satisfied `flushed`.
+ * @throws {Error} On a non-conflict failure, or when `flushed` still fails after the attempts.
  */
-export async function flushUntilStamped(
-  vault: DeployedVaultContract,
-  publicDataProvider: PublicDataProvider,
+export async function flushUntil(
+  providers: VaultProviders,
+  compiledContract: VaultCompiledContract,
   vaultContractAddress: string,
-  key: Uint8Array,
+  flushed: (state: VaultLedgerState) => boolean,
   attempts = 5,
-): Promise<Stamp> {
+): Promise<VaultLedgerState> {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const state = await readVaultLedger(publicDataProvider, vaultContractAddress);
-    if (state.stamps.member(key)) return state.stamps.lookup(key);
+    const state = await readVaultLedger(providers.publicDataProvider, vaultContractAddress);
+    if (flushed(state)) return state;
     try {
-      await flushPending(vault, publicDataProvider, vaultContractAddress);
+      await flushPending(providers, compiledContract, vaultContractAddress);
     } catch (error) {
       const staleRead: boolean =
         error instanceof Error && error.message.includes("mismatch between expected read");
@@ -177,5 +231,7 @@ export async function flushUntilStamped(
       );
     }
   }
-  return stampOf(await readVaultLedger(publicDataProvider, vaultContractAddress), key);
+  const state = await readVaultLedger(providers.publicDataProvider, vaultContractAddress);
+  if (flushed(state)) return state;
+  throw new Error(`still not flushed after ${String(attempts)} flush attempts`);
 }

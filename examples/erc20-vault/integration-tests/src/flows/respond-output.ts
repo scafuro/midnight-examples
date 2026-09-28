@@ -26,14 +26,13 @@
 // response key the vault pinned at initialise: a post's declared kind, the
 // observation's own success flag and the cache's contents are all
 // unauthenticated, they only decide which bytes get checked. The verified
-// kind and bytes route settlement: an executed transfer goes to
-// `completeDeposit` for a sweep and to `completeWithdraw` for a transfer, a
-// failed or unviable one is unclaimable on a sweep and goes to
-// `refundWithdraw` on a transfer. The fetched output is UNTRUSTED until that
-// check: the verified bytes go into the settle circuit as an argument, where
-// `verifyRespondBidirectionalEventV1<N>` re-hashes them and verifies the same
-// signature in-circuit. That in-circuit check is the authentication gate, so
-// a forged post merely wastes a proof here, it cannot mint.
+// kind and bytes route settlement: an executed sweep settles through
+// `completeDeposit`, a failed or unviable one through `closeFailedDeposit`.
+// The fetched output is UNTRUSTED until that check: the verified bytes go into
+// the queue circuit as an argument, where `verifyRespondBidirectionalEventV1<N>`
+// re-hashes them and verifies the same signature in-circuit. That in-circuit
+// check is the authentication gate, so a forged post merely wastes a proof
+// here, it cannot mint.
 import {
   boolAbiWord,
   deserializeEvmOutput,
@@ -355,8 +354,7 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
  * @param schemas - The request's schemas, as JSON text read off its on-ledger
  *   record.
  * @param requestsPath - The resolved ledger-tree path of the map holding the
- *   request: `VAULT_DEPOSIT_REQUESTS_PATH` for a deposit sweep, the default
- *   `VAULT_REQUESTS_PATH` for a withdraw transfer.
+ *   request. Defaults to `VAULT_DEPOSIT_REQUESTS_PATH`.
  * @param progress - Optional diagnostics for the enclosing poll.
  * @param memo - The enclosing poll's {@link RespondPollMemo}, so later ticks
  *   skip the ledger read and the observation this one resolved; a single

@@ -143,7 +143,7 @@ export async function runDepositRoundTrip(
     context.providers.publicDataProvider,
     context.vaultContractAddress,
   );
-  if (!ledger.depositEventMap.member(requestIdBytes(requestId))) {
+  if (!ledger.bidirectionalDepositMap.member(requestIdBytes(requestId))) {
     logSkip("completeDeposit", `request ${requestId} already claimed (not in the deposit map)`);
   } else {
     await settleDeposit(context, outcome, opts.claimRecipient);

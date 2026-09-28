@@ -30,10 +30,8 @@ export interface PollRespondBidirectionalOptions {
   /** Give-up timeout in milliseconds. */
   readonly timeoutMs: number;
   /**
-   * The resolved ledger-tree path of the map holding the request. Deposits
-   * pass VAULT_DEPOSIT_REQUESTS_PATH (the depositEventMap); withdrawals take
-   * the default VAULT_REQUESTS_PATH (the signBidirectionalEventMap they share
-   * with the approves).
+   * The resolved ledger-tree path of the map holding the request. Defaults to
+   * VAULT_DEPOSIT_REQUESTS_PATH (the bidirectionalDepositMap).
    */
   readonly requestsPath?: readonly number[];
 }

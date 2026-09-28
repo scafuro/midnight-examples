@@ -15,6 +15,7 @@ send, queue an attestation, settle) never conflict with each other or with the
 flush. All contention is concentrated in the flush, where it is cheap to
 handle: a flush carries no user funds or secrets, anyone may submit one, and a
 flush that loses a race is simply rebuilt from the new state and resubmitted.
+The price of a lost race is the losing flush's fee.
 
 ## The shared cells
 
@@ -116,13 +117,13 @@ flushes touch shared state.
 
 ## The flush
 
-`flushQueue` takes a vector of 20 slots. Each slot names a channel and a key:
+`flushQueue` takes a vector of 10 slots. Each slot names a channel and a key:
 
 - **Request slot.** Moves one entry from `inputRequestBuffer` to
   `outputRequestBuffer`, recording `globalLastSeen` as its `lastSeen`.
 - **Attestation slot.** Moves one record from `inputAttestationBuffer` to
   `outputAttestationBuffer` and folds its block height into `globalLastSeen`.
-- **Empty slot.** Does nothing, so a flush with fewer than 20 waiting items is
+- **Empty slot.** Does nothing, so a flush with fewer than 10 waiting items is
   still a valid call.
 
 A slot whose key is not in its input buffer does nothing. So does a request
@@ -146,6 +147,17 @@ then conflict with every flush.
 Two flushes built against the same state conflict on `globalLastSeen`. One of
 them lands, and the other is rebuilt and resubmitted. Only the flusher ever
 retries. Users' own transactions never fail because of a flush.
+
+The SDK's `flushPending` submits every flush with its whole transcript in the
+transaction's fallible section, which runs after the fee is paid. Before taking
+a fee, a node must be able to reject a transaction cheaply: it refuses one
+whose proof check plus guaranteed section takes longer than
+`max(15 ms, 2 µs per byte)`. midnight-js chooses the section before the wallet
+adds its fee payment, so on its own it leaves a one-item flush in the
+guaranteed section, where the payment then pushes it past that limit. In the
+fallible section only the proof check and the payment count. The same choice
+means a flush that loses a race still lands, as a failed fallible section, and
+pays its fee.
 
 ## The last seen height
 
@@ -244,8 +256,8 @@ flush is its only reader and writer.
 - **Latency.** Settling needs a second flush after the MPC attests, so a round
   trip is six Midnight transactions.
 - **Flush throughput.** Every request uses two flush slots over its life, one
-  for its entry and one for its attestation, so a 20-slot flush carries the
-  equivalent of 10 complete requests.
+  for its entry and one for its attestation, so a 10-slot flush carries the
+  equivalent of 5 complete requests.
 - **Serial flushes.** Flushes built against the same state conflict, so they
   land one after another, and throughput is bounded by the flush width and the
   flush rate, not by the number of users.
