@@ -1659,8 +1659,9 @@ describe("cross-action settle isolation", () => {
 // `Bytes [0x09, 0x5e, 0xa7, 0xb3]` hardcoded in erc20-vault.compact.
 const APPROVE_SELECTOR = new Uint8Array([0x09, 0x5e, 0xa7, 0xb3]);
 
-// The input index every approval fixture queues under, clear of the deposit and
-// withdraw fixtures' indexes.
+// The input index every approval fixture queues under. Each action's fixture has its
+// own index (deposit 1, withdraw 11, approve 21, replace nonce 31, swap 41, supply 51,
+// redeem 61), so any two can share a vault.
 const APPROVE_INDEX = 21n;
 
 // The vault's gas settings initialise() stores, which every approval copies at start.
@@ -2174,7 +2175,7 @@ interface ReplaceNonceCallArgs {
  * of this base with the delta inline.
  */
 const VALID_REPLACE_NONCE: ReplaceNonceCallArgs = {
-  inIndex: 21n,
+  inIndex: 31n,
   evmNonce: 3n,
 };
 
@@ -2753,7 +2754,7 @@ interface SwapCallArgs {
  * of this base with the delta inline (see {@link SWAP_REJECTION_CASES}).
  */
 const VALID_SWAP: SwapCallArgs = {
-  inIndex: 31n,
+  inIndex: 41n,
   swap: {
     erc20AddressIn: ERC20,
     erc20AddressOut: ERC20_OUT,
@@ -3487,7 +3488,7 @@ interface SupplyCallArgs {
  * of this base with the delta inline (see {@link SUPPLY_REJECTION_CASES}).
  */
 const VALID_SUPPLY: SupplyCallArgs = {
-  inIndex: 31n,
+  inIndex: 51n,
   supply: { amount: AMOUNT },
   coin: vaultCoin(AMOUNT, STATA_UNDERLYING_COLOR),
 };
@@ -4128,7 +4129,7 @@ interface RedeemCallArgs {
  * of this base with the delta inline (see {@link REDEEM_REJECTION_CASES}).
  */
 const VALID_REDEEM: RedeemCallArgs = {
-  inIndex: 41n,
+  inIndex: 61n,
   redeem: { shares: REDEEM_SHARES },
   coin: vaultCoin(REDEEM_SHARES, STATA_TOKEN_COLOR),
 };
