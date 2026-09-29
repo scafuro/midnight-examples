@@ -88,10 +88,12 @@ map already holds.
 
 The flush stores the entry in `outputRequestBuffer` together with the
 `lastSeen` height at that moment, under the entry's **request key**
-(`requestKey`): a hash of every buffered field that determines the EVM
-transaction (the action, the nonce flag, the nonce and the args hash). It
-deliberately leaves out the input index and the ownership commitment, so two
-identical requests share one request key.
+(`requestKey`): a hash of the nonce and the args hash, which together
+determine the EVM transaction. Each action's args hash starts with a domain tag
+no other action uses, and each action fixes whether the nonce is the vault's,
+so the key needs neither the action nor the nonce flag. It deliberately leaves
+out the input index and the ownership commitment, so two identical requests
+share one request key.
 
 The entry and its arguments fix every byte of the EVM transaction, gas
 included, so sending is permissionless and chooses nothing. The send never
