@@ -25,10 +25,13 @@ task is the first unticked one whose dependencies are ticked.
 - [x] **P1a** Approvals (router and stata) (`372965d`, all 123 tests on a
       fresh vault `6505fd4a…1300f1`, fakenet 0.30.0)
 - [x] **P1b** Nonce replacement (`372965d`, same run)
-- [ ] **P2a** Swap
-- [ ] **P2b** Supply
-- [ ] **P3** Redeem
-- [ ] **S1** Contract unit test sweep
+- [ ] **P2a** Swap (merged in `e3152b0`, e2e on a fresh vault in progress)
+- [ ] **P2b** Supply (merged in `e3152b0`, e2e on a fresh vault in progress)
+- [ ] **P3** Redeem, with the width-8 pure decoders (merged in `e3152b0`, e2e
+      on a fresh vault in progress)
+- [x] **S1** Contract unit test sweep (`cb740fc`, 411 contract tests, every
+      assert and `requireInitialised` site caught when disabled, chunk-shape
+      tests dropped)
 - [ ] **S2** SDK flush tests
 - [ ] **S3** Live concurrency and time budget
 - [ ] **S4** Documentation sweep
