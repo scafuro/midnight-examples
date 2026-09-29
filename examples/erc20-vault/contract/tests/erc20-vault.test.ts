@@ -65,6 +65,7 @@ import {
   VAULT_APPROVE_REQUESTS_PATH,
   VAULT_DEPOSIT_REQUESTS_PATH,
   VAULT_REPLACE_NONCE_REQUESTS_PATH,
+  VAULT_SUPPLY_REQUESTS_PATH,
   VAULT_SWAP_REQUESTS_PATH,
   VAULT_WITHDRAW_REQUESTS_PATH,
   type VaultPrivateState,
@@ -696,6 +697,18 @@ const attest = async (
   serializedOutput: Uint8Array,
 ): Promise<CircuitContext<VaultPrivateState>> => {
   const queued = (await contract.circuits.queueAttestation1(ctx, attestation, serializedOutput))
+    .context;
+  return flush(contract, queued, [], [attestation.requestId]);
+};
+
+/** Queue an 8-byte attestation and flush it: the arrange step before a width-8 settle. */
+const attest8 = async (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  attestation: RespondBidirectionalEvent,
+  serializedOutput: Uint8Array,
+): Promise<CircuitContext<VaultPrivateState>> => {
+  const queued = (await contract.circuits.queueAttestation8(ctx, attestation, serializedOutput))
     .context;
   return flush(contract, queued, [], [attestation.requestId]);
 };
@@ -3083,18 +3096,6 @@ const swapRequested = async () => {
   return { contract, ctx: next, requestId: requestIdBytes(idHex) };
 };
 
-/** Queue an 8-byte attestation and flush it: the arrange step before a settle. */
-const attest8 = async (
-  contract: Contract<VaultPrivateState>,
-  ctx: CircuitContext<VaultPrivateState>,
-  attestation: RespondBidirectionalEvent,
-  serializedOutput: Uint8Array,
-): Promise<CircuitContext<VaultPrivateState>> => {
-  const queued = (await contract.circuits.queueAttestation8(ctx, attestation, serializedOutput))
-    .context;
-  return flush(contract, queued, [], [attestation.requestId]);
-};
-
 /**
  * An executed swap's attested output: the spent amountIn packed by the swap's
  * respond schema, read from the COMPILED circuit, as the MPC packs it.
@@ -3420,6 +3421,645 @@ describe("completeSwap settle", () => {
   });
 });
 
+// ---- Supply fixtures ----
+
+// The ERC-4626 deposit(uint256,address) selector: the TS mirror of the literal
+// `Bytes [0x6e, 0x55, 0x3f, 0x65]` hardcoded in erc20-vault.compact.
+const STATA_DEPOSIT_SELECTOR = new Uint8Array([0x6e, 0x55, 0x3f, 0x65]);
+
+// The supply's schemas at their exact contract-declared widths: the round trip below
+// is the lockstep check for the compiled supplyOutputSchema and supplyRespondSchema.
+const SUPPLY_OUTPUT_SCHEMA = asciiPadded('[{"name":"shares","type":"uint256"}]', 36);
+const SUPPLY_RESPOND_SCHEMA = asciiPadded('[{"name":"shares","type":"uint64"}]', 35);
+
+// The vault token colours of the pinned Aave pair: a supply surrenders the
+// underlying's, and its shares are minted in the wrapper's.
+const STATA_UNDERLYING_COLOR = hexToBytes(
+  rawTokenType(pureCircuits.vaultTokenDomainSeparator(STATA_UNDERLYING), VAULT_ADDRESS),
+);
+const STATA_TOKEN_COLOR = hexToBytes(
+  rawTokenType(pureCircuits.vaultTokenDomainSeparator(STATA_TOKEN), VAULT_ADDRESS),
+);
+
+// The mint keys completeSupply mints the shares, or re-mints the underlying, under.
+const STATA_TOKEN_MINT_KEY = bytesToHex(pureCircuits.vaultTokenDomainSeparator(STATA_TOKEN));
+const STATA_UNDERLYING_MINT_KEY = bytesToHex(
+  pureCircuits.vaultTokenDomainSeparator(STATA_UNDERLYING),
+);
+
+// The shares an executed supply is attested with, packed by the compiled respond
+// schema to its 8-byte width, the way the MPC packs them.
+const SUPPLY_SHARES = 360_679n;
+const OUTPUT_SUPPLY = serializeRespondOutput(pureCircuits.supplyRespondSchema(), {
+  shares: SUPPLY_SHARES,
+});
+
+// completeSupply takes an 8-byte output on every verdict and ignores it on a failure.
+const OUTPUT_SUPPLY_IGNORED = new Uint8Array(8);
+
+/**
+ * A supply's `startSupply` arguments: the input index, the `SupplyRequest` and the
+ * surrendered underlying coin. The nonce and gas are the vault's, and the contract
+ * pins both token addresses, so the caller passes none of them.
+ */
+interface SupplyCallArgs {
+  inIndex: bigint;
+  supply: { amount: bigint };
+  coin: ReturnType<typeof vaultCoin>;
+}
+
+/**
+ * Known-good supply call args, the base every test varies from.
+ * Shared across tests: NEVER mutate. Build a variation as an explicit spread
+ * of this base with the delta inline (see {@link SUPPLY_REJECTION_CASES}).
+ */
+const VALID_SUPPLY: SupplyCallArgs = {
+  inIndex: 31n,
+  supply: { amount: AMOUNT },
+  coin: vaultCoin(AMOUNT, STATA_UNDERLYING_COLOR),
+};
+
+// The gas every supply copies at start: the vault's default fees at its supply limit.
+const DEFAULT_SUPPLY_GAS = { ...DEFAULT_VAULT_GAS, gasLimit: 500_000n };
+
+/** Queue a supply: startSupply with its args in circuit order. */
+const queueSupply = (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  args: SupplyCallArgs,
+) => contract.circuits.startSupply(ctx, args.inIndex, args.supply, args.coin);
+
+/** Queue, flush and send a supply, returning the send's context and the request key. */
+const supply = async (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  args: SupplyCallArgs,
+) => {
+  const queued = (await queueSupply(contract, ctx, args)).context;
+  const flushed = await flush(contract, queued, [args.inIndex], []);
+  const outKey = flushedRequestKey(ledgerOf(flushed), Action.supply, args.inIndex);
+  const sent = await contract.circuits.sendSupply(flushed, outKey);
+  return { context: sent.context, outKey };
+};
+
+// ---- Supply tests ----
+
+describe("supply round-trip", () => {
+  it("stores a vault-path stataToken deposit built from the flushed entry and its args", async () => {
+    const { contract, ctx } = await deployInitialised();
+
+    const { context: next, outKey } = await supply(contract, ctx, VALID_SUPPLY);
+    const state = next.callContext.currentQueryContext.state;
+
+    const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalSupplyMap);
+    const rawLedger = readSignetRequestsLedgerFromState(state, VAULT_SUPPLY_REQUESTS_PATH);
+    expect(typedIndex.size).toBe(1);
+    expect(rawLedger.requestsIndex).toEqual(typedIndex);
+    const [idHex, record] = first(typedIndex.entries(), "indexed supply request");
+
+    // The notification names THIS vault and the bidirectionalSupplyMap.
+    const notificationEvent = first(
+      decodeSignetLogEvents(next.events, SIGNET_ADDRESS),
+      "signet notification event",
+    );
+    expect(notificationEvent.name).toBe(SignetEventName.SignBidirectionalEvent);
+    const notificationPost = decodeSignBidirectionalEventNotificationPayload(
+      notificationEvent.payload,
+    );
+    expect(requestIdHex(notificationPost.requestId)).toBe(idHex);
+    expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
+      version: 1,
+      callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
+      requestsPath: [...VAULT_SUPPLY_REQUESTS_PATH],
+    });
+
+    // The vault's own account signs a call to the pinned wrapper at the first
+    // nonce the flush assigned, under the vault's supply gas copied at start.
+    expect(record.sender).toEqual({ bytes: VAULT_ADDRESS_BYTES });
+    expect(record.path).toEqual(asciiPadded("vault", 32));
+    const { calldata, ...envelope } = record.txParams;
+    expect(envelope).toEqual({
+      to: STATA_TOKEN,
+      chainId: CHAIN_ID,
+      nonce: 0n,
+      ...DEFAULT_SUPPLY_GAS,
+      value: 0n,
+      accessListEntryCount: 0n,
+      accessList: [],
+    });
+    expect(record.executionDest).toEqual(EXPECTED_ROUTING.executionDest);
+    expect(record.keyVersion).toBe(MPC_KEY_VERSION);
+    expect(record.algo).toBe(EXPECTED_ROUTING.algo);
+    expect(record.signatureDest).toBe(EXPECTED_ROUTING.signatureDest);
+    expect(record.params).toEqual(EXPECTED_ROUTING.params);
+    expect(record.txParamType).toBe(TxParamType.evmType2);
+    expect(record.outputDeserializationSchema).toEqual(SUPPLY_OUTPUT_SCHEMA);
+    expect(record.respondSerializationSchema).toEqual(SUPPLY_RESPOND_SCHEMA);
+
+    // Contract-built calldata: deposit(amount, receiver = the vault's own account).
+    expect(calldata.is_some).toBe(true);
+    expect(calldata.value.selector).toEqual(STATA_DEPOSIT_SELECTOR);
+    expect(calldata.value.noWords).toBe(2n);
+    expect(calldata.value.words).toHaveLength(2);
+    expect(calldata.value.words[0]).toEqual(numericAbiWord(AMOUNT));
+    expect(calldata.value.words[1]).toEqual(evmAddressAbiWord(VAULT_EVM));
+
+    expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
+
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    expect(entry).toEqual({
+      action: Action.supply,
+      nonceIsVault: true,
+      evmNonce: 0n,
+      inIndex: VALID_SUPPLY.inIndex,
+      commitment: pureCircuits.ownershipCommitment(VALID_SUPPLY.inIndex, SECRET_KEY),
+      argsHash: expect.any(Uint8Array) as Uint8Array,
+    });
+    expect(lastSeen).toBe(EVM_START_HEIGHT);
+    expect(ledger(state).supplyArgsMap.lookup(VALID_SUPPLY.inIndex)).toEqual({
+      request: VALID_SUPPLY.supply,
+      gas: DEFAULT_SUPPLY_GAS,
+    });
+    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+    expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
+    expect(ledger(state).globalEvmNonce).toBe(1n);
+  });
+
+  it("start burns the surrendered underlying coin: received by the vault, then paid in full to the burn address", async () => {
+    const { contract, ctx } = await deployInitialised();
+
+    const started = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+    const zswap = zswapState(started);
+
+    expect(zswap.inputs).toHaveLength(1);
+    const consumed = first(zswap.inputs, "consumed coin");
+    expect(consumed.color).toEqual(STATA_UNDERLYING_COLOR);
+    expect(consumed.value).toBe(AMOUNT);
+
+    expect(zswap.outputs).toHaveLength(2);
+    const received = first(
+      zswap.outputs.filter((output) => !output.recipient.is_left),
+      "contract-owned receive output",
+    );
+    expect(received.recipient.right.bytes).toEqual(VAULT_ADDRESS_BYTES);
+    expect(received.coinInfo).toEqual({
+      nonce: consumed.nonce,
+      color: consumed.color,
+      value: consumed.value,
+    });
+    const burnOutput = first(
+      zswap.outputs.filter((output) => output.recipient.is_left),
+      "burn output",
+    );
+    expect(burnOutput.coinInfo.color).toEqual(STATA_UNDERLYING_COLOR);
+    expect(burnOutput.coinInfo.value).toBe(AMOUNT);
+    expect(burnOutput.recipient.left.bytes).toEqual(BURN_ADDRESS_BYTES);
+  });
+
+  it("a supply flushed behind a withdrawal takes the next vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedWithdraw = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const queuedBoth = (await queueSupply(contract, queuedWithdraw, VALID_SUPPLY)).context;
+
+    const flushed = await flush(
+      contract,
+      queuedBoth,
+      [VALID_WITHDRAW.inIndex, VALID_SUPPLY.inIndex],
+      [],
+    );
+
+    const state = ledgerOf(flushed);
+    const withdrawKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
+    const supplyKey = flushedRequestKey(state, Action.supply, VALID_SUPPLY.inIndex);
+    expect(state.outputRequestBuffer.lookup(withdrawKey).entry.evmNonce).toBe(0n);
+    expect(state.outputRequestBuffer.lookup(supplyKey).entry.evmNonce).toBe(1n);
+    expect(state.globalEvmNonce).toBe(2n);
+  });
+});
+
+/** One row of the supply rejection table: full inputs to expected error. */
+interface SupplyRejectionCase {
+  /** Test name, completing the sentence "rejects <name>". */
+  name: string;
+  /** Complete call args passed to startSupply. */
+  args: SupplyCallArgs;
+  /** Error startSupply must throw. */
+  throws: RegExp;
+}
+
+const SUPPLY_REJECTION_CASES: SupplyRejectionCase[] = [
+  {
+    name: "a zero amount",
+    args: {
+      ...VALID_SUPPLY,
+      supply: { amount: 0n },
+      coin: vaultCoin(0n, STATA_UNDERLYING_COLOR),
+    },
+    throws: /Amount must be positive/,
+  },
+  {
+    name: "an amount above Uint<64> max (unrefundable)",
+    args: {
+      ...VALID_SUPPLY,
+      supply: { amount: UINT64_MAX + 1n },
+      coin: vaultCoin(UINT64_MAX + 1n, STATA_UNDERLYING_COLOR),
+    },
+    throws: /Amount exceeds Uint<64> max/,
+  },
+  {
+    name: "a coin of the wrapper's colour, not the underlying's",
+    args: { ...VALID_SUPPLY, coin: vaultCoin(AMOUNT, STATA_TOKEN_COLOR) },
+    throws: /Coin is not the vault token for the underlying/,
+  },
+  {
+    name: "a coin whose value differs from the supply amount",
+    args: { ...VALID_SUPPLY, coin: vaultCoin(AMOUNT - 1n, STATA_UNDERLYING_COLOR) },
+    throws: /Coin value must equal the supply amount/,
+  },
+];
+
+describe("supply validation", () => {
+  it.each(SUPPLY_REJECTION_CASES)("rejects $name", async ({ args, throws }) => {
+    const { contract, ctx } = await deployInitialised();
+    await expect(queueSupply(contract, ctx, args)).rejects.toThrow(throws);
+  });
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(queueSupply(contract, ctx, VALID_SUPPLY)).rejects.toThrow(/Not initialised/);
+  });
+
+  it("rejects an index the input buffer holds", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+    await expect(queueSupply(contract, queued, VALID_SUPPLY)).rejects.toThrow(
+      /Index already in use/,
+    );
+  });
+
+  it("rejects an index another action's queued request holds", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    await expect(
+      queueSupply(contract, queued, { ...VALID_SUPPLY, inIndex: VALID_WITHDRAW.inIndex }),
+    ).rejects.toThrow(/Index already in use/);
+  });
+
+  it("rejects an index the flush freed while its args stay in supplyArgsMap", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+    const flushed = await flush(contract, queued, [VALID_SUPPLY.inIndex], []);
+    expect(ledgerOf(flushed).inputRequestBuffer.member(VALID_SUPPLY.inIndex)).toBe(false);
+    await expect(queueSupply(contract, flushed, VALID_SUPPLY)).rejects.toThrow(
+      /Index already in use/,
+    );
+  });
+});
+
+describe("sendSupply", () => {
+  it("is permissionless: a stranger sends the supplier's request as queued", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+    const flushed = await flush(contract, queued, [VALID_SUPPLY.inIndex], []);
+    const outKey = flushedRequestKey(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
+
+    const sent = (
+      await contract.circuits.sendSupply(await strangerContext("sendSupply", flushed), outKey)
+    ).context;
+    const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalSupplyMap);
+    expect(index.size).toBe(1);
+    const record = first(index.values(), "supply request");
+    expect(record.path).toEqual(asciiPadded("vault", 32));
+    expect(record.txParams.nonce).toBe(0n);
+  });
+
+  it("rejects a key the flush has not moved", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+    await expect(contract.circuits.sendSupply(queued, bytes(32, 0x5a))).rejects.toThrow(
+      /Request not flushed/,
+    );
+  });
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(contract.circuits.sendSupply(ctx, bytes(32, 0x5a))).rejects.toThrow(
+      /Not initialised/,
+    );
+  });
+
+  it("rejects a second send of the same request", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const { context: sent, outKey } = await supply(contract, ctx, VALID_SUPPLY);
+    await expect(contract.circuits.sendSupply(sent, outKey)).rejects.toThrow(
+      /Request already sent/,
+    );
+  });
+
+  it("rejects a flushed withdrawal's key, and sendWithdraw rejects a flushed supply's", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedWithdraw = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const queuedBoth = (await queueSupply(contract, queuedWithdraw, VALID_SUPPLY)).context;
+    const flushed = await flush(
+      contract,
+      queuedBoth,
+      [VALID_WITHDRAW.inIndex, VALID_SUPPLY.inIndex],
+      [],
+    );
+    const withdrawKey = flushedRequestKey(
+      ledgerOf(flushed),
+      Action.withdraw,
+      VALID_WITHDRAW.inIndex,
+    );
+    const supplyKey = flushedRequestKey(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
+
+    await expect(contract.circuits.sendSupply(flushed, withdrawKey)).rejects.toThrow(
+      /Wrong action/,
+    );
+    await expect(contract.circuits.sendWithdraw(flushed, supplyKey)).rejects.toThrow(
+      /Wrong action/,
+    );
+  });
+});
+
+/**
+ * Deploy + initialise + supply(VALID_SUPPLY): the arrange step of every
+ * complete-supply test. Returns the sent supply's request id (the single supply
+ * map key) alongside the threaded context.
+ */
+const supplyRequested = async () => {
+  const { contract, ctx } = await deployInitialised();
+  const { context: next } = await supply(contract, ctx, VALID_SUPPLY);
+  const index = toSignBidirectionalEventIndex(ledgerOf(next).bidirectionalSupplyMap);
+  const idHex = first(index.keys(), "supply request id");
+  return { contract, ctx: next, requestId: requestIdBytes(idHex) };
+};
+
+describe("queueAttestation8", () => {
+  it("rejects an attestation not signed by the pinned MPC response key", async () => {
+    const { contract, ctx, requestId } = await supplyRequested();
+    await expect(
+      contract.circuits.queueAttestation8(
+        ctx,
+        respond(IMPOSTER_SECRET, requestId, OutputKind.executed, OUTPUT_SUPPLY, ATTESTED_HEIGHT),
+        OUTPUT_SUPPLY,
+      ),
+    ).rejects.toThrow(/Invalid attestation signature/);
+  });
+
+  it("rejects an output other than the one the MPC signed", async () => {
+    const { contract, ctx, requestId } = await supplyRequested();
+    await expect(
+      contract.circuits.queueAttestation8(
+        ctx,
+        respond(
+          MPC_RESPONSE_SECRET,
+          requestId,
+          OutputKind.executed,
+          OUTPUT_SUPPLY,
+          ATTESTED_HEIGHT,
+        ),
+        serializeRespondOutput(pureCircuits.supplyRespondSchema(), { shares: SUPPLY_SHARES + 1n }),
+      ),
+    ).rejects.toThrow(/Invalid attestation signature/);
+  });
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(
+      contract.circuits.queueAttestation8(
+        ctx,
+        respond(
+          MPC_RESPONSE_SECRET,
+          bytes(32, 0x5a),
+          OutputKind.executed,
+          OUTPUT_SUPPLY,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUPPLY,
+      ),
+    ).rejects.toThrow(/Not initialised/);
+  });
+
+  it("records the verified attestation under its request id, and the flush moves it", async () => {
+    const { contract, ctx, requestId } = await supplyRequested();
+    const attestation = respond(
+      MPC_RESPONSE_SECRET,
+      requestId,
+      OutputKind.executed,
+      OUTPUT_SUPPLY,
+      ATTESTED_HEIGHT,
+    );
+
+    const queued = (await contract.circuits.queueAttestation8(ctx, attestation, OUTPUT_SUPPLY))
+      .context;
+    expect(ledgerOf(queued).inputAttestationBuffer.lookup(requestId)).toEqual({
+      blockHeight: ATTESTED_HEIGHT,
+      outputKind: OutputKind.executed,
+      digest: attestation.digest,
+    });
+
+    const flushed = await flush(contract, queued, [], [requestId]);
+    expect(ledgerOf(flushed).inputAttestationBuffer.isEmpty()).toBe(true);
+    expect(ledgerOf(flushed).outputAttestationBuffer.member(requestId)).toBe(true);
+    expect(ledgerOf(flushed).globalLastSeen).toBe(ATTESTED_HEIGHT);
+  });
+});
+
+/** Arrange a flushed attestation of the given verdict for the requested supply. */
+interface SupplyVerdictCase {
+  /** Test name, completing the sentence "<name> and consumes the request". */
+  name: string;
+  /** The verdict the MPC attests. */
+  outputKind: OutputKind;
+  /** The output the MPC signs (empty under a failure kind). */
+  signedOutput: Uint8Array;
+  /** The output completeSupply is passed. */
+  presentedOutput: Uint8Array;
+  /** The mints completeSupply must request. */
+  mints: [string, bigint][];
+}
+
+const SUPPLY_VERDICT_CASES: SupplyVerdictCase[] = [
+  {
+    name: "an executed deposit mints the attested shares as the wrapper's vault token",
+    outputKind: OutputKind.executed,
+    signedOutput: OUTPUT_SUPPLY,
+    presentedOutput: OUTPUT_SUPPLY,
+    mints: [[STATA_TOKEN_MINT_KEY, SUPPLY_SHARES]],
+  },
+  {
+    name: "a reverted deposit (failed) re-mints the surrendered underlying",
+    outputKind: OutputKind.failed,
+    signedOutput: OUTPUT_EMPTY,
+    presentedOutput: OUTPUT_SUPPLY_IGNORED,
+    mints: [[STATA_UNDERLYING_MINT_KEY, AMOUNT]],
+  },
+  {
+    name: "a deposit whose nonce another transaction took (unviable) re-mints the surrendered underlying",
+    outputKind: OutputKind.unviable,
+    signedOutput: OUTPUT_EMPTY,
+    presentedOutput: OUTPUT_SUPPLY_IGNORED,
+    mints: [[STATA_UNDERLYING_MINT_KEY, AMOUNT]],
+  },
+];
+
+describe("completeSupply settle", () => {
+  it.each(SUPPLY_VERDICT_CASES)(
+    "$name and consumes the request",
+    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+      const { contract, ctx, requestId } = await supplyRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        signedOutput,
+        ATTESTED_HEIGHT,
+      );
+      const attested =
+        outputKind === OutputKind.executed
+          ? await attest8(contract, ctx, attestation, signedOutput)
+          : await attestFailure(contract, ctx, attestation);
+
+      const next = (
+        await contract.circuits.completeSupply(attested, requestId, presentedOutput, MINT_NONCE)
+      ).context;
+
+      expect(shieldedMintsOf(next)).toEqual(mints);
+      const state = ledgerOf(next);
+      expect(state.bidirectionalSupplyMap.isEmpty()).toBe(true);
+      expect(state.supplyArgsMap.isEmpty()).toBe(true);
+      expect(state.outputRequestBuffer.isEmpty()).toBe(true);
+      expect(state.outputAttestationBuffer.isEmpty()).toBe(true);
+      expect(state.evictionMap.isEmpty()).toBe(true);
+    },
+  );
+
+  it.each(SUPPLY_VERDICT_CASES)(
+    "rejects a caller other than the supplier when $name",
+    async ({ outputKind, signedOutput, presentedOutput }) => {
+      const { contract, ctx, requestId } = await supplyRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        signedOutput,
+        ATTESTED_HEIGHT,
+      );
+      const attested =
+        outputKind === OutputKind.executed
+          ? await attest8(contract, ctx, attestation, signedOutput)
+          : await attestFailure(contract, ctx, attestation);
+
+      await expect(
+        contract.circuits.completeSupply(
+          await strangerContext("completeSupply", attested),
+          requestId,
+          presentedOutput,
+          MINT_NONCE,
+        ),
+      ).rejects.toThrow(/Not the requester/);
+    },
+  );
+
+  it("rejects a share count other than the one the execution was attested with", async () => {
+    // Presenting more shares would mint wrapper tokens the vault account never received.
+    const { contract, ctx, requestId } = await supplyRequested();
+    const attested = await attest8(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUPPLY, ATTESTED_HEIGHT),
+      OUTPUT_SUPPLY,
+    );
+    await expect(
+      contract.circuits.completeSupply(
+        attested,
+        requestId,
+        serializeRespondOutput(pureCircuits.supplyRespondSchema(), { shares: SUPPLY_SHARES + 1n }),
+        MINT_NONCE,
+      ),
+    ).rejects.toThrow(/Output does not match the attestation/);
+  });
+
+  it.each([
+    { name: "queueAttestation8", outputKind: OutputKind.executed, output: OUTPUT_SUPPLY },
+    { name: "queueAttestation0", outputKind: OutputKind.failed, output: OUTPUT_EMPTY },
+  ])(
+    "$name refuses an attestation at or below the supply's lastSeen",
+    async ({ outputKind, output }) => {
+      const { contract, ctx, requestId } = await supplyRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        output,
+        EVM_START_HEIGHT,
+      );
+      await expect(
+        outputKind === OutputKind.executed
+          ? contract.circuits.queueAttestation8(ctx, attestation, output)
+          : contract.circuits.queueAttestation0(ctx, attestation, output),
+      ).rejects.toThrow(/Stale attestation/);
+    },
+  );
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(
+      contract.circuits.completeSupply(ctx, bytes(32, 0x5a), OUTPUT_SUPPLY_IGNORED, MINT_NONCE),
+    ).rejects.toThrow(/Not initialised/);
+  });
+
+  it("settles once: a second completeSupply for the same request rejects", async () => {
+    const { contract, ctx, requestId } = await supplyRequested();
+    const attested = await attest8(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUPPLY, ATTESTED_HEIGHT),
+      OUTPUT_SUPPLY,
+    );
+    const next = (
+      await contract.circuits.completeSupply(attested, requestId, OUTPUT_SUPPLY, MINT_NONCE)
+    ).context;
+    await expect(
+      contract.circuits.completeSupply(next, requestId, OUTPUT_SUPPLY, MINT_NONCE),
+    ).rejects.toThrow(/Request not sent/);
+  });
+
+  it("completeSupply rejects a withdrawal's request id, and completeWithdraw a supply's", async () => {
+    const { contract, ctx, requestId: withdrawId } = await withdrawRequested();
+    const supplied = (await supply(contract, ctx, VALID_SUPPLY)).context;
+    const supplyId = requestIdBytes(
+      first(
+        toSignBidirectionalEventIndex(ledgerOf(supplied).bidirectionalSupplyMap).keys(),
+        "supply request id",
+      ),
+    );
+    const withdrawQueued = (
+      await contract.circuits.queueAttestation0(
+        supplied,
+        respond(MPC_RESPONSE_SECRET, withdrawId, OutputKind.failed, OUTPUT_EMPTY, ATTESTED_HEIGHT),
+        OUTPUT_EMPTY,
+      )
+    ).context;
+    const bothQueued = (
+      await contract.circuits.queueAttestation0(
+        withdrawQueued,
+        respond(MPC_RESPONSE_SECRET, supplyId, OutputKind.failed, OUTPUT_EMPTY, ATTESTED_HEIGHT),
+        OUTPUT_EMPTY,
+      )
+    ).context;
+    const attested = await flush(contract, bothQueued, [], [withdrawId, supplyId]);
+
+    await expect(
+      contract.circuits.completeSupply(attested, withdrawId, OUTPUT_SUPPLY_IGNORED, MINT_NONCE),
+    ).rejects.toThrow(/Wrong action/);
+    await expect(
+      contract.circuits.completeWithdraw(attested, supplyId, OUTPUT_IGNORED, MINT_NONCE),
+    ).rejects.toThrow(/Wrong action/);
+  });
+});
+
 interface VaultCall {
   contractAddress: string;
   publicTranscript: unknown;
@@ -3619,6 +4259,44 @@ describe("throughput: requests never pin shared state, only the flush does", () 
       flushSlots([VALID_SWAP.inIndex], []),
     );
     expect(replay(stateOf(withdrawFlush.context), swapFlush, true)).toMatch(/^REJECTED/);
+  });
+
+  it("two concurrent startSupplys from different callers both apply", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const alice = await queueSupply(contract, ctx, VALID_SUPPLY);
+    const bobCtx = await strangerContext("startSupply", ctx);
+    const bob = await queueSupply(contract, bobCtx, {
+      ...VALID_SUPPLY,
+      inIndex: VALID_SUPPLY.inIndex + 1n,
+    });
+    expect(replay(stateOf(alice.context), bob, true)).toBe("applied");
+  });
+
+  it("a supply start applies after a concurrent flush moved the vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const withdrawFlush = await contract.circuits.flushQueue(
+      queued,
+      flushSlots([VALID_WITHDRAW.inIndex], []),
+    );
+    const supplyStart = await queueSupply(contract, queued, VALID_SUPPLY);
+    expect(ledgerOf(withdrawFlush.context).globalEvmNonce).toBe(1n);
+    expect(replay(stateOf(withdrawFlush.context), supplyStart, true)).toBe("applied");
+  });
+
+  it("a flush moving a supply conflicts with a concurrent flush moving a withdrawal on the vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedSupply = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+    const queuedBoth = (await queueWithdraw(contract, queuedSupply, VALID_WITHDRAW)).context;
+    const withdrawFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([VALID_WITHDRAW.inIndex], []),
+    );
+    const supplyFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([VALID_SUPPLY.inIndex], []),
+    );
+    expect(replay(stateOf(withdrawFlush.context), supplyFlush, true)).toMatch(/^REJECTED/);
   });
 });
 
@@ -3910,6 +4588,35 @@ describe("gas parameters reach the constructed transaction", () => {
       maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
       maxPriorityFeePerGas: DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
       gasLimit: DEFAULT_SWAP_GAS_LIMIT,
+    });
+  });
+
+  it("sendSupply carries the updated fee envelope and the SUPPLY gas limit", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const configured = (await setGasParams(contract, ctx, NEW_GAS_PARAMS)).context;
+
+    const next = (await supply(contract, configured, VALID_SUPPLY)).context;
+
+    expect(envelopeOf(ledgerOf(next).bidirectionalSupplyMap)).toEqual({
+      maxFeePerGas: NEW_MAX_FEE_PER_GAS,
+      maxPriorityFeePerGas: NEW_MAX_PRIORITY_FEE_PER_GAS,
+      gasLimit: NEW_SUPPLY_GAS_LIMIT,
+    });
+  });
+
+  it("a supply keeps the gas it was queued with when setGasParams runs before its send", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+    const flushed = await flush(contract, queued, [VALID_SUPPLY.inIndex], []);
+    const outKey = flushedRequestKey(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
+    const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
+
+    const sent = (await contract.circuits.sendSupply(reconfigured, outKey)).context;
+
+    expect(envelopeOf(ledgerOf(sent).bidirectionalSupplyMap)).toEqual({
+      maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
+      maxPriorityFeePerGas: DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+      gasLimit: DEFAULT_SUPPLY_GAS_LIMIT,
     });
   });
 

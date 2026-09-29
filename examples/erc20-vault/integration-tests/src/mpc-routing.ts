@@ -1,7 +1,7 @@
 // The CONTRACT-FIXED MPC routing of every vault SignBidirectionalEvent, needed to
 // rebuild expected event records off-chain: TS mirrors of the vault contract's
 // in-circuit constants, which MUST stay in lockstep with erc20-vault.compact, and
-// the swap's schemas read from its compiled pure circuits. The vault contract
+// the swap's and the supply's schemas read from its compiled pure circuits. The vault contract
 // package's round-trip simulator tests assert the same values against the real
 // compiled contract.
 
@@ -17,7 +17,8 @@ import { pureCircuits as vaultCircuits } from "@sig-net/midnight-examples-erc20-
 /**
  * What the MPC reports back about an ERC20 `transfer` or `approve`, and about a
  * plain transfer: a single bool. Serves as both the output-deserialization and
- * the respond-serialization schema of every vault event except a swap's. Stored
+ * the respond-serialization schema of every vault event except a swap's and a
+ * supply's. Stored
  * at its EXACT byte width (schemas are exact-width by protocol convention, never
  * zero-padded: off-chain readers recover the declared width from the stored
  * bytes).
@@ -49,7 +50,7 @@ export interface VaultMpcRouting {
 
 /**
  * The routing the vault contract bakes into every event it records except a
- * swap's: ECDSA, an unused signature destination, no extras, the MPC's Ethereum
+ * swap's and a supply's: ECDSA, an unused signature destination, no extras, the MPC's Ethereum
  * routing key as the execution destination, and
  * {@link ERC20_TRANSFER_RESULT_SCHEMA} in both directions.
  */
@@ -77,4 +78,15 @@ export const SWAP_MPC_ROUTING: VaultMpcRouting = {
   ...TRANSFER_RESULT_MPC_ROUTING,
   outputDeserializationSchema: vaultCircuits.swapOutputSchema(),
   respondSerializationSchema: vaultCircuits.swapRespondSchema(),
+};
+
+/**
+ * The routing of a supply event: {@link TRANSFER_RESULT_MPC_ROUTING}'s fields
+ * with the supply's own schemas, which decode the wrapper `deposit`'s uint256
+ * shares and pack them as a uint64.
+ */
+export const SUPPLY_MPC_ROUTING: VaultMpcRouting = {
+  ...TRANSFER_RESULT_MPC_ROUTING,
+  outputDeserializationSchema: vaultCircuits.supplyOutputSchema(),
+  respondSerializationSchema: vaultCircuits.supplyRespondSchema(),
 };
