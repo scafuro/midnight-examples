@@ -1116,11 +1116,6 @@ export pure circuit swapRespondSchema(): Bytes<37> {
   return "[{\"name\":\"amountIn\",\"type\":\"uint64\"}]" as Bytes<37>;
 }
 
-// swapRespondSchema()'s output decoded: the amountIn the swap spent, packed to 8 bytes.
-struct ExactOutputSingleReturnValue {
-  amountIn: Uint<64>;
-}
-
 // Swap requests (7-word exactOutputSingle, 38-byte output and 37-byte respond schemas).
 // Compiled path for MPC notification: [2, 9] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalSwapMap: SignBidirectionalEventMapV1<EvmType2TxParams<7, 0, 0>, 38, 37>;
@@ -1247,6 +1242,15 @@ export circuit sendSwap(outKey: Bytes<32>): [] {
   );
 }
 
+// swapRespondSchema()'s output decoded: the amountIn the swap spent, packed to 8 bytes.
+struct ExactOutputSingleReturnValue {
+  amountIn: Uint<64>;
+}
+
+export pure circuit swapAmountIn(output: Bytes<8>): Uint<64> {
+  return deserialize<ExactOutputSingleReturnValue, 8>(output).amountIn;
+}
+
 // Settles a swap on either verdict. Executed: checks the output against the
 // attestation, then mints exactly amountOut of erc20AddressOut and the unspent
 // amountInMaximum - amountIn of erc20AddressIn as change, a zero-value coin on an exact
@@ -1289,7 +1293,7 @@ export circuit completeSwap(
       recipient
     );
     // The router spends at most amountInMaximum, which start capped at Uint<64> max.
-    const amountIn = deserialize<ExactOutputSingleReturnValue, 8>(output).amountIn;
+    const amountIn = swapAmountIn(output);
     mintShieldedToken(
       vaultTokenDomainSeparator(args.request.erc20AddressIn),
       (args.request.amountInMaximum - amountIn) as Uint<64>,
@@ -1320,11 +1324,6 @@ export pure circuit supplyOutputSchema(): Bytes<36> {
 // The MPC re-packs the shares as a uint64, the width completeSupply mints.
 export pure circuit supplyRespondSchema(): Bytes<35> {
   return "[{\"name\":\"shares\",\"type\":\"uint64\"}]" as Bytes<35>;
-}
-
-// supplyRespondSchema()'s output decoded, packed by the MPC to 8 bytes.
-struct DepositReturnValue {
-  shares: Uint<64>;
 }
 
 export struct SupplyRequest {
@@ -1447,6 +1446,15 @@ export circuit sendSupply(outKey: Bytes<32>): [] {
   );
 }
 
+// supplyRespondSchema()'s output decoded, packed by the MPC to 8 bytes.
+struct DepositReturnValue {
+  shares: Uint<64>;
+}
+
+export pure circuit supplyShares(output: Bytes<8>): Uint<64> {
+  return deserialize<DepositReturnValue, 8>(output).shares;
+}
+
 // Settles a supply on either verdict. Executed: checks the output against the
 // attestation, then mints the attested shares as the stataToken vault coin. Failed or
 // unviable: the wrapper took nothing, so the surrendered stataUnderlying amount is
@@ -1479,7 +1487,7 @@ export circuit completeSupply(
     );
     mintShieldedToken(
       vaultTokenDomainSeparator(stataToken),
-      deserialize<DepositReturnValue, 8>(output).shares,
+      supplyShares(output),
       disclose(mintNonce),
       caller
     );
@@ -1507,11 +1515,6 @@ export pure circuit redeemOutputSchema(): Bytes<36> {
 // The MPC re-packs the assets as a uint64, the width completeRedeem mints.
 export pure circuit redeemRespondSchema(): Bytes<35> {
   return "[{\"name\":\"assets\",\"type\":\"uint64\"}]" as Bytes<35>;
-}
-
-// redeemRespondSchema()'s output decoded, packed by the MPC to 8 bytes.
-struct RedeemReturnValue {
-  assets: Uint<64>;
 }
 
 export struct RedeemRequest {
@@ -1636,6 +1639,15 @@ export circuit sendRedeem(outKey: Bytes<32>): [] {
   );
 }
 
+// redeemRespondSchema()'s output decoded, packed by the MPC to 8 bytes.
+struct RedeemReturnValue {
+  assets: Uint<64>;
+}
+
+export pure circuit redeemAssets(output: Bytes<8>): Uint<64> {
+  return deserialize<RedeemReturnValue, 8>(output).assets;
+}
+
 // Settles a redeem on either verdict. Executed: checks the output against the
 // attestation, then mints the attested assets as the stataUnderlying vault coin. Failed
 // or unviable: the wrapper burned nothing, so the surrendered stataToken shares are
@@ -1668,7 +1680,7 @@ export circuit completeRedeem(
     );
     mintShieldedToken(
       vaultTokenDomainSeparator(stataUnderlying),
-      deserialize<RedeemReturnValue, 8>(output).assets,
+      redeemAssets(output),
       disclose(mintNonce),
       caller
     );

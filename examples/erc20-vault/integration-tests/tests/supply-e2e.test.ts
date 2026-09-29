@@ -20,6 +20,7 @@
 // (src/flows/), in-process, never a subprocess.
 import { bytesToHex, OutputKind, requestIdBytes, type RequestIdHex } from "@sig-net/midnight";
 import {
+  pureCircuits,
   readVaultLedger,
   VAULT_SUPPLY_REQUESTS_PATH,
   vaultGasEnvelope,
@@ -39,7 +40,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { fundingSummary } from "../src/evm-logging.ts";
 import { broadcastEvm } from "../src/flows/broadcast-evm.ts";
-import { attestedSupplyShares, settleSupply } from "../src/flows/complete-supply.ts";
+import { settleSupply } from "../src/flows/complete-supply.ts";
 import { runDepositRoundTrip } from "../src/flows/deposit-round-trip.ts";
 import {
   pollRespondBidirectional,
@@ -275,7 +276,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
           "a mined wrapper deposit must be attested under OutputKind.executed",
         ).toBe(OutputKind.executed);
         expect(supplyAttestation.serializedOutput).toHaveLength(8);
-        supplyShares = attestedSupplyShares(supplyAttestation);
+        supplyShares = pureCircuits.supplyShares(supplyAttestation.serializedOutput);
         expect(supplyShares).toBeGreaterThan(0n);
 
         banner([

@@ -3166,6 +3166,18 @@ const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
   },
 ];
 
+describe("swapAmountIn", () => {
+  it.each([
+    { name: "zero", amountIn: 0n },
+    { name: "one base unit", amountIn: 1n },
+    { name: "a typical spend", amountIn: SWAP_AMOUNT_IN_SPENT },
+    { name: "the Uint<64> maximum", amountIn: UINT64_MAX },
+  ])("decodes $name as swapRespondSchema() packs it", ({ amountIn }) => {
+    const output = serializeRespondOutput(pureCircuits.swapRespondSchema(), { amountIn });
+    expect(pureCircuits.swapAmountIn(output)).toBe(amountIn);
+  });
+});
+
 describe("completeSwap settle", () => {
   it.each(SWAP_VERDICT_CASES)(
     "$name and consumes the request",
@@ -3905,6 +3917,18 @@ const SUPPLY_VERDICT_CASES: SupplyVerdictCase[] = [
   },
 ];
 
+describe("supplyShares", () => {
+  it.each([
+    { name: "zero", shares: 0n },
+    { name: "one share", shares: 1n },
+    { name: "a typical share count", shares: SUPPLY_SHARES },
+    { name: "the Uint<64> maximum", shares: UINT64_MAX },
+  ])("decodes $name as supplyRespondSchema() packs it", ({ shares }) => {
+    const output = serializeRespondOutput(pureCircuits.supplyRespondSchema(), { shares });
+    expect(pureCircuits.supplyShares(output)).toBe(shares);
+  });
+});
+
 describe("completeSupply settle", () => {
   it.each(SUPPLY_VERDICT_CASES)(
     "$name and consumes the request",
@@ -4462,6 +4486,18 @@ const REDEEM_VERDICT_CASES: RedeemVerdictCase[] = [
     mints: [[STATA_TOKEN_MINT_KEY, REDEEM_SHARES]],
   },
 ];
+
+describe("redeemAssets", () => {
+  it.each([
+    { name: "zero", assets: 0n },
+    { name: "one base unit", assets: 1n },
+    { name: "a typical asset amount", assets: REDEEM_ASSETS },
+    { name: "the Uint<64> maximum", assets: UINT64_MAX },
+  ])("decodes $name as redeemRespondSchema() packs it", ({ assets }) => {
+    const output = serializeRespondOutput(pureCircuits.redeemRespondSchema(), { assets });
+    expect(pureCircuits.redeemAssets(output)).toBe(assets);
+  });
+});
 
 describe("completeRedeem settle", () => {
   it.each(REDEEM_VERDICT_CASES)(

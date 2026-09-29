@@ -18,6 +18,7 @@
 // (src/flows/), in-process, never a subprocess.
 import { OutputKind, requestIdBytes, type RequestIdHex } from "@sig-net/midnight";
 import {
+  pureCircuits,
   readVaultLedger,
   VAULT_SWAP_REQUESTS_PATH,
   vaultGasEnvelope,
@@ -37,7 +38,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { fundingSummary } from "../src/evm-logging.ts";
 import { quoteExactOutputSingle } from "../src/evm-swap.ts";
 import { broadcastEvm } from "../src/flows/broadcast-evm.ts";
-import { settleSwap, swapAmountIn } from "../src/flows/complete-swap.ts";
+import { settleSwap } from "../src/flows/complete-swap.ts";
 import { runDepositRoundTrip } from "../src/flows/deposit-round-trip.ts";
 import {
   pollRespondBidirectional,
@@ -288,7 +289,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault swap e2e", () =
         swapAttestation.event.outputKind,
         "the broadcast step saw the swap mine, so the MPC must attest it executed",
       ).toBe(OutputKind.executed);
-      const amountIn = swapAmountIn(swapAttestation);
+      const amountIn = pureCircuits.swapAmountIn(swapAttestation.serializedOutput);
       expect(amountIn, "an executed swap attests the input it spent").toBeGreaterThan(0n);
 
       banner([

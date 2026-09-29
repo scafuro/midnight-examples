@@ -2,14 +2,7 @@
 // stataToken deposit, flush it, then settle through `completeSupply` with the
 // request id, the output bytes the attestation signs, and a fresh RANDOM mint nonce
 // so the minted coin cannot be linked back to the request.
-import {
-  bytesToBigint,
-  bytesToHex,
-  OutputKind,
-  type RequestIdHex,
-  requestIdHex,
-  serializeRespondOutput,
-} from "@sig-net/midnight";
+import { OutputKind, type RequestIdHex, requestIdHex } from "@sig-net/midnight";
 import {
   pureCircuits,
   VAULT_SUPPLY_REQUESTS_PATH,
@@ -20,35 +13,6 @@ import type { VaultContext } from "../vault-context.ts";
 import { pollRespondBidirectional } from "./poll-respond-bidirectional.ts";
 import { queueAndFlushAttestation } from "./queue-attestation.ts";
 import type { RespondOutcome } from "./respond-output.ts";
-
-/**
- * The stataToken shares an executed supply's attestation carries, which
- * `completeSupply` mints. The output packs them as a little-endian uint64 under
- * the compiled `supplyRespondSchema()`, and the decoded value is re-packed with
- * that schema to prove it reproduces the attested bytes.
- *
- * @param outcome - The attested outcome from {@link pollRespondBidirectional}.
- * @returns The attested share count.
- * @throws {Error} If the outcome is not an execution, or its output is not the
- *   packing of a share count under the supply's respond schema.
- */
-export function attestedSupplyShares(outcome: RespondOutcome): bigint {
-  const requestId = requestIdHex(outcome.event.requestId);
-  if (outcome.event.outputKind !== OutputKind.executed) {
-    throw new Error(
-      `supply ${requestId} was attested ${OutputKind[outcome.event.outputKind]}: it carries no shares`,
-    );
-  }
-  const shares = bytesToBigint(outcome.serializedOutput);
-  const repacked = serializeRespondOutput(pureCircuits.supplyRespondSchema(), { shares });
-  if (bytesToHex(repacked) !== bytesToHex(outcome.serializedOutput)) {
-    throw new Error(
-      `supply ${requestId} attests output 0x${bytesToHex(outcome.serializedOutput)}, ` +
-        `which is not a share count packed by supplyRespondSchema()`,
-    );
-  }
-  return shares;
-}
 
 /**
  * Settle a resolved supply outcome: {@link queueAndFlushAttestation}, then call
@@ -69,7 +33,7 @@ export async function settleSupply(context: VaultContext, outcome: RespondOutcom
   console.log(`request id:      ${requestIdHex(outcome.event.requestId)}`);
   console.log(
     executed
-      ? `EVM deposit executed: completeSupply mints ${String(attestedSupplyShares(outcome))} stataToken shares to this wallet (the supplier)`
+      ? `EVM deposit executed: completeSupply mints ${String(pureCircuits.supplyShares(outcome.serializedOutput))} stataToken shares to this wallet (the supplier)`
       : `the MPC attested the deposit as ${OutputKind[outcome.event.outputKind]}: ` +
           `completeSupply re-mints the surrendered underlying to this wallet (the supplier)`,
   );
