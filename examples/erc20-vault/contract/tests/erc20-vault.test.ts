@@ -2,11 +2,17 @@
 // @midnight-ntwrk/compact-runtime. No ledger, no network, no proving.
 
 import {
+  ChargedState,
   type CircuitContext,
+  type CircuitResults,
   createCircuitContext,
   createConstructorContext,
+  type EncodedRecipient,
+  type EncodedZswapLocalState,
   rawTokenType,
   sampleContractAddress,
+  StateMap,
+  StateValue,
 } from "@midnight-ntwrk/compact-runtime";
 // This tree's wasm ContractState class: see signetStateProvider for why the
 // portal-linked signet module's state must round-trip through it.
@@ -56,8 +62,10 @@ import {
   Action,
   Contract,
   createVaultPrivateState,
+  FLUSH_WIDTH,
   FlushChannel,
   flushedRequestKey,
+  type FlushSlot,
   flushSlots,
   ledger,
   pureCircuits,
@@ -72,11 +80,13 @@ import {
   type VaultPrivateState,
   witnesses,
 } from "../src/index.ts";
+import { compiledFieldIndex } from "./compiled-ledger.ts";
 
 // ---- Fixtures ----
 
-// Dummy coin public key (32-byte hex). Required by the API, unused here.
-const CPK = "0".repeat(64);
+// The coin public key of every simulated caller, where ownPublicKey() mints. Non-zero,
+// so a mint to the caller is told apart from one to the all-zero burn address.
+const CPK = "c0".repeat(32);
 
 const bytes = (length: number, fill: number) => new Uint8Array(length).fill(fill);
 
@@ -158,6 +168,14 @@ const CHAIN_ID = 11155111n;
 // every event the vault records (kernel.self() again).
 const VAULT_ADDRESS = sampleContractAddress();
 const VAULT_ADDRESS_BYTES = hexToBytes(VAULT_ADDRESS);
+
+// The vault token colour for ERC20 at the simulated contract address, computed
+// exactly as a wallet would: the compiled domain-separator circuit plus the
+// runtime's rawTokenType (the off-chain twin of the in-circuit
+// `tokenType(domainSep, kernel.self())`).
+const VAULT_TOKEN_COLOR = hexToBytes(
+  rawTokenType(pureCircuits.vaultTokenDomainSeparator(ERC20), VAULT_ADDRESS),
+);
 
 // The contract-fixed MPC routing of every vault event (mirrors of the
 // in-circuit constants; the round-trip tests below are the lockstep check for
@@ -254,9 +272,10 @@ const ledgerOf = (ctx: CircuitContext<VaultPrivateState>) => ledger(stateOf(ctx)
 
 /**
  * Deploy + initialise(VAULT_EVM, CHAIN_ID, MPC_RESPONSE_KEY) as
- * the deployer: the ready-to-use vault, with the MPC response key stored.
+ * the deployer: the ready-to-use vault, with the MPC response key stored and
+ * `evmStartHeight` as its last seen height.
  */
-const deployInitialised = async () => {
+const deployInitialised = async (evmStartHeight: bigint = EVM_START_HEIGHT) => {
   const { contract, ctx } = await deployContract();
   const next = (
     await contract.circuits.initialise(
@@ -268,7 +287,7 @@ const deployInitialised = async () => {
       CHAIN_ID,
       MPC_RESPONSE_KEY,
       MPC_KEY_VERSION,
-      EVM_START_HEIGHT,
+      evmStartHeight,
     )
   ).context;
   return { contract, ctx: next };
@@ -438,6 +457,45 @@ describe("initialise", () => {
     ).rejects.toThrow(/Chain ID must be positive/);
   });
 
+  it.each([
+    {
+      name: "a zero router",
+      router: ZERO_ADDRESS,
+      underlying: STATA_UNDERLYING,
+      wrapper: STATA_TOKEN,
+      throws: /Router cannot be zero/,
+    },
+    {
+      name: "a zero stataUnderlying",
+      router: ROUTER,
+      underlying: ZERO_ADDRESS,
+      wrapper: STATA_TOKEN,
+      throws: /stataUnderlying cannot be zero/,
+    },
+    {
+      name: "a zero stataToken",
+      router: ROUTER,
+      underlying: STATA_UNDERLYING,
+      wrapper: ZERO_ADDRESS,
+      throws: /stataToken cannot be zero/,
+    },
+  ])("rejects $name", async ({ router, underlying, wrapper, throws }) => {
+    const { contract, ctx } = await deployContract();
+    await expect(
+      contract.circuits.initialise(
+        ctx,
+        VAULT_EVM,
+        router,
+        underlying,
+        wrapper,
+        CHAIN_ID,
+        MPC_RESPONSE_KEY,
+        MPC_KEY_VERSION,
+        EVM_START_HEIGHT,
+      ),
+    ).rejects.toThrow(throws);
+  });
+
   it("stores the vault EVM address, the chain id and the MPC response key", async () => {
     const { ctx } = await deployInitialised();
     const state = ledger(ctx.callContext.currentQueryContext.state);
@@ -603,7 +661,42 @@ describe("deposit validation", () => {
 
   it("rejects before initialise", async () => {
     const { contract, ctx } = await deployContract();
-    await expect(deposit(contract, ctx, VALID_DEPOSIT)).rejects.toThrow(/Not initialised/);
+    await expect(queueDeposit(contract, ctx, VALID_DEPOSIT)).rejects.toThrow(/Not initialised/);
+  });
+
+  it("rejects an index the input buffer holds", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
+    await expect(
+      queueDeposit(contract, queued, { ...VALID_DEPOSIT, evmNonce: VALID_DEPOSIT.evmNonce + 1n }),
+    ).rejects.toThrow(/Index already in use/);
+  });
+
+  it("rejects an index another action's queued request holds", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    await expect(
+      queueDeposit(contract, queued, { ...VALID_DEPOSIT, inIndex: VALID_WITHDRAW.inIndex }),
+    ).rejects.toThrow(/Index already in use/);
+  });
+
+  it("rejects an index the flush freed while its args stay in depositArgsMap", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
+    const flushed = await flush(contract, queued, [VALID_DEPOSIT.inIndex], []);
+    expect(ledgerOf(flushed).inputRequestBuffer.member(VALID_DEPOSIT.inIndex)).toBe(false);
+    await expect(
+      queueDeposit(contract, flushed, { ...VALID_DEPOSIT, evmNonce: VALID_DEPOSIT.evmNonce + 1n }),
+    ).rejects.toThrow(/Index already in use/);
+  });
+
+  it("sendDeposit rejects a queued deposit's key before the flush moves it", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
+    const outKey = queuedRequestKey(ledgerOf(queued), VALID_DEPOSIT.inIndex);
+    await expect(contract.circuits.sendDeposit(queued, outKey)).rejects.toThrow(
+      /Request not flushed/,
+    );
   });
 
   it("an identical repeat names the same transaction and stays queued while the first is open", async () => {
@@ -716,6 +809,33 @@ const attest8 = async (
 
 // ---- Settle fixtures ----
 
+/** The zswap local state a circuit run produced, failing when there is none. */
+const zswapState = (context: CircuitContext<VaultPrivateState>) => {
+  const state = context.callContext.currentZswapLocalState;
+  if (!state) {
+    throw new Error("expected zswap local state on the circuit context");
+  }
+  return state;
+};
+
+/**
+ * The coins a settle minted: the zswap outputs `settled` holds beyond `before`'s, as a
+ * threaded context accumulates the outputs of every circuit run before it.
+ */
+const coinsMinted = (
+  before: CircuitContext<VaultPrivateState>,
+  settled: CircuitContext<VaultPrivateState>,
+): EncodedZswapLocalState["outputs"] =>
+  zswapState(settled).outputs.slice(zswapState(before).outputs.length);
+
+// Where every settle but a deposit naming a recipient mints: the caller's own coin
+// public key, ownPublicKey().
+const TO_CALLER: EncodedRecipient = {
+  is_left: true,
+  left: { bytes: hexToBytes(CPK) },
+  right: { bytes: new Uint8Array(32) },
+};
+
 // The circuit's `Maybe<Either<ZswapCoinPublicKey, ContractAddress>>` recipient
 // argument. Compact's Maybe/Either are plain structs: even a `none` (and the
 // unused Either side of a `some`) carries a fully default-valued payload so
@@ -761,19 +881,19 @@ const depositRequested = async () => {
 // ---- Claim-deposit tests ----
 
 describe("completeDeposit settle", () => {
-  // The mint itself is shielded: the call resolving proves it executed, and
-  // the publicly-observable effect asserted here is the request's consumption.
   it.each([
-    { name: "no recipient: mints to the caller", recipient: CALLER_RECIPIENT },
+    { name: "no recipient: mints to the caller", recipient: CALLER_RECIPIENT, mintedTo: TO_CALLER },
     {
       name: "an explicit wallet recipient: mints to the given coin public key",
       recipient: OTHER_WALLET_RECIPIENT,
+      mintedTo: OTHER_WALLET_RECIPIENT.value,
     },
     {
       name: "an explicit contract recipient: mints to the given contract address",
       recipient: CONTRACT_RECIPIENT,
+      mintedTo: CONTRACT_RECIPIENT.value,
     },
-  ])("$name and consumes the request", async ({ recipient }) => {
+  ])("$name and consumes the request", async ({ recipient, mintedTo }) => {
     const { contract, ctx, requestId } = await depositRequested();
     const attested = await attest(
       contract,
@@ -793,6 +913,12 @@ describe("completeDeposit settle", () => {
     ).context;
 
     expect(next.callContext.currentQueryContext.effects.shieldedMints.size).toBe(1);
+    expect(coinsMinted(attested, next)).toEqual([
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: AMOUNT },
+        recipient: mintedTo,
+      },
+    ]);
     const state = ledgerOf(next);
     expect(state.bidirectionalDepositMap.isEmpty()).toBe(true);
     expect(state.outputRequestBuffer.isEmpty()).toBe(true);
@@ -981,14 +1107,6 @@ describe("completeDeposit settle", () => {
 // Where the vault sends the ERC20 on withdraw.
 const DEST_EVM = bytes(20, 0x77);
 
-// The vault token colour for ERC20 at the simulated contract address, computed
-// exactly as a wallet would: the compiled domain-separator circuit plus the
-// runtime's rawTokenType (the off-chain twin of the in-circuit
-// `tokenType(domainSep, kernel.self())`).
-const VAULT_TOKEN_COLOR = hexToBytes(
-  rawTokenType(pureCircuits.vaultTokenDomainSeparator(ERC20), VAULT_ADDRESS),
-);
-
 // The stdlib's shieldedBurnAddress() recipient: the all-zero coin public key.
 // The burn-output assertions below are the lockstep check for this mirror.
 const BURN_ADDRESS_BYTES = new Uint8Array(32);
@@ -1047,15 +1165,6 @@ const withdraw = async (
   const outKey = flushedRequestKey(ledgerOf(flushed), Action.withdraw, args.inIndex);
   const sent = await contract.circuits.sendWithdraw(flushed, outKey);
   return { context: sent.context, outKey };
-};
-
-/** The zswap local state a circuit run produced, failing when there is none. */
-const zswapState = (context: CircuitContext<VaultPrivateState>) => {
-  const state = context.callContext.currentZswapLocalState;
-  if (!state) {
-    throw new Error("expected zswap local state on the circuit context");
-  }
-  return state;
 };
 
 // ---- Withdraw tests ----
@@ -1343,6 +1452,14 @@ describe("withdraw validation", () => {
     );
   });
 
+  it("rejects an index another action's queued request holds", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
+    await expect(
+      queueWithdraw(contract, queued, { ...VALID_WITHDRAW, inIndex: VALID_DEPOSIT.inIndex }),
+    ).rejects.toThrow(/Index already in use/);
+  });
+
   it("rejects an index the flush freed while its args stay in withdrawArgsMap", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
@@ -1455,8 +1572,10 @@ interface WithdrawVerdictCase {
   signedOutput: Uint8Array;
   /** The output completeWithdraw is passed. */
   presentedOutput: Uint8Array;
-  /** The mints completeWithdraw must request. */
+  /** The mints completeWithdraw must request of the ledger: mint key to amount. */
   mints: [string, bigint][];
+  /** The coins those mints create, each with its nonce, colour, value and recipient. */
+  coins: EncodedZswapLocalState["outputs"];
 }
 
 const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
@@ -1466,6 +1585,7 @@ const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
     signedOutput: OUTPUT_SUCCESS,
     presentedOutput: OUTPUT_SUCCESS,
     mints: [],
+    coins: [],
   },
   {
     name: "a transfer that returned false re-mints the surrendered amount",
@@ -1473,6 +1593,12 @@ const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
     signedOutput: OUTPUT_FALSE,
     presentedOutput: OUTPUT_FALSE,
     mints: [[VAULT_TOKEN_MINT_KEY, AMOUNT]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a reverted transfer (failed) re-mints the surrendered amount",
@@ -1480,6 +1606,12 @@ const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_IGNORED,
     mints: [[VAULT_TOKEN_MINT_KEY, AMOUNT]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a transfer whose nonce another transaction took (unviable) re-mints the surrendered amount",
@@ -1487,13 +1619,19 @@ const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_IGNORED,
     mints: [[VAULT_TOKEN_MINT_KEY, AMOUNT]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ],
   },
 ];
 
 describe("completeWithdraw settle", () => {
   it.each(WITHDRAW_VERDICT_CASES)(
     "$name and consumes the request",
-    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+    async ({ outputKind, signedOutput, presentedOutput, mints, coins }) => {
       const { contract, ctx, requestId } = await withdrawRequested();
       const attestation = respond(
         MPC_RESPONSE_SECRET,
@@ -1512,6 +1650,7 @@ describe("completeWithdraw settle", () => {
       ).context;
 
       expect(shieldedMintsOf(next)).toEqual(mints);
+      expect(coinsMinted(attested, next)).toEqual(coins);
       const state = ledgerOf(next);
       expect(state.bidirectionalWithdrawMap.isEmpty()).toBe(true);
       expect(state.withdrawArgsMap.isEmpty()).toBe(true);
@@ -1659,8 +1798,9 @@ describe("cross-action settle isolation", () => {
 // `Bytes [0x09, 0x5e, 0xa7, 0xb3]` hardcoded in erc20-vault.compact.
 const APPROVE_SELECTOR = new Uint8Array([0x09, 0x5e, 0xa7, 0xb3]);
 
-// The input index every approval fixture queues under, clear of the deposit and
-// withdraw fixtures' indexes.
+// The input index every approval fixture queues under. Each action's fixture has its
+// own index (deposit 1, withdraw 11, approve 21, replace nonce 31, swap 41, supply 51,
+// redeem 61), so any two can share a vault.
 const APPROVE_INDEX = 21n;
 
 // The vault's gas settings initialise() stores, which every approval copies at start.
@@ -2174,7 +2314,7 @@ interface ReplaceNonceCallArgs {
  * of this base with the delta inline.
  */
 const VALID_REPLACE_NONCE: ReplaceNonceCallArgs = {
-  inIndex: 21n,
+  inIndex: 31n,
   evmNonce: 3n,
 };
 
@@ -2657,6 +2797,12 @@ describe("completeReplaceNonce settle", () => {
     ).context;
 
     expect(shieldedMintsOf(settled)).toEqual([[VAULT_TOKEN_MINT_KEY, AMOUNT]]);
+    expect(coinsMinted(withdrawUnviable, settled)).toEqual([
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ]);
     expect(ledgerOf(settled).outputRequestBuffer.isEmpty()).toBe(true);
   });
 
@@ -2753,7 +2899,7 @@ interface SwapCallArgs {
  * of this base with the delta inline (see {@link SWAP_REJECTION_CASES}).
  */
 const VALID_SWAP: SwapCallArgs = {
-  inIndex: 31n,
+  inIndex: 41n,
   swap: {
     erc20AddressIn: ERC20,
     erc20AddressOut: ERC20_OUT,
@@ -3125,8 +3271,10 @@ interface SwapVerdictCase {
   signedOutput: Uint8Array;
   /** The output completeSwap is passed. */
   presentedOutput: Uint8Array;
-  /** The mints completeSwap must request. */
+  /** The mints completeSwap must request of the ledger: mint key to amount. */
   mints: [string, bigint][];
+  /** The coins those mints create, each with its nonce, colour, value and recipient. */
+  coins: EncodedZswapLocalState["outputs"];
 }
 
 const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
@@ -3139,6 +3287,20 @@ const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
       [VAULT_TOKEN_OUT_MINT_KEY, SWAP_AMOUNT_OUT],
       [VAULT_TOKEN_MINT_KEY, SWAP_AMOUNT_IN_MAX - SWAP_AMOUNT_IN_SPENT],
     ],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR_OUT, value: SWAP_AMOUNT_OUT },
+        recipient: TO_CALLER,
+      },
+      {
+        coinInfo: {
+          nonce: CHANGE_NONCE,
+          color: VAULT_TOKEN_COLOR,
+          value: SWAP_AMOUNT_IN_MAX - SWAP_AMOUNT_IN_SPENT,
+        },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "an exact spend mints amountOut and a zero-value change coin",
@@ -3149,6 +3311,16 @@ const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
       [VAULT_TOKEN_OUT_MINT_KEY, SWAP_AMOUNT_OUT],
       [VAULT_TOKEN_MINT_KEY, 0n],
     ],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR_OUT, value: SWAP_AMOUNT_OUT },
+        recipient: TO_CALLER,
+      },
+      {
+        coinInfo: { nonce: CHANGE_NONCE, color: VAULT_TOKEN_COLOR, value: 0n },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a reverted swap (failed) re-mints the surrendered amountInMaximum",
@@ -3156,6 +3328,12 @@ const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_SWAP_IGNORED,
     mints: [[VAULT_TOKEN_MINT_KEY, SWAP_AMOUNT_IN_MAX]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: SWAP_AMOUNT_IN_MAX },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a swap whose nonce another transaction took (unviable) re-mints the surrendered amountInMaximum",
@@ -3163,6 +3341,12 @@ const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_SWAP_IGNORED,
     mints: [[VAULT_TOKEN_MINT_KEY, SWAP_AMOUNT_IN_MAX]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: SWAP_AMOUNT_IN_MAX },
+        recipient: TO_CALLER,
+      },
+    ],
   },
 ];
 
@@ -3181,7 +3365,7 @@ describe("swapAmountIn", () => {
 describe("completeSwap settle", () => {
   it.each(SWAP_VERDICT_CASES)(
     "$name and consumes the request",
-    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+    async ({ outputKind, signedOutput, presentedOutput, mints, coins }) => {
       const { contract, ctx, requestId } = await swapRequested();
       const attestation = respond(
         MPC_RESPONSE_SECRET,
@@ -3207,6 +3391,7 @@ describe("completeSwap settle", () => {
 
       // The effects map keys the mints by token, not in the order the circuit minted them.
       expect(new Map(shieldedMintsOf(next))).toEqual(new Map(mints));
+      expect(coinsMinted(attested, next)).toEqual(coins);
       const state = ledgerOf(next);
       expect(state.bidirectionalSwapMap.isEmpty()).toBe(true);
       expect(state.swapArgsMap.isEmpty()).toBe(true);
@@ -3288,6 +3473,12 @@ describe("completeSwap settle", () => {
       )
     ).context;
     expect(shieldedMintsOf(next)).toEqual([[VAULT_TOKEN_MINT_KEY, SWAP_AMOUNT_IN_MAX]]);
+    expect(coinsMinted(attested, next)).toEqual([
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: SWAP_AMOUNT_IN_MAX },
+        recipient: TO_CALLER,
+      },
+    ]);
   });
 
   it.each([
@@ -3487,7 +3678,7 @@ interface SupplyCallArgs {
  * of this base with the delta inline (see {@link SUPPLY_REJECTION_CASES}).
  */
 const VALID_SUPPLY: SupplyCallArgs = {
-  inIndex: 31n,
+  inIndex: 51n,
   supply: { amount: AMOUNT },
   coin: vaultCoin(AMOUNT, STATA_UNDERLYING_COLOR),
 };
@@ -3889,8 +4080,10 @@ interface SupplyVerdictCase {
   signedOutput: Uint8Array;
   /** The output completeSupply is passed. */
   presentedOutput: Uint8Array;
-  /** The mints completeSupply must request. */
+  /** The mints completeSupply must request of the ledger: mint key to amount. */
   mints: [string, bigint][];
+  /** The coins those mints create, each with its nonce, colour, value and recipient. */
+  coins: EncodedZswapLocalState["outputs"];
 }
 
 const SUPPLY_VERDICT_CASES: SupplyVerdictCase[] = [
@@ -3900,6 +4093,12 @@ const SUPPLY_VERDICT_CASES: SupplyVerdictCase[] = [
     signedOutput: OUTPUT_SUPPLY,
     presentedOutput: OUTPUT_SUPPLY,
     mints: [[STATA_TOKEN_MINT_KEY, SUPPLY_SHARES]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_TOKEN_COLOR, value: SUPPLY_SHARES },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a reverted deposit (failed) re-mints the surrendered underlying",
@@ -3907,6 +4106,12 @@ const SUPPLY_VERDICT_CASES: SupplyVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_SUPPLY_IGNORED,
     mints: [[STATA_UNDERLYING_MINT_KEY, AMOUNT]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_UNDERLYING_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a deposit whose nonce another transaction took (unviable) re-mints the surrendered underlying",
@@ -3914,6 +4119,12 @@ const SUPPLY_VERDICT_CASES: SupplyVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_SUPPLY_IGNORED,
     mints: [[STATA_UNDERLYING_MINT_KEY, AMOUNT]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_UNDERLYING_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ],
   },
 ];
 
@@ -3932,7 +4143,7 @@ describe("supplyShares", () => {
 describe("completeSupply settle", () => {
   it.each(SUPPLY_VERDICT_CASES)(
     "$name and consumes the request",
-    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+    async ({ outputKind, signedOutput, presentedOutput, mints, coins }) => {
       const { contract, ctx, requestId } = await supplyRequested();
       const attestation = respond(
         MPC_RESPONSE_SECRET,
@@ -3951,6 +4162,7 @@ describe("completeSupply settle", () => {
       ).context;
 
       expect(shieldedMintsOf(next)).toEqual(mints);
+      expect(coinsMinted(attested, next)).toEqual(coins);
       const state = ledgerOf(next);
       expect(state.bidirectionalSupplyMap.isEmpty()).toBe(true);
       expect(state.supplyArgsMap.isEmpty()).toBe(true);
@@ -4128,7 +4340,7 @@ interface RedeemCallArgs {
  * of this base with the delta inline (see {@link REDEEM_REJECTION_CASES}).
  */
 const VALID_REDEEM: RedeemCallArgs = {
-  inIndex: 41n,
+  inIndex: 61n,
   redeem: { shares: REDEEM_SHARES },
   coin: vaultCoin(REDEEM_SHARES, STATA_TOKEN_COLOR),
 };
@@ -4459,8 +4671,10 @@ interface RedeemVerdictCase {
   signedOutput: Uint8Array;
   /** The output completeRedeem is passed. */
   presentedOutput: Uint8Array;
-  /** The mints completeRedeem must request. */
+  /** The mints completeRedeem must request of the ledger: mint key to amount. */
   mints: [string, bigint][];
+  /** The coins those mints create, each with its nonce, colour, value and recipient. */
+  coins: EncodedZswapLocalState["outputs"];
 }
 
 const REDEEM_VERDICT_CASES: RedeemVerdictCase[] = [
@@ -4470,6 +4684,12 @@ const REDEEM_VERDICT_CASES: RedeemVerdictCase[] = [
     signedOutput: OUTPUT_REDEEM,
     presentedOutput: OUTPUT_REDEEM,
     mints: [[STATA_UNDERLYING_MINT_KEY, REDEEM_ASSETS]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_UNDERLYING_COLOR, value: REDEEM_ASSETS },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a reverted redeem (failed) re-mints the surrendered shares",
@@ -4477,6 +4697,12 @@ const REDEEM_VERDICT_CASES: RedeemVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_REDEEM_IGNORED,
     mints: [[STATA_TOKEN_MINT_KEY, REDEEM_SHARES]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_TOKEN_COLOR, value: REDEEM_SHARES },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a redeem whose nonce another transaction took (unviable) re-mints the surrendered shares",
@@ -4484,6 +4710,12 @@ const REDEEM_VERDICT_CASES: RedeemVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_REDEEM_IGNORED,
     mints: [[STATA_TOKEN_MINT_KEY, REDEEM_SHARES]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_TOKEN_COLOR, value: REDEEM_SHARES },
+        recipient: TO_CALLER,
+      },
+    ],
   },
 ];
 
@@ -4502,7 +4734,7 @@ describe("redeemAssets", () => {
 describe("completeRedeem settle", () => {
   it.each(REDEEM_VERDICT_CASES)(
     "$name and consumes the request",
-    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+    async ({ outputKind, signedOutput, presentedOutput, mints, coins }) => {
       const { contract, ctx, requestId } = await redeemRequested();
       const attestation = respond(
         MPC_RESPONSE_SECRET,
@@ -4521,6 +4753,7 @@ describe("completeRedeem settle", () => {
       ).context;
 
       expect(shieldedMintsOf(next)).toEqual(mints);
+      expect(coinsMinted(attested, next)).toEqual(coins);
       const state = ledgerOf(next);
       expect(state.bidirectionalRedeemMap.isEmpty()).toBe(true);
       expect(state.redeemArgsMap.isEmpty()).toBe(true);
@@ -4702,7 +4935,696 @@ const replay = (
   }
 };
 
-describe("throughput: requests never pin shared state, only the flush does", () => {
+// A read the replayed transcript expected differs from what the state holds: how the
+// ledger rejects a transaction that lost a race.
+const READ_CONFLICT = /^REJECTED: mismatch between expected /;
+const APPLIED = /^applied$/;
+
+/** The request id the send of the request under `outKey` recorded in evictionMap. */
+const sentRequestId = (ctx: CircuitContext<VaultPrivateState>, outKey: Uint8Array): Uint8Array => {
+  const outKeyHex = bytesToHex(outKey);
+  for (const [requestId, key] of ledgerOf(ctx).evictionMap) {
+    if (bytesToHex(key) === outKeyHex) {
+      return requestId;
+    }
+  }
+  throw new Error(`no send recorded the request under ${outKeyHex}`);
+};
+
+// ---- Contention fixtures ----
+
+// The busy vault's traffic, every item of it waiting for a flush: a deposit sent and
+// attested at BUSY_HEIGHT, a deposit queued and a withdrawal queued. Their indexes and
+// nonces are clear of every action fixture's.
+const BUSY_ATTESTED_DEPOSIT: DepositCallArgs = { ...VALID_DEPOSIT, inIndex: 101n, evmNonce: 7n };
+const BUSY_QUEUED_DEPOSIT: DepositCallArgs = { ...VALID_DEPOSIT, inIndex: 102n, evmNonce: 8n };
+const BUSY_QUEUED_WITHDRAW: WithdrawCallArgs = { ...VALID_WITHDRAW, inIndex: 103n };
+const BUSY_HEIGHT = 150n;
+
+/**
+ * Deploy + initialise, then queue the busy vault's traffic: the shared state every
+ * contention test builds on. Returns the queued attestation's request id alongside
+ * the context.
+ */
+const busyVault = async () => {
+  const { contract, ctx } = await deployInitialised();
+  const { context: sent, outKey } = await deposit(contract, ctx, BUSY_ATTESTED_DEPOSIT);
+  const attestedId = sentRequestId(sent, outKey);
+  const queuedAttestation = (
+    await contract.circuits.queueAttestation1(
+      sent,
+      respond(MPC_RESPONSE_SECRET, attestedId, OutputKind.executed, OUTPUT_SUCCESS, BUSY_HEIGHT),
+      OUTPUT_SUCCESS,
+    )
+  ).context;
+  const queuedDeposit = (await queueDeposit(contract, queuedAttestation, BUSY_QUEUED_DEPOSIT))
+    .context;
+  const busy = (await queueWithdraw(contract, queuedDeposit, BUSY_QUEUED_WITHDRAW)).context;
+  return { contract, ctx: busy, attestedId };
+};
+
+/**
+ * The flush that moves all of the busy vault's traffic, so it raises globalLastSeen,
+ * advances globalEvmNonce and moves a caller-signed request.
+ */
+const busyFlushSlots = (attestedId: Uint8Array): FlushSlot[] =>
+  flushSlots([BUSY_QUEUED_DEPOSIT.inIndex, BUSY_QUEUED_WITHDRAW.inIndex], [attestedId]);
+
+/** A user circuit, run on the busy vault once the request it acts on is arranged. */
+interface UserCircuitCase {
+  /** The user circuit the row runs, and the request it acts on. */
+  name: string;
+  /**
+   * Arrange the row's own request on `ctx`, every flush carrying only that request's
+   * items, then run the user circuit. Returns the state the circuit was built on and
+   * its run.
+   */
+  run: (
+    contract: Contract<VaultPrivateState>,
+    ctx: CircuitContext<VaultPrivateState>,
+  ) => Promise<{
+    shared: CircuitContext<VaultPrivateState>;
+    user: CircuitResults<VaultPrivateState, []>;
+  }>;
+}
+
+const USER_CIRCUIT_CASES: UserCircuitCase[] = [
+  {
+    name: "startDeposit",
+    run: async (contract, ctx) => ({
+      shared: ctx,
+      user: await queueDeposit(contract, ctx, VALID_DEPOSIT),
+    }),
+  },
+  {
+    name: "startWithdraw",
+    run: async (contract, ctx) => ({
+      shared: ctx,
+      user: await queueWithdraw(contract, ctx, VALID_WITHDRAW),
+    }),
+  },
+  {
+    name: "startApproveRouter",
+    run: async (contract, ctx) => ({
+      shared: ctx,
+      user: await ROUTER_APPROVAL.start(contract, ctx),
+    }),
+  },
+  {
+    name: "startApproveStata",
+    run: async (contract, ctx) => ({
+      shared: ctx,
+      user: await STATA_APPROVAL.start(contract, ctx),
+    }),
+  },
+  {
+    name: "startReplaceNonce",
+    run: async (contract, ctx) => ({
+      shared: ctx,
+      user: await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE),
+    }),
+  },
+  {
+    name: "startSwap",
+    run: async (contract, ctx) => ({
+      shared: ctx,
+      user: await queueSwap(contract, ctx, VALID_SWAP),
+    }),
+  },
+  {
+    name: "startSupply",
+    run: async (contract, ctx) => ({
+      shared: ctx,
+      user: await queueSupply(contract, ctx, VALID_SUPPLY),
+    }),
+  },
+  {
+    name: "startRedeem",
+    run: async (contract, ctx) => ({
+      shared: ctx,
+      user: await queueRedeem(contract, ctx, VALID_REDEEM),
+    }),
+  },
+  {
+    name: "sendDeposit",
+    run: async (contract, ctx) => {
+      const queued = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
+      const outKey = queuedRequestKey(ledgerOf(queued), VALID_DEPOSIT.inIndex);
+      const shared = await flush(contract, queued, [VALID_DEPOSIT.inIndex], []);
+      return { shared, user: await contract.circuits.sendDeposit(shared, outKey) };
+    },
+  },
+  {
+    name: "sendWithdraw",
+    run: async (contract, ctx) => {
+      const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+      const shared = await flush(contract, queued, [VALID_WITHDRAW.inIndex], []);
+      const outKey = flushedRequestKey(ledgerOf(shared), Action.withdraw, VALID_WITHDRAW.inIndex);
+      return { shared, user: await contract.circuits.sendWithdraw(shared, outKey) };
+    },
+  },
+  {
+    name: "sendApprove",
+    run: async (contract, ctx) => {
+      const queued = (await ROUTER_APPROVAL.start(contract, ctx)).context;
+      const shared = await flush(contract, queued, [APPROVE_INDEX], []);
+      const outKey = flushedRequestKey(ledgerOf(shared), Action.approve, APPROVE_INDEX);
+      return { shared, user: await contract.circuits.sendApprove(shared, outKey) };
+    },
+  },
+  {
+    name: "sendReplaceNonce",
+    run: async (contract, ctx) => {
+      const queued = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
+      const outKey = queuedRequestKey(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
+      const shared = await flush(contract, queued, [VALID_REPLACE_NONCE.inIndex], []);
+      return { shared, user: await contract.circuits.sendReplaceNonce(shared, outKey) };
+    },
+  },
+  {
+    name: "sendSwap",
+    run: async (contract, ctx) => {
+      const queued = (await queueSwap(contract, ctx, VALID_SWAP)).context;
+      const shared = await flush(contract, queued, [VALID_SWAP.inIndex], []);
+      const outKey = flushedRequestKey(ledgerOf(shared), Action.swap, VALID_SWAP.inIndex);
+      return { shared, user: await contract.circuits.sendSwap(shared, outKey) };
+    },
+  },
+  {
+    name: "sendSupply",
+    run: async (contract, ctx) => {
+      const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+      const shared = await flush(contract, queued, [VALID_SUPPLY.inIndex], []);
+      const outKey = flushedRequestKey(ledgerOf(shared), Action.supply, VALID_SUPPLY.inIndex);
+      return { shared, user: await contract.circuits.sendSupply(shared, outKey) };
+    },
+  },
+  {
+    name: "sendRedeem",
+    run: async (contract, ctx) => {
+      const queued = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
+      const shared = await flush(contract, queued, [VALID_REDEEM.inIndex], []);
+      const outKey = flushedRequestKey(ledgerOf(shared), Action.redeem, VALID_REDEEM.inIndex);
+      return { shared, user: await contract.circuits.sendRedeem(shared, outKey) };
+    },
+  },
+  {
+    name: "queueAttestation1 for a deposit",
+    run: async (contract, ctx) => {
+      const { context: shared, outKey } = await deposit(contract, ctx, VALID_DEPOSIT);
+      const requestId = sentRequestId(shared, outKey);
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        OutputKind.executed,
+        OUTPUT_SUCCESS,
+        ATTESTED_HEIGHT,
+      );
+      return {
+        shared,
+        user: await contract.circuits.queueAttestation1(shared, attestation, OUTPUT_SUCCESS),
+      };
+    },
+  },
+  {
+    name: "queueAttestation1 for a withdrawal",
+    run: async (contract, ctx) => {
+      const { context: shared, outKey } = await withdraw(contract, ctx, VALID_WITHDRAW);
+      const requestId = sentRequestId(shared, outKey);
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        OutputKind.executed,
+        OUTPUT_SUCCESS,
+        ATTESTED_HEIGHT,
+      );
+      return {
+        shared,
+        user: await contract.circuits.queueAttestation1(shared, attestation, OUTPUT_SUCCESS),
+      };
+    },
+  },
+  {
+    name: "queueAttestation1 for an approval",
+    run: async (contract, ctx) => {
+      const { context: shared, outKey } = await approve(contract, ctx, ROUTER_APPROVAL);
+      const requestId = sentRequestId(shared, outKey);
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        OutputKind.executed,
+        OUTPUT_SUCCESS,
+        ATTESTED_HEIGHT,
+      );
+      return {
+        shared,
+        user: await contract.circuits.queueAttestation1(shared, attestation, OUTPUT_SUCCESS),
+      };
+    },
+  },
+  {
+    name: "queueAttestation1 for a nonce replacement",
+    run: async (contract, ctx) => {
+      const { context: shared, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+      const requestId = sentRequestId(shared, outKey);
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        OutputKind.executed,
+        OUTPUT_SUCCESS,
+        ATTESTED_HEIGHT,
+      );
+      return {
+        shared,
+        user: await contract.circuits.queueAttestation1(shared, attestation, OUTPUT_SUCCESS),
+      };
+    },
+  },
+  {
+    name: "queueAttestation8 for a swap",
+    run: async (contract, ctx) => {
+      const { context: shared, outKey } = await swap(contract, ctx, VALID_SWAP);
+      const requestId = sentRequestId(shared, outKey);
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        OutputKind.executed,
+        OUTPUT_SWAP,
+        ATTESTED_HEIGHT,
+      );
+      return {
+        shared,
+        user: await contract.circuits.queueAttestation8(shared, attestation, OUTPUT_SWAP),
+      };
+    },
+  },
+  {
+    name: "queueAttestation8 for a supply",
+    run: async (contract, ctx) => {
+      const { context: shared, outKey } = await supply(contract, ctx, VALID_SUPPLY);
+      const requestId = sentRequestId(shared, outKey);
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        OutputKind.executed,
+        OUTPUT_SUPPLY,
+        ATTESTED_HEIGHT,
+      );
+      return {
+        shared,
+        user: await contract.circuits.queueAttestation8(shared, attestation, OUTPUT_SUPPLY),
+      };
+    },
+  },
+  {
+    name: "queueAttestation8 for a redeem",
+    run: async (contract, ctx) => {
+      const { context: shared, outKey } = await redeem(contract, ctx, VALID_REDEEM);
+      const requestId = sentRequestId(shared, outKey);
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        OutputKind.executed,
+        OUTPUT_REDEEM,
+        ATTESTED_HEIGHT,
+      );
+      return {
+        shared,
+        user: await contract.circuits.queueAttestation8(shared, attestation, OUTPUT_REDEEM),
+      };
+    },
+  },
+  {
+    name: "queueAttestation0 for a failed withdrawal",
+    run: async (contract, ctx) => {
+      const { context: shared, outKey } = await withdraw(contract, ctx, VALID_WITHDRAW);
+      const requestId = sentRequestId(shared, outKey);
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        OutputKind.failed,
+        OUTPUT_EMPTY,
+        ATTESTED_HEIGHT,
+      );
+      return {
+        shared,
+        user: await contract.circuits.queueAttestation0(shared, attestation, OUTPUT_EMPTY),
+      };
+    },
+  },
+  {
+    name: "completeDeposit, minting the deposit",
+    run: async (contract, ctx) => {
+      const { context: sent, outKey } = await deposit(contract, ctx, VALID_DEPOSIT);
+      const requestId = sentRequestId(sent, outKey);
+      const shared = await attest(
+        contract,
+        sent,
+        respond(
+          MPC_RESPONSE_SECRET,
+          requestId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      );
+      return {
+        shared,
+        user: await contract.circuits.completeDeposit(
+          shared,
+          requestId,
+          OUTPUT_SUCCESS,
+          MINT_NONCE,
+          CALLER_RECIPIENT,
+        ),
+      };
+    },
+  },
+  {
+    name: "completeWithdraw, re-minting a transfer that returned false",
+    run: async (contract, ctx) => {
+      const { context: sent, outKey } = await withdraw(contract, ctx, VALID_WITHDRAW);
+      const requestId = sentRequestId(sent, outKey);
+      const shared = await attest(
+        contract,
+        sent,
+        respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_FALSE, ATTESTED_HEIGHT),
+        OUTPUT_FALSE,
+      );
+      return {
+        shared,
+        user: await contract.circuits.completeWithdraw(shared, requestId, OUTPUT_FALSE, MINT_NONCE),
+      };
+    },
+  },
+  {
+    name: "completeApprove",
+    run: async (contract, ctx) => {
+      const { context: sent, outKey } = await approve(contract, ctx, ROUTER_APPROVAL);
+      const requestId = sentRequestId(sent, outKey);
+      const shared = await attest(
+        contract,
+        sent,
+        respond(
+          MPC_RESPONSE_SECRET,
+          requestId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      );
+      return {
+        shared,
+        user: await contract.circuits.completeApprove(shared, requestId, OUTPUT_SUCCESS),
+      };
+    },
+  },
+  {
+    name: "completeReplaceNonce",
+    run: async (contract, ctx) => {
+      const { context: sent, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+      const requestId = sentRequestId(sent, outKey);
+      const shared = await attest(
+        contract,
+        sent,
+        respond(
+          MPC_RESPONSE_SECRET,
+          requestId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      );
+      return {
+        shared,
+        user: await contract.circuits.completeReplaceNonce(shared, requestId, OUTPUT_SUCCESS),
+      };
+    },
+  },
+  {
+    name: "completeSwap, minting the bought token and the change",
+    run: async (contract, ctx) => {
+      const { context: sent, outKey } = await swap(contract, ctx, VALID_SWAP);
+      const requestId = sentRequestId(sent, outKey);
+      const shared = await attest8(
+        contract,
+        sent,
+        respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SWAP, ATTESTED_HEIGHT),
+        OUTPUT_SWAP,
+      );
+      return {
+        shared,
+        user: await contract.circuits.completeSwap(
+          shared,
+          requestId,
+          OUTPUT_SWAP,
+          MINT_NONCE,
+          CHANGE_NONCE,
+        ),
+      };
+    },
+  },
+  {
+    name: "completeSupply, minting the shares",
+    run: async (contract, ctx) => {
+      const { context: sent, outKey } = await supply(contract, ctx, VALID_SUPPLY);
+      const requestId = sentRequestId(sent, outKey);
+      const shared = await attest8(
+        contract,
+        sent,
+        respond(
+          MPC_RESPONSE_SECRET,
+          requestId,
+          OutputKind.executed,
+          OUTPUT_SUPPLY,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUPPLY,
+      );
+      return {
+        shared,
+        user: await contract.circuits.completeSupply(shared, requestId, OUTPUT_SUPPLY, MINT_NONCE),
+      };
+    },
+  },
+  {
+    name: "completeRedeem, minting the assets",
+    run: async (contract, ctx) => {
+      const { context: sent, outKey } = await redeem(contract, ctx, VALID_REDEEM);
+      const requestId = sentRequestId(sent, outKey);
+      const shared = await attest8(
+        contract,
+        sent,
+        respond(
+          MPC_RESPONSE_SECRET,
+          requestId,
+          OutputKind.executed,
+          OUTPUT_REDEEM,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_REDEEM,
+      );
+      return {
+        shared,
+        user: await contract.circuits.completeRedeem(shared, requestId, OUTPUT_REDEEM, MINT_NONCE),
+      };
+    },
+  },
+];
+
+/** Two flushes built on the busy vault: the first lands, then the second is replayed on top. */
+interface FlushPairCase {
+  /** What the pair shows. */
+  name: string;
+  /** The slots of the flush that lands first. */
+  first: (attestedId: Uint8Array) => FlushSlot[];
+  /** The slots of the flush replayed after it. */
+  second: (attestedId: Uint8Array) => FlushSlot[];
+  /** What the replay of the second flush returns. */
+  outcome: RegExp;
+}
+
+const FLUSH_PAIR_CASES: FlushPairCase[] = [
+  {
+    name: "two flushes carrying the same caller-signed request conflict",
+    first: () => flushSlots([BUSY_QUEUED_DEPOSIT.inIndex], []),
+    second: () => flushSlots([BUSY_QUEUED_DEPOSIT.inIndex], []),
+    outcome: READ_CONFLICT,
+  },
+  {
+    name: "two flushes carrying the same vault-signed request conflict",
+    first: () => flushSlots([BUSY_QUEUED_WITHDRAW.inIndex], []),
+    second: () => flushSlots([BUSY_QUEUED_WITHDRAW.inIndex], []),
+    outcome: READ_CONFLICT,
+  },
+  {
+    name: "two flushes carrying the same attestation conflict",
+    first: (attestedId) => flushSlots([], [attestedId]),
+    second: (attestedId) => flushSlots([], [attestedId]),
+    outcome: READ_CONFLICT,
+  },
+  {
+    name: "a request-only flush conflicts after a height-raising flush",
+    first: (attestedId) => flushSlots([], [attestedId]),
+    second: () => flushSlots([BUSY_QUEUED_DEPOSIT.inIndex], []),
+    outcome: READ_CONFLICT,
+  },
+  {
+    name: "an attestation-only flush applies after a request-only flush",
+    first: () => flushSlots([BUSY_QUEUED_DEPOSIT.inIndex, BUSY_QUEUED_WITHDRAW.inIndex], []),
+    second: (attestedId) => flushSlots([], [attestedId]),
+    outcome: APPLIED,
+  },
+];
+
+/** A request of one action, queued on the busy vault beside its queued withdrawal. */
+interface VaultNonceCase {
+  /** What the row shows. */
+  name: string;
+  /** Start the row's request. */
+  queue: (
+    contract: Contract<VaultPrivateState>,
+    ctx: CircuitContext<VaultPrivateState>,
+  ) => Promise<CircuitResults<VaultPrivateState, []>>;
+  /** The index the request is queued under. */
+  inIndex: bigint;
+  /** What the replay of the flush moving it returns, after a flush moved the withdrawal. */
+  outcome: RegExp;
+}
+
+const VAULT_NONCE_CASES: VaultNonceCase[] = [
+  {
+    name: "a deposit's flush applies: a caller-signed request never reads the vault nonce",
+    queue: (contract, ctx) => queueDeposit(contract, ctx, VALID_DEPOSIT),
+    inIndex: VALID_DEPOSIT.inIndex,
+    outcome: APPLIED,
+  },
+  {
+    name: "a nonce replacement's flush applies: it names its nonce itself",
+    queue: (contract, ctx) => queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE),
+    inIndex: VALID_REPLACE_NONCE.inIndex,
+    outcome: APPLIED,
+  },
+  {
+    name: "a withdrawal's flush conflicts on the vault nonce",
+    queue: (contract, ctx) => queueWithdraw(contract, ctx, VALID_WITHDRAW),
+    inIndex: VALID_WITHDRAW.inIndex,
+    outcome: READ_CONFLICT,
+  },
+  {
+    name: "an approval's flush conflicts on the vault nonce",
+    queue: (contract, ctx) => ROUTER_APPROVAL.start(contract, ctx),
+    inIndex: APPROVE_INDEX,
+    outcome: READ_CONFLICT,
+  },
+  {
+    name: "a swap's flush conflicts on the vault nonce",
+    queue: (contract, ctx) => queueSwap(contract, ctx, VALID_SWAP),
+    inIndex: VALID_SWAP.inIndex,
+    outcome: READ_CONFLICT,
+  },
+  {
+    name: "a supply's flush conflicts on the vault nonce",
+    queue: (contract, ctx) => queueSupply(contract, ctx, VALID_SUPPLY),
+    inIndex: VALID_SUPPLY.inIndex,
+    outcome: READ_CONFLICT,
+  },
+  {
+    name: "a redeem's flush conflicts on the vault nonce",
+    queue: (contract, ctx) => queueRedeem(contract, ctx, VALID_REDEEM),
+    inIndex: VALID_REDEEM.inIndex,
+    outcome: READ_CONFLICT,
+  },
+];
+
+/** Two starts of one action under different indexes, built on the same state. */
+interface ConcurrentStartsCase {
+  /** The start circuit and who calls it twice. */
+  name: string;
+  /** The first start. */
+  first: (
+    contract: Contract<VaultPrivateState>,
+    ctx: CircuitContext<VaultPrivateState>,
+  ) => Promise<CircuitResults<VaultPrivateState, []>>;
+  /** The second start, under another index. */
+  second: (
+    contract: Contract<VaultPrivateState>,
+    ctx: CircuitContext<VaultPrivateState>,
+  ) => Promise<CircuitResults<VaultPrivateState, []>>;
+}
+
+const CONCURRENT_STARTS_CASES: ConcurrentStartsCase[] = [
+  {
+    name: "startDeposit, by the depositor and a stranger",
+    first: (contract, ctx) => queueDeposit(contract, ctx, VALID_DEPOSIT),
+    second: async (contract, ctx) =>
+      queueDeposit(contract, await strangerContext("startDeposit", ctx), {
+        ...VALID_DEPOSIT,
+        inIndex: VALID_DEPOSIT.inIndex + 1n,
+      }),
+  },
+  {
+    name: "startWithdraw, by the withdrawer and a stranger",
+    first: (contract, ctx) => queueWithdraw(contract, ctx, VALID_WITHDRAW),
+    second: async (contract, ctx) =>
+      queueWithdraw(contract, await strangerContext("startWithdraw", ctx), {
+        ...VALID_WITHDRAW,
+        inIndex: VALID_WITHDRAW.inIndex + 1n,
+      }),
+  },
+  {
+    name: "startApproveRouter, twice by the deployer",
+    first: (contract, ctx) => contract.circuits.startApproveRouter(ctx, APPROVE_INDEX, ERC20),
+    second: (contract, ctx) =>
+      contract.circuits.startApproveRouter(ctx, APPROVE_INDEX + 1n, ERC20_OUT),
+  },
+  {
+    name: "startApproveStata, twice by the deployer",
+    first: (contract, ctx) => contract.circuits.startApproveStata(ctx, APPROVE_INDEX),
+    second: (contract, ctx) => contract.circuits.startApproveStata(ctx, APPROVE_INDEX + 1n),
+  },
+  {
+    name: "startReplaceNonce, twice by the deployer",
+    first: (contract, ctx) => queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE),
+    second: (contract, ctx) =>
+      queueReplaceNonce(contract, ctx, {
+        inIndex: VALID_REPLACE_NONCE.inIndex + 1n,
+        evmNonce: VALID_REPLACE_NONCE.evmNonce + 1n,
+      }),
+  },
+  {
+    name: "startSwap, by the swapper and a stranger",
+    first: (contract, ctx) => queueSwap(contract, ctx, VALID_SWAP),
+    second: async (contract, ctx) =>
+      queueSwap(contract, await strangerContext("startSwap", ctx), {
+        ...VALID_SWAP,
+        inIndex: VALID_SWAP.inIndex + 1n,
+      }),
+  },
+  {
+    name: "startSupply, by the supplier and a stranger",
+    first: (contract, ctx) => queueSupply(contract, ctx, VALID_SUPPLY),
+    second: async (contract, ctx) =>
+      queueSupply(contract, await strangerContext("startSupply", ctx), {
+        ...VALID_SUPPLY,
+        inIndex: VALID_SUPPLY.inIndex + 1n,
+      }),
+  },
+  {
+    name: "startRedeem, by the redeemer and a stranger",
+    first: (contract, ctx) => queueRedeem(contract, ctx, VALID_REDEEM),
+    second: async (contract, ctx) =>
+      queueRedeem(contract, await strangerContext("startRedeem", ctx), {
+        ...VALID_REDEEM,
+        inIndex: VALID_REDEEM.inIndex + 1n,
+      }),
+  },
+];
+
+describe("contention: user circuits never conflict, only flushes do", () => {
   it("CONTROL: a queued deposit applies against the state it was built on", async () => {
     const { contract, ctx } = await deployInitialised();
     const builtOn = stateOf(ctx);
@@ -4710,16 +5632,168 @@ describe("throughput: requests never pin shared state, only the flush does", () 
     expect(replay(builtOn, run)).toBe("applied");
   });
 
-  it("two concurrent startDeposits from different callers both apply", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const alice = await queueDeposit(contract, ctx, VALID_DEPOSIT);
-    const stateAfterAlice = alice.context.callContext.currentQueryContext.state;
-    const bobCtx = await strangerContext("startDeposit", ctx);
-    const bob = await queueDeposit(contract, bobCtx, { ...VALID_DEPOSIT, inIndex: 2n });
-    expect(replay(stateAfterAlice, bob, true)).toBe("applied");
+  it.each(USER_CIRCUIT_CASES)(
+    "$name and a concurrent flush both apply, in either order",
+    async ({ run }) => {
+      const { contract, ctx, attestedId } = await busyVault();
+      const { shared, user } = await run(contract, ctx);
+      const concurrentFlush = await contract.circuits.flushQueue(
+        shared,
+        busyFlushSlots(attestedId),
+      );
+      expect(ledgerOf(concurrentFlush.context).globalLastSeen).toBe(BUSY_HEIGHT);
+      expect(ledgerOf(concurrentFlush.context).globalEvmNonce).toBe(
+        ledgerOf(shared).globalEvmNonce + 1n,
+      );
+
+      expect(replay(stateOf(concurrentFlush.context), user, true)).toBe("applied");
+      expect(replay(stateOf(user.context), concurrentFlush, true)).toBe("applied");
+    },
+  );
+
+  it.each(CONCURRENT_STARTS_CASES)(
+    "$name: the two starts both apply, in either order",
+    async ({ first: firstStart, second: secondStart }) => {
+      const { contract, ctx } = await deployInitialised();
+      const firstRun = await firstStart(contract, ctx);
+      const secondRun = await secondStart(contract, ctx);
+      expect(replay(stateOf(firstRun.context), secondRun, true)).toBe("applied");
+      expect(replay(stateOf(secondRun.context), firstRun, true)).toBe("applied");
+    },
+  );
+
+  it.each(FLUSH_PAIR_CASES)(
+    "$name",
+    async ({ first: firstSlots, second: secondSlots, outcome }) => {
+      const { contract, ctx, attestedId } = await busyVault();
+      const firstFlush = await contract.circuits.flushQueue(ctx, firstSlots(attestedId));
+      const secondFlush = await contract.circuits.flushQueue(ctx, secondSlots(attestedId));
+      expect(replay(stateOf(ctx), secondFlush)).toBe("applied");
+      expect(replay(stateOf(firstFlush.context), secondFlush, true)).toMatch(outcome);
+    },
+  );
+
+  it.each(VAULT_NONCE_CASES)(
+    "after a flush moved a withdrawal, $name",
+    async ({ queue, inIndex, outcome }) => {
+      const { contract, ctx } = await busyVault();
+      const shared = (await queue(contract, ctx)).context;
+      const nonceFlush = await contract.circuits.flushQueue(
+        shared,
+        flushSlots([BUSY_QUEUED_WITHDRAW.inIndex], []),
+      );
+      const actionFlush = await contract.circuits.flushQueue(shared, flushSlots([inIndex], []));
+      expect(ledgerOf(nonceFlush.context).globalEvmNonce).toBe(
+        ledgerOf(shared).globalEvmNonce + 1n,
+      );
+      expect(replay(stateOf(shared), actionFlush)).toBe("applied");
+      expect(replay(stateOf(nonceFlush.context), actionFlush, true)).toMatch(outcome);
+    },
+  );
+
+  it("a flush that skipped a twin conflicts after the open request completes, and the complete applies", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const attested = await attest(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    const twin = { ...VALID_DEPOSIT, inIndex: VALID_DEPOSIT.inIndex + 1n };
+    const shared = (await queueDeposit(contract, attested, twin)).context;
+    const twinSkippingFlush = await contract.circuits.flushQueue(
+      shared,
+      flushSlots([twin.inIndex], []),
+    );
+    const complete = await contract.circuits.completeDeposit(
+      shared,
+      requestId,
+      OUTPUT_SUCCESS,
+      MINT_NONCE,
+      CALLER_RECIPIENT,
+    );
+    expect(ledgerOf(twinSkippingFlush.context).inputRequestBuffer.member(twin.inIndex)).toBe(true);
+
+    expect(replay(stateOf(shared), twinSkippingFlush)).toBe("applied");
+    expect(replay(stateOf(complete.context), twinSkippingFlush, true)).toMatch(READ_CONFLICT);
+    expect(replay(stateOf(twinSkippingFlush.context), complete, true)).toBe("applied");
+  });
+});
+
+describe("flushQueue", () => {
+  it.each([
+    {
+      name: "a request slot naming an index nothing is queued under",
+      slots: flushSlots([999n], []),
+    },
+    {
+      name: "an attestation slot naming a request id with no queued attestation",
+      slots: flushSlots([], [bytes(32, 0x5a)]),
+    },
+  ])("$name leaves the ledger as it was", async ({ slots }) => {
+    const { contract, ctx } = await busyVault();
+    const flushed = (await contract.circuits.flushQueue(ctx, slots)).context;
+    expect(flushed.callContext.currentQueryContext.state.toString()).toBe(
+      ctx.callContext.currentQueryContext.state.toString(),
+    );
   });
 
-  it("a flush skips an identical repeat and still moves the rest of its batch", async () => {
+  it("a request slot repeated in one flush moves the entry once, taking one vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+
+    const flushed = await flush(
+      contract,
+      queued,
+      [VALID_WITHDRAW.inIndex, VALID_WITHDRAW.inIndex],
+      [],
+    );
+
+    const state = ledgerOf(flushed);
+    const outKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
+    expect(state.inputRequestBuffer.isEmpty()).toBe(true);
+    expect(state.outputRequestBuffer.size()).toBe(1n);
+    expect(state.outputRequestBuffer.lookup(outKey).entry.evmNonce).toBe(0n);
+    expect(state.globalEvmNonce).toBe(1n);
+  });
+
+  it("an attestation slot repeated in one flush moves the record once", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const queued = (
+      await contract.circuits.queueAttestation1(
+        ctx,
+        respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, BUSY_HEIGHT),
+        OUTPUT_SUCCESS,
+      )
+    ).context;
+
+    const flushed = await flush(contract, queued, [], [requestId, requestId]);
+
+    const state = ledgerOf(flushed);
+    expect(state.inputAttestationBuffer.isEmpty()).toBe(true);
+    expect(state.outputAttestationBuffer.size()).toBe(1n);
+    expect(state.outputAttestationBuffer.lookup(requestId).blockHeight).toBe(BUSY_HEIGHT);
+    expect(state.globalLastSeen).toBe(BUSY_HEIGHT);
+  });
+
+  it("of two twins in one flush, the first moves and the second waits queued", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const twin = { ...VALID_DEPOSIT, inIndex: VALID_DEPOSIT.inIndex + 1n };
+    const queuedFirst = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
+    const queuedBoth = (await queueDeposit(contract, queuedFirst, twin)).context;
+    const outKey = queuedRequestKey(ledgerOf(queuedBoth), VALID_DEPOSIT.inIndex);
+    expect(queuedRequestKey(ledgerOf(queuedBoth), twin.inIndex)).toEqual(outKey);
+
+    const flushed = await flush(contract, queuedBoth, [VALID_DEPOSIT.inIndex, twin.inIndex], []);
+
+    const state = ledgerOf(flushed);
+    expect(state.outputRequestBuffer.size()).toBe(1n);
+    expect(state.outputRequestBuffer.lookup(outKey).entry.inIndex).toBe(VALID_DEPOSIT.inIndex);
+    expect(state.inputRequestBuffer.member(VALID_DEPOSIT.inIndex)).toBe(false);
+    expect(state.inputRequestBuffer.member(twin.inIndex)).toBe(true);
+  });
+
+  it("skips an identical repeat of an open request and still moves the rest of its batch", async () => {
     const { contract, ctx } = await deployInitialised();
     const afterFirst = (await deposit(contract, ctx, VALID_DEPOSIT)).context;
     const repeat = { ...VALID_DEPOSIT, inIndex: 2n };
@@ -4735,201 +5809,64 @@ describe("throughput: requests never pin shared state, only the flush does", () 
     expect(ledgerOf(flushed).outputRequestBuffer.member(otherKey)).toBe(true);
   });
 
-  it("two concurrent startWithdraws from different callers both apply", async () => {
+  it("an attestation below globalLastSeen leaves it unchanged", async () => {
     const { contract, ctx } = await deployInitialised();
-    const alice = await queueWithdraw(contract, ctx, VALID_WITHDRAW);
-    const stateAfterAlice = stateOf(alice.context);
-    const bobCtx = await strangerContext("startWithdraw", ctx);
-    const bob = await queueWithdraw(contract, bobCtx, {
-      ...VALID_WITHDRAW,
-      inIndex: VALID_WITHDRAW.inIndex + 1n,
-    });
-    expect(replay(stateAfterAlice, bob, true)).toBe("applied");
+    const second = { ...VALID_DEPOSIT, inIndex: 2n, evmNonce: VALID_DEPOSIT.evmNonce + 1n };
+    const { context: sentFirst, outKey: firstKey } = await deposit(contract, ctx, VALID_DEPOSIT);
+    const { context: sentBoth, outKey: secondKey } = await deposit(contract, sentFirst, second);
+    const firstId = sentRequestId(sentBoth, firstKey);
+    const secondId = sentRequestId(sentBoth, secondKey);
+    const lowerHeight = BUSY_HEIGHT - 30n;
+
+    const raised = await attest(
+      contract,
+      sentBoth,
+      respond(MPC_RESPONSE_SECRET, firstId, OutputKind.executed, OUTPUT_SUCCESS, BUSY_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    const lowerFolded = await attest(
+      contract,
+      raised,
+      respond(MPC_RESPONSE_SECRET, secondId, OutputKind.executed, OUTPUT_SUCCESS, lowerHeight),
+      OUTPUT_SUCCESS,
+    );
+
+    expect(ledgerOf(raised).globalLastSeen).toBe(BUSY_HEIGHT);
+    expect(ledgerOf(lowerFolded).outputAttestationBuffer.lookup(secondId).blockHeight).toBe(
+      lowerHeight,
+    );
+    expect(ledgerOf(lowerFolded).globalLastSeen).toBe(BUSY_HEIGHT);
   });
 
-  it("a deposit-only flush applies after a concurrent flush moved the vault nonce", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const queuedDeposit = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
-    const queuedBoth = (await queueWithdraw(contract, queuedDeposit, VALID_WITHDRAW)).context;
-    const withdrawFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_WITHDRAW.inIndex], []),
+  it.each([
+    {
+      name: "11 requests",
+      inIndexes: Array.from({ length: 11 }, (_, i) => BigInt(i)),
+      requestIds: [],
+    },
+    {
+      name: "11 attestations",
+      inIndexes: [],
+      requestIds: Array.from({ length: 11 }, (_, i) => bytes(32, i)),
+    },
+    {
+      name: "6 requests and 5 attestations",
+      inIndexes: Array.from({ length: 6 }, (_, i) => BigInt(i)),
+      requestIds: Array.from({ length: 5 }, (_, i) => bytes(32, i)),
+    },
+  ])("flushSlots refuses $name, one item over the flush width", ({ inIndexes, requestIds }) => {
+    expect(() => flushSlots(inIndexes, requestIds)).toThrow(
+      "a flush takes at most 10 items; got 11",
     );
-    const depositFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_DEPOSIT.inIndex], []),
-    );
-    expect(ledgerOf(withdrawFlush.context).globalEvmNonce).toBe(1n);
-    expect(replay(stateOf(withdrawFlush.context), depositFlush, true)).toBe("applied");
   });
 
-  it("two flushes that each move a withdrawal conflict on the vault nonce", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const second = { ...VALID_WITHDRAW, inIndex: VALID_WITHDRAW.inIndex + 1n };
-    const queuedFirst = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
-    const queuedBoth = (await queueWithdraw(contract, queuedFirst, second)).context;
-    const firstFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_WITHDRAW.inIndex], []),
+  it("flushSlots fills the whole width with items when given exactly FLUSH_WIDTH", () => {
+    const slots = flushSlots(
+      Array.from({ length: 6 }, (_, i) => BigInt(i)),
+      Array.from({ length: 4 }, (_, i) => bytes(32, i)),
     );
-    const secondFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([second.inIndex], []),
-    );
-    expect(replay(stateOf(firstFlush.context), secondFlush, true)).toMatch(/^REJECTED/);
-  });
-  it("an approval start applies after a concurrent flush moved the vault nonce", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
-    const withdrawFlush = await contract.circuits.flushQueue(
-      queued,
-      flushSlots([VALID_WITHDRAW.inIndex], []),
-    );
-    const approvalStart = await ROUTER_APPROVAL.start(contract, queued);
-    expect(ledgerOf(withdrawFlush.context).globalEvmNonce).toBe(1n);
-    expect(replay(stateOf(withdrawFlush.context), approvalStart, true)).toBe("applied");
-  });
-
-  it("a flush moving an approval conflicts with a concurrent flush moving a withdrawal on the vault nonce", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const queuedApproval = (await ROUTER_APPROVAL.start(contract, ctx)).context;
-    const queuedBoth = (await queueWithdraw(contract, queuedApproval, VALID_WITHDRAW)).context;
-    const withdrawFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_WITHDRAW.inIndex], []),
-    );
-    const approvalFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([APPROVE_INDEX], []),
-    );
-    expect(replay(stateOf(withdrawFlush.context), approvalFlush, true)).toMatch(/^REJECTED/);
-  });
-
-  it("two concurrent startReplaceNonces under different indexes both apply", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const firstRun = await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE);
-    const secondRun = await queueReplaceNonce(contract, ctx, {
-      inIndex: VALID_REPLACE_NONCE.inIndex + 1n,
-      evmNonce: VALID_REPLACE_NONCE.evmNonce + 1n,
-    });
-    expect(replay(stateOf(firstRun.context), secondRun, true)).toBe("applied");
-  });
-
-  it("a replacement-only flush applies after a concurrent flush moved the vault nonce", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const queuedReplacement = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
-    const queuedBoth = (await queueWithdraw(contract, queuedReplacement, VALID_WITHDRAW)).context;
-    const withdrawFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_WITHDRAW.inIndex], []),
-    );
-    const replacementFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_REPLACE_NONCE.inIndex], []),
-    );
-    expect(ledgerOf(withdrawFlush.context).globalEvmNonce).toBe(1n);
-    expect(replay(stateOf(withdrawFlush.context), replacementFlush, true)).toBe("applied");
-  });
-
-  it("two concurrent startSwaps from different callers both apply", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const alice = await queueSwap(contract, ctx, VALID_SWAP);
-    const bob = await queueSwap(contract, await strangerContext("startSwap", ctx), {
-      ...VALID_SWAP,
-      inIndex: VALID_SWAP.inIndex + 1n,
-    });
-    expect(replay(stateOf(alice.context), bob, true)).toBe("applied");
-  });
-
-  it("a flush moving a swap conflicts with a concurrent flush moving a withdrawal on the vault nonce", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const queuedSwap = (await queueSwap(contract, ctx, VALID_SWAP)).context;
-    const queuedBoth = (await queueWithdraw(contract, queuedSwap, VALID_WITHDRAW)).context;
-    const withdrawFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_WITHDRAW.inIndex], []),
-    );
-    const swapFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_SWAP.inIndex], []),
-    );
-    expect(replay(stateOf(withdrawFlush.context), swapFlush, true)).toMatch(/^REJECTED/);
-  });
-
-  it("two concurrent startSupplys from different callers both apply", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const alice = await queueSupply(contract, ctx, VALID_SUPPLY);
-    const bobCtx = await strangerContext("startSupply", ctx);
-    const bob = await queueSupply(contract, bobCtx, {
-      ...VALID_SUPPLY,
-      inIndex: VALID_SUPPLY.inIndex + 1n,
-    });
-    expect(replay(stateOf(alice.context), bob, true)).toBe("applied");
-  });
-
-  it("a supply start applies after a concurrent flush moved the vault nonce", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
-    const withdrawFlush = await contract.circuits.flushQueue(
-      queued,
-      flushSlots([VALID_WITHDRAW.inIndex], []),
-    );
-    const supplyStart = await queueSupply(contract, queued, VALID_SUPPLY);
-    expect(ledgerOf(withdrawFlush.context).globalEvmNonce).toBe(1n);
-    expect(replay(stateOf(withdrawFlush.context), supplyStart, true)).toBe("applied");
-  });
-
-  it("a flush moving a supply conflicts with a concurrent flush moving a withdrawal on the vault nonce", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const queuedSupply = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
-    const queuedBoth = (await queueWithdraw(contract, queuedSupply, VALID_WITHDRAW)).context;
-    const withdrawFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_WITHDRAW.inIndex], []),
-    );
-    const supplyFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_SUPPLY.inIndex], []),
-    );
-    expect(replay(stateOf(withdrawFlush.context), supplyFlush, true)).toMatch(/^REJECTED/);
-  });
-
-  it("two concurrent startRedeems from different callers both apply", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const alice = await queueRedeem(contract, ctx, VALID_REDEEM);
-    const bobCtx = await strangerContext("startRedeem", ctx);
-    const bob = await queueRedeem(contract, bobCtx, {
-      ...VALID_REDEEM,
-      inIndex: VALID_REDEEM.inIndex + 1n,
-    });
-    expect(replay(stateOf(alice.context), bob, true)).toBe("applied");
-  });
-
-  it("a redeem start applies after a concurrent flush moved the vault nonce", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
-    const withdrawFlush = await contract.circuits.flushQueue(
-      queued,
-      flushSlots([VALID_WITHDRAW.inIndex], []),
-    );
-    const redeemStart = await queueRedeem(contract, queued, VALID_REDEEM);
-    expect(ledgerOf(withdrawFlush.context).globalEvmNonce).toBe(1n);
-    expect(replay(stateOf(withdrawFlush.context), redeemStart, true)).toBe("applied");
-  });
-
-  it("a flush moving a redeem conflicts with a concurrent flush moving a withdrawal on the vault nonce", async () => {
-    const { contract, ctx } = await deployInitialised();
-    const queuedRedeem = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
-    const queuedBoth = (await queueWithdraw(contract, queuedRedeem, VALID_WITHDRAW)).context;
-    const withdrawFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_WITHDRAW.inIndex], []),
-    );
-    const redeemFlush = await contract.circuits.flushQueue(
-      queuedBoth,
-      flushSlots([VALID_REDEEM.inIndex], []),
-    );
-    expect(replay(stateOf(withdrawFlush.context), redeemFlush, true)).toMatch(/^REJECTED/);
+    expect(slots).toHaveLength(FLUSH_WIDTH);
+    expect(slots.filter(({ channel }) => channel === FlushChannel.empty)).toHaveLength(0);
   });
 });
 
@@ -5425,4 +6362,394 @@ describe("attested block heights", () => {
     expect(record.path).toEqual(DEPLOYER_COMMITMENT);
     expect(record.txParams.nonce).toBe(VALID_DEPOSIT.evmNonce);
   });
+});
+
+describe("queueing and settling attestations", () => {
+  it("queueAttestation0 rejects a failure signed by a key other than the stored MPC response key", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    await expect(
+      contract.circuits.queueAttestation0(
+        ctx,
+        respond(IMPOSTER_SECRET, requestId, OutputKind.failed, OUTPUT_EMPTY, ATTESTED_HEIGHT),
+        OUTPUT_EMPTY,
+      ),
+    ).rejects.toThrow(/Invalid attestation signature/);
+  });
+
+  it("refuses a second attestation for a request whose first is still queued", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const attestation = respond(
+      MPC_RESPONSE_SECRET,
+      requestId,
+      OutputKind.executed,
+      OUTPUT_SUCCESS,
+      ATTESTED_HEIGHT,
+    );
+    const queued = (await contract.circuits.queueAttestation1(ctx, attestation, OUTPUT_SUCCESS))
+      .context;
+    await expect(
+      contract.circuits.queueAttestation1(queued, attestation, OUTPUT_SUCCESS),
+    ).rejects.toThrow(/Attestation already queued/);
+  });
+
+  it("refuses a second attestation for a request whose first is flushed", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const attestation = respond(
+      MPC_RESPONSE_SECRET,
+      requestId,
+      OutputKind.executed,
+      OUTPUT_SUCCESS,
+      ATTESTED_HEIGHT,
+    );
+    const attested = await attest(contract, ctx, attestation, OUTPUT_SUCCESS);
+    await expect(
+      contract.circuits.queueAttestation1(attested, attestation, OUTPUT_SUCCESS),
+    ).rejects.toThrow(/Attestation already flushed/);
+  });
+
+  it("completeDeposit refuses an attestation that is queued but not yet flushed", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const queued = (
+      await contract.circuits.queueAttestation1(
+        ctx,
+        respond(
+          MPC_RESPONSE_SECRET,
+          requestId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      )
+    ).context;
+    await expect(
+      contract.circuits.completeDeposit(
+        queued,
+        requestId,
+        OUTPUT_SUCCESS,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+    ).rejects.toThrow(/Attestation not flushed/);
+  });
+});
+
+// A request key or id no request holds: the circuits below refuse before reading it.
+const UNKNOWN_KEY = bytes(32, 0x5a);
+
+describe("before initialise", () => {
+  it.each([
+    {
+      name: "flushQueue",
+      call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>
+        contract.circuits.flushQueue(ctx, flushSlots([], [])),
+    },
+    {
+      name: "queueAttestation0",
+      call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>
+        contract.circuits.queueAttestation0(
+          ctx,
+          respond(
+            MPC_RESPONSE_SECRET,
+            UNKNOWN_KEY,
+            OutputKind.failed,
+            OUTPUT_EMPTY,
+            ATTESTED_HEIGHT,
+          ),
+          OUTPUT_EMPTY,
+        ),
+    },
+    {
+      name: "queueAttestation1",
+      call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>
+        contract.circuits.queueAttestation1(
+          ctx,
+          respond(
+            MPC_RESPONSE_SECRET,
+            UNKNOWN_KEY,
+            OutputKind.executed,
+            OUTPUT_SUCCESS,
+            ATTESTED_HEIGHT,
+          ),
+          OUTPUT_SUCCESS,
+        ),
+    },
+    {
+      name: "sendDeposit",
+      call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>
+        contract.circuits.sendDeposit(ctx, UNKNOWN_KEY),
+    },
+    {
+      name: "completeDeposit",
+      call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>
+        contract.circuits.completeDeposit(
+          ctx,
+          UNKNOWN_KEY,
+          OUTPUT_IGNORED,
+          MINT_NONCE,
+          CALLER_RECIPIENT,
+        ),
+    },
+    {
+      name: "sendWithdraw",
+      call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>
+        contract.circuits.sendWithdraw(ctx, UNKNOWN_KEY),
+    },
+    {
+      name: "completeWithdraw",
+      call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>
+        contract.circuits.completeWithdraw(ctx, UNKNOWN_KEY, OUTPUT_IGNORED, MINT_NONCE),
+    },
+    {
+      name: "sendApprove",
+      call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>
+        contract.circuits.sendApprove(ctx, UNKNOWN_KEY),
+    },
+    {
+      name: "completeApprove",
+      call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>
+        contract.circuits.completeApprove(ctx, UNKNOWN_KEY, OUTPUT_IGNORED),
+    },
+  ])("$name refuses an uninitialised vault", async ({ call }) => {
+    const { contract, ctx } = await deployContract();
+    await expect(call(contract, ctx)).rejects.toThrow(/Not initialised/);
+  });
+});
+
+// ---- Hand-built ledgers ----
+
+// Some guards hold invariants no sequence of circuit calls breaks: a send records the
+// event and the evictionMap entry while the output entry is open, and a complete removes
+// all three together. These helpers build the broken ledger by hand, so each such guard
+// is seen firing.
+
+/** The value of the vault ledger field `name` in `ctx`'s state. */
+const ledgerFieldOf = (ctx: CircuitContext<VaultPrivateState>, name: string): StateValue =>
+  compiledFieldIndex(name).reduce((node, index) => {
+    const child = node.asArray()?.at(index);
+    if (!child) {
+      throw new Error(`ledger field ${name} has no node at index ${String(index)}`);
+    }
+    return child;
+  }, ctx.callContext.currentQueryContext.state.state);
+
+/** `node` with the value at `path` below it replaced by `value`. */
+const replacedAt = (node: StateValue, path: readonly number[], value: StateValue): StateValue => {
+  const [index, ...rest] = path;
+  if (index === undefined) {
+    return value;
+  }
+  const children = node.asArray();
+  if (!children) {
+    throw new Error("a ledger path runs through a node that is not an array");
+  }
+  return children.reduce(
+    (rebuilt, child, i) => rebuilt.arrayPush(i === index ? replacedAt(child, rest, value) : child),
+    StateValue.newArray(),
+  );
+};
+
+/**
+ * Re-enter `ctx`'s state as its own caller, about to call `circuitId`, with the vault
+ * ledger field `name` replaced by `value`.
+ */
+const withLedgerField = async (
+  circuitId: string,
+  ctx: CircuitContext<VaultPrivateState>,
+  name: string,
+  value: StateValue,
+): Promise<CircuitContext<VaultPrivateState>> =>
+  createCircuitContext(
+    circuitId,
+    VAULT_ADDRESS,
+    CPK,
+    new ChargedState(
+      replacedAt(ctx.callContext.currentQueryContext.state.state, compiledFieldIndex(name), value),
+    ),
+    createVaultPrivateState(SECRET_KEY),
+    await signetStateProvider(),
+    undefined,
+    undefined,
+    undefined,
+    BLOCK_HASH,
+  );
+
+const EMPTY_MAP = StateValue.newMap(new StateMap());
+
+/** One complete circuit, arranged to reach its event check with a flushed failure. */
+interface EventMissingCase {
+  /** The complete circuit the row calls. */
+  name: string;
+  /** The action's event map, emptied by hand before the complete. */
+  eventMap: string;
+  /** Deploy, initialise and send one request of the action. */
+  requested: () => Promise<{
+    contract: Contract<VaultPrivateState>;
+    ctx: CircuitContext<VaultPrivateState>;
+    requestId: Uint8Array;
+  }>;
+  /** The complete call, passed every argument a failure verdict takes. */
+  complete: (
+    contract: Contract<VaultPrivateState>,
+    ctx: CircuitContext<VaultPrivateState>,
+    requestId: Uint8Array,
+  ) => Promise<unknown>;
+}
+
+const EVENT_MISSING_CASES: EventMissingCase[] = [
+  {
+    name: "completeDeposit",
+    eventMap: "bidirectionalDepositMap",
+    requested: depositRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeDeposit(
+        ctx,
+        requestId,
+        OUTPUT_IGNORED,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+  },
+  {
+    name: "completeWithdraw",
+    eventMap: "bidirectionalWithdrawMap",
+    requested: withdrawRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeWithdraw(ctx, requestId, OUTPUT_IGNORED, MINT_NONCE),
+  },
+  {
+    name: "completeApprove",
+    eventMap: "bidirectionalApproveMap",
+    requested: approveRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeApprove(ctx, requestId, OUTPUT_IGNORED),
+  },
+  {
+    name: "completeReplaceNonce",
+    eventMap: "bidirectionalReplaceNonceMap",
+    requested: replaceNonceRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeReplaceNonce(ctx, requestId, OUTPUT_IGNORED),
+  },
+  {
+    name: "completeSwap",
+    eventMap: "bidirectionalSwapMap",
+    requested: swapRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeSwap(ctx, requestId, OUTPUT_SWAP_IGNORED, MINT_NONCE, CHANGE_NONCE),
+  },
+  {
+    name: "completeSupply",
+    eventMap: "bidirectionalSupplyMap",
+    requested: supplyRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeSupply(ctx, requestId, OUTPUT_SUPPLY_IGNORED, MINT_NONCE),
+  },
+  {
+    name: "completeRedeem",
+    eventMap: "bidirectionalRedeemMap",
+    requested: redeemRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeRedeem(ctx, requestId, OUTPUT_REDEEM_IGNORED, MINT_NONCE),
+  },
+];
+
+describe("invariant guards, on a ledger built by hand", () => {
+  it("queueAttestation1 refuses a sent request whose output entry is gone", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const broken = await withLedgerField(
+      "queueAttestation1",
+      ctx,
+      "outputRequestBuffer",
+      EMPTY_MAP,
+    );
+    await expect(
+      contract.circuits.queueAttestation1(
+        broken,
+        respond(
+          MPC_RESPONSE_SECRET,
+          requestId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      ),
+    ).rejects.toThrow(/Request not open/);
+  });
+
+  it("completeDeposit refuses an attested request whose output entry is gone", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const attested = await attest(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    const broken = await withLedgerField(
+      "completeDeposit",
+      attested,
+      "outputRequestBuffer",
+      EMPTY_MAP,
+    );
+    await expect(
+      contract.circuits.completeDeposit(
+        broken,
+        requestId,
+        OUTPUT_SUCCESS,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+    ).rejects.toThrow(/Request not open/);
+  });
+
+  it("completeDeposit refuses a flushed attestation at or below its entry's lastSeen", async () => {
+    // Queueing already refuses such an attestation, and nothing re-stamps an open
+    // entry, so the entry comes from a vault that flushed the same deposit later.
+    const { contract, ctx, requestId, outKey } = await depositRequested();
+    const attested = await attest(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    const later = await deployInitialised(ATTESTED_HEIGHT);
+    const laterQueued = (await queueDeposit(later.contract, later.ctx, VALID_DEPOSIT)).context;
+    const laterFlushed = await flush(later.contract, laterQueued, [VALID_DEPOSIT.inIndex], []);
+
+    const restamped = await withLedgerField(
+      "completeDeposit",
+      attested,
+      "outputRequestBuffer",
+      ledgerFieldOf(laterFlushed, "outputRequestBuffer"),
+    );
+    expect(ledgerOf(restamped).outputRequestBuffer.lookup(outKey).lastSeen).toBe(ATTESTED_HEIGHT);
+    expect(ledgerOf(restamped).outputAttestationBuffer.lookup(requestId).blockHeight).toBe(
+      ATTESTED_HEIGHT,
+    );
+
+    await expect(
+      contract.circuits.completeDeposit(
+        restamped,
+        requestId,
+        OUTPUT_SUCCESS,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+    ).rejects.toThrow(/Stale attestation/);
+  });
+
+  it.each(EVENT_MISSING_CASES)(
+    "$name refuses a settled request whose event is gone",
+    async ({ name, eventMap, requested, complete }) => {
+      const { contract, ctx, requestId } = await requested();
+      const attested = await attestFailure(
+        contract,
+        ctx,
+        respond(MPC_RESPONSE_SECRET, requestId, OutputKind.failed, OUTPUT_EMPTY, ATTESTED_HEIGHT),
+      );
+      const broken = await withLedgerField(name, attested, eventMap, EMPTY_MAP);
+      await expect(complete(contract, broken, requestId)).rejects.toThrow(/Request event missing/);
+    },
+  );
 });
