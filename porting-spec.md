@@ -757,6 +757,31 @@ Each port task includes, for its action:
   `vault-queue-benchmark` in the old worktree): port or delete, with the user.
 - Check the CI workflow's spec list.
 
+**Load limits (binding on every S3 spec).** Load on the local stack has broken
+it before: the old `vault-queue-benchmark` test that had 20 wallets prove and
+submit together got node error 170 (`InvalidDustSpendProof`: the node rejects
+the DUST fee proof because its DUST state disagrees with the wallet's), and
+from then on every wallet's first submission on that stack got 170 too, until
+`docker compose --profile fakenet down`, `docker compose up -d` and a
+redeploy. It happened on two independent fresh stacks. The root cause is not
+established, so keep S3 well away from that load:
+
+- At most two submitting wallets, the minimum that shows a race. Never port
+  the 20-wallet test, and never add a wallet count or a loop that scales load.
+- A wallet never has two of its own transactions unconfirmed at once. The
+  race is between wallets, never within one.
+- A spec that hits error 170 fails at once, with the harness's own
+  explanation (`steps.ts`, the `Custom error: 170` branch). It never retries
+  or rebuilds after a 170.
+- After the concurrency spec, a single deposit start from the user wallet
+  must succeed, as a canary that the stack is still healthy. It fails with
+  "stack poisoned: reset it" otherwise.
+- The concurrency spec is not a CI gate spec. It runs last in `FILE_ORDER`,
+  after `admin-replace-nonce-e2e`, so a poisoned stack can never fail
+  another spec.
+- The time-budget test measures one flush at a time on a quiet stack, with
+  no concurrent submissions.
+
 **S4. Documentation sweep, scope confirmed with the user first:**
 
 - the flow pages under `examples/erc20-vault/docs/`
