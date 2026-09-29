@@ -28,6 +28,8 @@ const FILE_ORDER = [
   "swap-refund-e2e.test.ts",
   "redeem-refund-e2e.test.ts",
   "admin-replace-nonce-e2e.test.ts",
+  // Last: its concurrent submissions are the load most likely to poison the local stack.
+  "concurrent-flush-e2e.test.ts",
 ];
 
 const rank = (moduleId: string): number => {
