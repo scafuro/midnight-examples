@@ -189,7 +189,7 @@ export circuit setGasParams(
 // Keep at least two variants: a one-variant enum in a hashed struct compiles to a
 // field element the ledger parses as zero bytes, and proofs then fail the proof
 // server's alignment check.
-export enum Action { deposit, withdraw, approve, replaceNonce }
+export enum Action { deposit, withdraw, supply, approve, replaceNonce }
 
 // The EIP-1559 fee envelope of a request's EVM transaction, fixed at start.
 export struct GasParams {
@@ -395,6 +395,26 @@ export circuit queueAttestation1(
   recordAttestation(attestation, digest);
 }
 
+// Queues an attestation with an 8-byte output (a uint64 return value). The output is
+// needed here, as the signed digest binds the height to it and the flush trusts the
+// height it folds.
+export circuit queueAttestation8(
+  respondBidirectionalEvent: RespondBidirectionalEventV1,
+  serializedOutput: Bytes<8>
+): [] {
+  requireInitialised();
+  const attestation = disclose(respondBidirectionalEvent);
+  const output = disclose(serializedOutput);
+  assert(
+    verifyRespondBidirectionalEventV1<8>(output, attestation, mpcResponseKey),
+    "Invalid attestation signature"
+  );
+  const digest = calculateSignetAttestationDigestV1<8>(
+    attestation.requestId, attestation.blockHeight, attestation.outputKind, output
+  );
+  recordAttestation(attestation, digest);
+}
+
 // Consumes the open request and the flushed attestation that settles it, for the
 // action's complete circuit, which removes the action's own event and args. The height
 // check is the absolute safety bound: the attestation's block must be strictly above
@@ -442,7 +462,7 @@ export struct DepositArgs {
 }
 
 // Deposit requests (2-word ERC20 transfer, 34-byte schemas).
-// Compiled path for MPC notification: [1, 7] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [1, 5] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalDepositMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the deposit queued under it, from start to complete.
@@ -534,11 +554,11 @@ export circuit sendDeposit(outKey: Bytes<32>): [] {
   bidirectionalDepositMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [1, 7]).
+  // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [1, 5]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [1, 7, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [1, 5, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -603,7 +623,7 @@ export struct WithdrawArgs {
 }
 
 // Withdraw requests (2-word ERC20 transfer, 34-byte schemas).
-// Compiled path for MPC notification: [1, 9] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [1, 7] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalWithdrawMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the withdrawal queued under it, from start to complete.
@@ -705,11 +725,11 @@ export circuit sendWithdraw(outKey: Bytes<32>): [] {
   bidirectionalWithdrawMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalWithdrawMap's compiled ledger path, [1, 9]).
+  // Notify the MPC (bidirectionalWithdrawMap's compiled ledger path, [1, 7]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [1, 9, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [1, 7, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -773,7 +793,7 @@ export struct ApproveArgs {
 }
 
 // Approve requests of both spenders (2-word ERC20 approve, 34-byte schemas).
-// Compiled path for MPC notification: [1, 11] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [1, 9] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalApproveMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the approval queued under it, from start to complete.
@@ -887,11 +907,11 @@ export circuit sendApprove(outKey: Bytes<32>): [] {
   bidirectionalApproveMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalApproveMap's compiled ledger path, [1, 11]).
+  // Notify the MPC (bidirectionalApproveMap's compiled ledger path, [1, 9]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [1, 11, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [1, 9, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -930,7 +950,7 @@ export struct ReplaceNonceArgs {
 }
 
 // Nonce replacement requests (no calldata, 34-byte schemas).
-// Compiled path for MPC notification: [1, 13] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [1, 11] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalReplaceNonceMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the replacement queued under it, from start to complete.
@@ -1014,11 +1034,11 @@ export circuit sendReplaceNonce(outKey: Bytes<32>): [] {
   bidirectionalReplaceNonceMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalReplaceNonceMap's compiled ledger path, [1, 13]).
+  // Notify the MPC (bidirectionalReplaceNonceMap's compiled ledger path, [1, 11]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [1, 13, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [1, 11, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -1043,6 +1063,193 @@ export circuit completeReplaceNonce(requestId: RequestId, serializedOutput: Byte
         disclosedId, record.blockHeight, record.outputKind, disclose(serializedOutput)
       ) == record.digest,
       "Output does not match the attestation"
+    );
+  }
+}
+
+// ==== Supply =========================================================================
+// deposit(amount, vaultEvmAddress) on stataToken, signed by the MPC with the vault's own
+// account at a nonce the flush assigns, under the vault's gas settings. The wrapper pulls
+// amount of stataUnderlying from the vault account under the allowance startApproveStata
+// grants, and mints the vault account shares. Exact-input, so there is no change.
+
+// The wrapper's deposit returns the shares it minted as a uint256.
+export pure circuit supplyOutputSchema(): Bytes<36> {
+  return "[{\"name\":\"shares\",\"type\":\"uint256\"}]" as Bytes<36>;
+}
+
+// The MPC re-packs the shares as a uint64, the width completeSupply mints.
+export pure circuit supplyRespondSchema(): Bytes<35> {
+  return "[{\"name\":\"shares\",\"type\":\"uint64\"}]" as Bytes<35>;
+}
+
+// supplyRespondSchema()'s output decoded, packed by the MPC to 8 bytes.
+struct DepositReturnValue {
+  shares: Uint<64>;
+}
+
+export struct SupplyRequest {
+  // The stataUnderlying amount to supply, in its base units.
+  amount: Uint<128>;
+}
+
+export struct SupplyArgs {
+  request: SupplyRequest;
+  gas: GasParams;
+}
+
+// Supply requests (2-word ERC-4626 deposit, 36-byte output and 35-byte respond schemas).
+// Compiled path for MPC notification: [1, 13] (read from managed/erc20-vault/compiler/contract-info.json).
+export ledger bidirectionalSupplyMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 36, 35>;
+
+// inIndex -> the arguments of the supply queued under it, from start to complete.
+export ledger supplyArgsMap: Map<Uint<64>, SupplyArgs>;
+
+circuit supplyArgsHash(args: SupplyArgs): Bytes<32> {
+  return upgradeFromTransient(transientHash<[Bytes<32>, SupplyArgs]>([
+    pad(32, "vault:supply:args"),
+    args
+  ]));
+}
+
+// Queues the supply under inIndex, a caller-chosen random index, and burns the
+// surrendered stataUnderlying vault coin: the coin spend is the authorisation. The
+// vault's account signs and pays, so the gas is the vault's own setting at start.
+export circuit startSupply(
+  inIndex: Uint<64>,
+  supplyRequest: SupplyRequest,
+  coin: ShieldedCoinInfo
+): [] {
+  requireInitialised();
+  assert(supplyRequest.amount > 0 as Uint<128>, "Amount must be positive");
+  // completeSupply re-mints via a Uint<64> API, so reject unrefundable amounts.
+  assert(supplyRequest.amount <= 18446744073709551615 as Uint<128>, "Amount exceeds Uint<64> max");
+
+  assert(
+    coin.color == tokenType(vaultTokenDomainSeparator(stataUnderlying), kernel.self()),
+    "Coin is not the vault token for the underlying"
+  );
+  assert(coin.value == supplyRequest.amount, "Coin value must equal the supply amount");
+  receiveShielded(disclose(coin));
+  sendImmediateShielded(disclose(coin), shieldedBurnAddress(), disclose(coin).value);
+
+  const disclosedIndex = disclose(inIndex);
+  assert(
+    !inputRequestBuffer.member(disclosedIndex) && !supplyArgsMap.member(disclosedIndex),
+    "Index already in use"
+  );
+
+  const args = disclose(SupplyArgs {
+    request: supplyRequest,
+    gas: GasParams {
+      gasLimit: vaultGasLimits.supply,
+      maxFeePerGas: vaultMaxFeePerGas,
+      maxPriorityFeePerGas: vaultMaxPriorityFeePerGas,
+    },
+  });
+  supplyArgsMap.insert(disclosedIndex, args);
+  inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
+    action: Action.supply,
+    nonceIsVault: true,
+    evmNonce: 0 as Uint<64>,
+    inIndex: inIndex,
+    commitment: ownershipCommitment(inIndex, callerSecretKey()),
+    argsHash: supplyArgsHash(args),
+  }));
+}
+
+// Records the flushed supply's SignBidirectionalEvent and notifies the MPC.
+// Permissionless: the entry and its args fix every byte of the EVM transaction, so a
+// second send of the same entry names the same request id and is refused.
+export circuit sendSupply(outKey: Bytes<32>): [] {
+  requireInitialised();
+  const disclosedKey = disclose(outKey);
+  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  assert(entry.action == Action.supply, "Wrong action");
+  const args = supplyArgsMap.lookup(entry.inIndex);
+  // The pinned receiver keeps the shares in the vault account, which backs the minted coins.
+  const calldata = EvmCalldata<2> {
+    selector: Bytes [0x6e, 0x55, 0x3f, 0x65], // deposit(uint256,address)
+    noWords: 2 as Uint<16>,
+    words: [
+      numericAbiWord(args.request.amount),
+      evmAddressAbiWord(vaultEvmAddress),
+    ]
+  };
+  const txParams = EvmType2TxParams<2, 0, 0> {
+    chainId: evmChainId,
+    nonce: entry.evmNonce,
+    maxPriorityFeePerGas: args.gas.maxPriorityFeePerGas,
+    maxFeePerGas: args.gas.maxFeePerGas,
+    gasLimit: args.gas.gasLimit,
+    to: stataToken,
+    value: 0 as Uint<128>,
+    calldata: some<EvmCalldata<2>>(calldata),
+    accessListEntryCount: 0,
+    accessList: []
+  };
+  const request = constructSignBidirectionalEventV1<EvmType2TxParams<2, 0, 0>, 36, 35>(
+    mpcKeyVersion, kernel.self(), pad(32, "vault"),
+    MPCSignatureAlgorithm.ecdsa, TxParamType.evmType2, txParams, ethereumCaip2Id(),
+    MPCDestination.unused, pad(64, ""), supplyOutputSchema(), supplyRespondSchema()
+  );
+  const requestId = calculateEvmType2RequestIdV1<2, 0, 0, 36, 35>(request);
+  assert(!bidirectionalSupplyMap.member(requestId), "Request already sent");
+  bidirectionalSupplyMap.insert(requestId, request);
+  evictionMap.insert(requestId, disclosedKey);
+
+  // Notify the MPC (bidirectionalSupplyMap's compiled ledger path, [1, 13]).
+  signetSigner.signBidirectional(
+    requestId,
+    constructSignBidirectionalEventNotificationV1(
+      kernel.self(), 2 as Uint<8>, [1, 13, 0, 0] as Vector<4, Uint<8>>,
+    ),
+  );
+}
+
+// Settles a supply on either verdict. Executed: checks the output against the
+// attestation, then mints the attested shares as the stataToken vault coin. Failed or
+// unviable: the wrapper took nothing, so the surrendered stataUnderlying amount is
+// re-minted, and serializedOutput is ignored. Either mint goes to the caller.
+// Supplier-gated, one settle per request. mintNonce must be caller-chosen RANDOM: one
+// derived from the (public) requestId would link the minted coin to the supply.
+export circuit completeSupply(
+  requestId: RequestId,
+  serializedOutput: Bytes<8>,
+  mintNonce: Bytes<32>,
+): [] {
+  requireInitialised();
+  const disclosedId = disclose(requestId);
+  const settled = settleRequest(disclosedId, Action.supply);
+  const entry = settled[0];
+  const record = settled[1];
+  const args = supplyArgsMap.lookup(entry.inIndex);
+  supplyArgsMap.remove(entry.inIndex);
+  assert(bidirectionalSupplyMap.member(disclosedId), "Request event missing");
+  bidirectionalSupplyMap.remove(disclosedId);
+
+  const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
+  if (record.outputKind == OutputKind.executed) {
+    const output = disclose(serializedOutput);
+    assert(
+      calculateSignetAttestationDigestV1<8>(
+        disclosedId, record.blockHeight, record.outputKind, output
+      ) == record.digest,
+      "Output does not match the attestation"
+    );
+    mintShieldedToken(
+      vaultTokenDomainSeparator(stataToken),
+      deserialize<DepositReturnValue, 8>(output).shares,
+      disclose(mintNonce),
+      caller
+    );
+  } else {
+    mintShieldedToken(
+      vaultTokenDomainSeparator(stataUnderlying),
+      args.request.amount as Uint<64>,
+      disclose(mintNonce),
+      caller
     );
   }
 }

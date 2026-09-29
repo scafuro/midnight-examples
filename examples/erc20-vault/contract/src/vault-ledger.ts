@@ -59,6 +59,7 @@ export async function printVaultState(
   printRequestMap("withdraw", state.bidirectionalWithdrawMap);
   printRequestMap("approve", state.bidirectionalApproveMap);
   printRequestMap("nonce replacement", state.bidirectionalReplaceNonceMap);
+  printRequestMap("supply", state.bidirectionalSupplyMap);
 }
 
 /**
