@@ -58,9 +58,9 @@ carries:
 - **The nonce.** `nonceIsVault` is `false` when the caller names the nonce,
   which is taken verbatim: a deposit names the depositor's own account nonce,
   and a nonce replacement names the vault account nonce it replaces. It is
-  `true` for a withdrawal or an approval, which the vault's account signs at a
-  nonce the caller does not choose: the start writes 0, and the flush replaces
-  it with the vault's next nonce.
+  `true` for a withdrawal, a swap, a supply, a redeem or an approval, which
+  the vault's account signs at a nonce the caller does not choose: the start
+  writes 0, and the flush replaces it with the vault's next nonce.
 - **The input index** it was queued under, which is public already.
 - **An ownership commitment**, `ownershipCommitment(inIndex, secret key)`. The
   complete circuit recomputes it from the stored index and the caller's
@@ -73,9 +73,14 @@ index: `depositArgsMap` holds each deposit's `DepositArgs` (the
 the gas envelope), `withdrawArgsMap` each withdrawal's `WithdrawArgs` (the
 `WithdrawRequest` and the vault's gas envelope at start), `approveArgsMap`
 each approval's `ApproveArgs` (the `ApproveRequest`, naming the ERC20 and the
-spender, and the vault's gas envelope at start), and `replaceNonceArgsMap`
-each nonce replacement's `ReplaceNonceArgs` (the vault's gas envelope at
-start). The start circuit writes them, the send and complete circuits read
+spender, and the vault's gas envelope at start), `replaceNonceArgsMap` each
+nonce replacement's `ReplaceNonceArgs` (the vault's gas envelope at start),
+`swapArgsMap` each swap's `SwapArgs` (the `SwapRequest` and the vault's gas
+envelope at start), `supplyArgsMap` each supply's `SupplyArgs` (the
+`SupplyRequest`, naming the amount, and the vault's gas envelope at start),
+and `redeemArgsMap` each redeem's `RedeemArgs` (the `RedeemRequest`, naming
+the shares, and the vault's gas envelope at start).
+The start circuit writes them, the send and complete circuits read
 them, and the complete circuit removes them. The flush never touches them, so
 its cost does not grow with the actions the vault supports.
 The start circuit refuses an index that either the input buffer or its args
@@ -291,8 +296,9 @@ the record's storage is width-independent.
 
 ## Vault-signed requests
 
-A withdrawal or an approval is signed by the vault's own EVM account, so it
-needs the account's next nonce, and no two requests may get the same one. That
+A withdrawal, a swap, a supply, a redeem or an approval is signed by the
+vault's own EVM account, so it needs the account's next nonce, and no two
+requests may get the same one. That
 nonce is the second shared cell, and it follows the same rule: the flush is its
 only reader and writer.
 
@@ -340,6 +346,70 @@ transaction:
    assigned, and records it in `bidirectionalApproveMap`.
 3. **Complete.** `completeApprove` settles every verdict by closing the
    request. It mints nothing, as the start surrendered nothing.
+
+The swap lifecycle is the same six steps. It buys an exact amount of one ERC20
+with at most a capped amount of another, through the pinned Uniswap router and
+the allowance a router approval granted:
+
+1. **Start.** `startSwap` takes the input index, the `SwapRequest` and the
+   vault coin of `erc20AddressIn`, whose value must equal `amountInMaximum`.
+   It burns the coin, copies the vault's gas settings into `swapArgsMap`, and
+   queues the entry with `nonceIsVault` set.
+2. **Send.** `sendSwap` builds `exactOutputSingle` on `uniswapRouter`, buying
+   exactly `amountOut` of `erc20AddressOut` for at most `amountInMaximum` of
+   `erc20AddressIn` and delivering it to `vaultEvmAddress`, with the
+   derivation path `"vault"` and the nonce the flush assigned, and records it
+   in `bidirectionalSwapMap`.
+3. **Queue the attestation.** The MPC decodes the router's `uint256` return,
+   the input the swap spent, and attests it packed as a `uint64`, so an
+   executed swap is queued with `queueAttestation8`.
+4. **Complete.** `completeSwap` settles every verdict. An executed swap mints
+   exactly `amountOut` of `erc20AddressOut` and the unspent
+   `amountInMaximum - amountIn` of `erc20AddressIn` as change, a zero-value
+   coin on an exact spend, under two caller-chosen nonces that must differ. A
+   failed or unviable swap spent nothing, so it re-mints `amountInMaximum` of
+   `erc20AddressIn`. Every mint goes to the swapper.
+
+The supply lifecycle is the same six steps. It deposits the vault account's
+pinned `stataUnderlying` into the pinned `stataToken` wrapper (an ERC-4626
+tokenised vault) for shares, drawing on the allowance the stata approval grants:
+
+1. **Start.** `startSupply` takes the input index, the `SupplyRequest` and the
+   vault coin of `stataUnderlying`, whose value must equal the amount. It burns
+   the coin, copies the vault's gas settings into `supplyArgsMap`, and queues
+   the entry with `nonceIsVault` set. Both tokens are contract-fixed, so the
+   request names only the amount.
+2. **Send.** `sendSupply` builds `deposit(amount, vaultEvmAddress)` on
+   `stataToken` with the derivation path `"vault"` and the nonce the flush
+   assigned, and records it in `bidirectionalSupplyMap`.
+3. **Queue the attestation.** The MPC decodes the wrapper's uint256 share
+   count and re-packs it as a uint64, so an executed supply is queued with
+   `queueAttestation8`, and a failed or unviable one with `queueAttestation0`.
+4. **Complete.** `completeSupply` settles every verdict. An executed deposit
+   minted shares to the vault account, so it mints the attested share count
+   as the `stataToken` vault coin to the supplier. A failed or unviable one
+   moved nothing, so it re-mints the burned `stataUnderlying` amount.
+
+The redeem lifecycle is the same six steps, the supply's in reverse. It
+redeems shares the vault account holds in the pinned `stataToken` wrapper for
+the `stataUnderlying` they are worth. The vault account owns the shares it
+burns, so no approval is involved:
+
+1. **Start.** `startRedeem` takes the input index, the `RedeemRequest` and the
+   vault coin of `stataToken`, whose value must equal the shares. It burns the
+   coin, copies the vault's gas settings into `redeemArgsMap`, and queues the
+   entry with `nonceIsVault` set. Both tokens are contract-fixed, so the
+   request names only the shares.
+2. **Send.** `sendRedeem` builds `redeem(shares, vaultEvmAddress,
+   vaultEvmAddress)` on `stataToken` with the derivation path `"vault"` and the
+   nonce the flush assigned, and records it in `bidirectionalRedeemMap`.
+3. **Queue the attestation.** The MPC decodes the wrapper's uint256 asset
+   amount and re-packs it as a uint64, so an executed redeem is queued with
+   `queueAttestation8`, and a failed or unviable one with `queueAttestation0`.
+4. **Complete.** `completeRedeem` settles every verdict. An executed redeem
+   paid the vault account the underlying, so it mints the attested asset
+   amount as the `stataUnderlying` vault coin to the redeemer. A failed or
+   unviable one burned nothing, so it re-mints the surrendered shares.
 
 ## Nonce replacement
 

@@ -11,7 +11,10 @@ import { describe, expect, it } from "vitest";
 import {
   VAULT_APPROVE_REQUESTS_PATH,
   VAULT_DEPOSIT_REQUESTS_PATH,
+  VAULT_REDEEM_REQUESTS_PATH,
   VAULT_REPLACE_NONCE_REQUESTS_PATH,
+  VAULT_SUPPLY_REQUESTS_PATH,
+  VAULT_SWAP_REQUESTS_PATH,
   VAULT_WITHDRAW_REQUESTS_PATH,
 } from "../src/index.ts";
 
@@ -37,10 +40,13 @@ const compiledFieldIndex = (name: string): readonly number[] => {
 
 describe("exported ledger paths match the compiled contract-info.json", () => {
   it.each([
-    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [1, 7]],
-    ["bidirectionalWithdrawMap", VAULT_WITHDRAW_REQUESTS_PATH, [1, 9]],
-    ["bidirectionalApproveMap", VAULT_APPROVE_REQUESTS_PATH, [1, 11]],
-    ["bidirectionalReplaceNonceMap", VAULT_REPLACE_NONCE_REQUESTS_PATH, [1, 13]],
+    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [2, 5]],
+    ["bidirectionalWithdrawMap", VAULT_WITHDRAW_REQUESTS_PATH, [2, 7]],
+    ["bidirectionalApproveMap", VAULT_APPROVE_REQUESTS_PATH, [2, 3]],
+    ["bidirectionalReplaceNonceMap", VAULT_REPLACE_NONCE_REQUESTS_PATH, [2, 1]],
+    ["bidirectionalSwapMap", VAULT_SWAP_REQUESTS_PATH, [2, 9]],
+    ["bidirectionalSupplyMap", VAULT_SUPPLY_REQUESTS_PATH, [2, 11]],
+    ["bidirectionalRedeemMap", VAULT_REDEEM_REQUESTS_PATH, [2, 13]],
     // The literal column is deliberate: the notification vectors in
     // erc20-vault.compact are hand-written, so a re-chunk that moves a path
     // must fail here even when the exported constant was updated with it.
@@ -50,26 +56,26 @@ describe("exported ledger paths match the compiled contract-info.json", () => {
   });
 });
 
-describe("the admin-updateable gas parameters sit in chunk 0", () => {
+describe("the admin-updateable gas parameters straddle chunks 0 and 1", () => {
   it.each([
     ["vaultMaxFeePerGas", [0, 2]],
     ["vaultMaxPriorityFeePerGas", [0, 3]],
-    ["vaultGasLimits", [0, 4]],
+    ["vaultGasLimits", [1, 0]],
   ] as const)("%s", (fieldName, compiledPath) => {
     expect(compiledFieldIndex(fieldName)).toEqual(compiledPath);
   });
 });
 
-describe("the state tree stays TWO chunks deep", () => {
-  it("holds at most 30 fields, the two chunks' worth", () => {
-    expect(contractInfo.ledger.length).toBeLessThanOrEqual(30);
+describe("the state tree stays THREE chunks wide", () => {
+  it("holds at most 45 fields, the three chunks' worth", () => {
+    expect(contractInfo.ledger.length).toBeLessThanOrEqual(45);
   });
 
-  it("uses exactly two chunks, at depth 2", () => {
+  it("uses exactly three chunks, at depth 2", () => {
     const chunks = new Set(contractInfo.ledger.map((field) => field.index[0]));
     const depths = new Set(contractInfo.ledger.map((field) => field.index.length));
 
-    expect([...chunks].sort()).toEqual([0, 1]);
+    expect([...chunks].sort()).toEqual([0, 1, 2]);
     expect([...depths]).toEqual([2]);
   });
 });

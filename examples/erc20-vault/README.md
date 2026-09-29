@@ -168,9 +168,11 @@ Integrating the vault with the Sig Network MPC consists of 4 once-off
 own per-request **runtime** steps, documented flow by flow in the walkthrough
 pages listed under [The flows](#the-flows). Each Compact snippet is abridged
 from [`contract/src/erc20-vault.compact`](contract/src/erc20-vault.compact),
-which is laid out in banner sections: `Ledger state`, `Shared helpers`,
-`Initialisation and configuration`, then one section per request kind
-(`Deposit`, `Withdraw`, `Swap`, `Supply`, `Redeem`). Each snippet keeps the
+which is laid out in banner sections: `Configuration`, the admin sections
+that send no EVM transaction (`Initialisation`, `Gas settings`), the
+`Request queue` every action shares, the admin actions that do
+(`Replace nonce`, `Approve`), then the application's actions (`Deposit`,
+`Withdraw`, `Swap`, `Supply`). Each snippet keeps the
 declaration and circuit names of the code it abridges, so searching one of
 those names reaches the full code in its section. Each off-chain snippet has
 an executable counterpart in
