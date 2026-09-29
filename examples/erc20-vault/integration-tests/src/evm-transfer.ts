@@ -1,12 +1,8 @@
 // EVM value helpers shared by the vault flows.
 
-// EIP-1559 gas parameters for the ERC20 transfers the MPC signs. An ERC20
-// transfer costs ~50-65k gas; the fee caps are generous.
-// Double duty: the gas envelope the deposit flow CHOOSES (the caller's
-// account pays those), and the TS mirror of the envelope the CONTRACT FIXES
-// for withdrawals (the vault account pays those) — the values MUST stay in
-// lockstep with withdraw in erc20-vault.compact, or the withdraw
-// expected-record check fails.
+// EIP-1559 gas parameters for the deposit sweep the MPC signs: the envelope the
+// deposit flow chooses at startDeposit, which the caller's derived account pays.
+// An ERC20 transfer costs ~50-65k gas, and the fee caps are generous.
 
 /**
  * The ERC20 `transfer(address,uint256)` selector, as broadcast (big-endian).

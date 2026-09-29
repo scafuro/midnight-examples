@@ -20,7 +20,7 @@ export interface PollSignatureResponseOptions {
   /**
    * EVM address the MPC's signature must recover to — the request's derived
    * sender. Deposit requests are signed by the user's derived account
-   * (`context.evmUserAddress`); withdraw requests by the VAULT's
+   * (`context.evmUserAddress`), and every other request by the VAULT's
    * (`context.evmVaultAddress`). Always explicit: this flow is generic over
    * request kinds, and which account signs is the caller's knowledge.
    */

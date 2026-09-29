@@ -308,11 +308,9 @@ function ensureRespondOutputSource(env: NodeJS.ProcessEnv): void {
 }
 
 /**
- * Refuse an `EVM_RPC_URL` without `debug_traceTransaction` when the deposit
- * and withdraw polls recompute attested outputs from the trace. Under
- * `mpc-cache` those polls read the MPC's output cache, so a non-tracing
- * endpoint is accepted; the swap, supply and redeem polls always trace, and
- * their specs fail on such an endpoint at the poll.
+ * Refuse an `EVM_RPC_URL` without `debug_traceTransaction` when the attestation
+ * polls recompute attested outputs from the trace. Under `mpc-cache` every poll
+ * reads the MPC's output cache, so a non-tracing endpoint is accepted.
  *
  * @param env - The suite's env accumulator (reads `RESPOND_OUTPUT_SOURCE` and `EVM_RPC_URL`).
  * @throws {Error} If the source is the EVM node and the endpoint refuses the method.

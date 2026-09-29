@@ -8,9 +8,8 @@
 // The unviable attestation needs an ARCHIVE Sepolia RPC behind the anvil fork: the
 // fakenet responder finds the block that consumed the replaced nonce by bisecting
 // the account's nonce over chain history. The replacement's executed attestation
-// carries the success value the MPC synthesises for a plain transfer, which only the
-// MPC output cache yields (see completeReplaceNonce), so that one poll reads the
-// cache whatever RESPOND_OUTPUT_SOURCE says.
+// carries the success value the MPC synthesises for a plain transfer, which returns
+// no data: the poll recomputes it from the respond schema (see completeReplaceNonce).
 //
 // Run AFTER tests/happy-day-e2e.test.ts (FILE_ORDER): initialise lives there, and
 // the session's identity must be the deployer's (the setup defaults
