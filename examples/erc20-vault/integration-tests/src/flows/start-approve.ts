@@ -34,7 +34,7 @@ import {
 
 import { logEvmFeeCap } from "../evm-logging.ts";
 import { ERC20_APPROVE_SELECTOR } from "../evm-transfer.ts";
-import { VAULT_MPC_ROUTING } from "../mpc-routing.ts";
+import { VAULT_RESPONSE_MPC_ROUTING } from "../mpc-routing.ts";
 import type { VaultContext } from "../vault-context.ts";
 import { flushUntil } from "./vault-queue.ts";
 
@@ -92,7 +92,7 @@ async function flushAndSendApprove(
     sender: { bytes: hexToBytes(stripHexPrefix(context.vaultContractAddress)) },
     keyVersion: SIGNET_DEFAULT_KEY_VERSION,
     path: VAULT_PATH_BYTES,
-    ...VAULT_MPC_ROUTING,
+    ...VAULT_RESPONSE_MPC_ROUTING,
     txParamType: TxParamType.evmType2,
     txParams: {
       to: approval.erc20Address,

@@ -31,7 +31,7 @@ import {
   ERC20_TRANSFER_MAX_PRIORITY_FEE_PER_GAS,
   ERC20_TRANSFER_SELECTOR,
 } from "../evm-transfer.ts";
-import { VAULT_MPC_ROUTING } from "../mpc-routing.ts";
+import { VAULT_RESPONSE_MPC_ROUTING } from "../mpc-routing.ts";
 import type { VaultContext } from "../vault-context.ts";
 import { flushUntil } from "./vault-queue.ts";
 
@@ -61,7 +61,7 @@ export interface StartDepositOptions {
  * and even the derivation path, which is the caller's identity commitment
  * recomputed in-circuit) is contract-composed from the initialise-pinned
  * config. The expected event record is reconstructed off-chain (chain fields
- * read from the ledger, routing from the {@link VAULT_MPC_ROUTING} mirror),
+ * read from the ledger, routing from the {@link VAULT_RESPONSE_MPC_ROUTING} mirror),
  * its id computed with the library's `calculateRequestId` TS twin, and
  * asserted present as a ledger map key after the call.
  *
@@ -138,7 +138,7 @@ export async function startDeposit(
     sender: { bytes: hexToBytes(stripHexPrefix(context.vaultContractAddress)) },
     keyVersion,
     path: context.identity.commitment,
-    ...VAULT_MPC_ROUTING,
+    ...VAULT_RESPONSE_MPC_ROUTING,
     txParamType: TxParamType.evmType2,
     txParams: {
       to: erc20,

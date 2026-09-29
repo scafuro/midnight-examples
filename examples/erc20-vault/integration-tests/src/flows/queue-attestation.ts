@@ -34,7 +34,7 @@ export async function queueAndFlushAttestation(
     !ledger.outputAttestationBuffer.member(requestId)
   ) {
     const output = outcome.serializedOutput;
-    if (output.length > 1) {
+    if (output.length > 1 && output.length !== 8) {
       throw new Error(
         `no queue circuit takes a ${String(output.length)}-byte output (request ${requestIdHex(requestId)})`,
       );
@@ -43,7 +43,9 @@ export async function queueAndFlushAttestation(
     const queued =
       output.length === 0
         ? await context.vault.callTx.queueAttestation0(attestation, output)
-        : await context.vault.callTx.queueAttestation1(attestation, output);
+        : output.length === 1
+          ? await context.vault.callTx.queueAttestation1(attestation, output)
+          : await context.vault.callTx.queueAttestation8(attestation, output);
     console.log(`attestation queued in tx ${queued.public.txId}`);
   }
   await flushUntil(context, (state) => state.outputAttestationBuffer.member(requestId), {

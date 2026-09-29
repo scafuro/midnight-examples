@@ -25,7 +25,7 @@ import {
 } from "@sig-net/midnight-examples-erc20-vault-contract";
 
 import { logEvmFeeCap } from "../evm-logging.ts";
-import { VAULT_MPC_ROUTING } from "../mpc-routing.ts";
+import { VAULT_RESPONSE_MPC_ROUTING } from "../mpc-routing.ts";
 import type { VaultContext } from "../vault-context.ts";
 import { flushUntil } from "./vault-queue.ts";
 
@@ -102,7 +102,7 @@ export async function startReplaceNonce(
     sender: { bytes: hexToBytes(stripHexPrefix(context.vaultContractAddress)) },
     keyVersion,
     path: VAULT_PATH_BYTES,
-    ...VAULT_MPC_ROUTING,
+    ...VAULT_RESPONSE_MPC_ROUTING,
     txParamType: TxParamType.evmType2,
     txParams: {
       to: before.vaultEvmAddress,
