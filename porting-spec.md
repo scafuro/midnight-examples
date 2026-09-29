@@ -34,8 +34,11 @@ task is the first unticked one whose dependencies are ticked.
       tests dropped)
 - [x] **S2** SDK flush tests (`bf0d6a6`, 24 tests over a fake chain, 18
       mutations of `vault-queue.ts` caught)
-- [ ] **S3** Live concurrency and time budget
-- [ ] **S4** Documentation sweep
+- [x] **S3** Live concurrency (`94fc0d3`, `concurrent-flush-e2e` passed 10/10
+      twice in a row, one lost flush per race recovered, no error 170. The
+      time-budget measurement moved to F1)
+- [x] **S4** Documentation sweep (`079296a`, every doc but the diagrams: see
+      `image-fixing-todos.md`)
 - [ ] **F1** Put back benchmarking (follow-up)
 
 ## 1. Context

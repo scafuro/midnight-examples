@@ -743,9 +743,10 @@ ids in banners as it goes, for recovering a run that died mid-flow.
 | `swap-refund-e2e` | 8 | A swap that reverts on its input cap re-mints the burned `amountInMaximum` | `SWAP_REFUND_DEPOSIT_REQUEST_ID` / `SWAP_REFUND_SWAP_REQUEST_ID` |
 | `redeem-refund-e2e` | 10 | A redeem whose wrapper redeem reverts re-mints the burned shares | `REDEEM_REFUND_DEPOSIT_REQUEST_ID` / `REDEEM_REFUND_SUPPLY_REQUEST_ID` / `REDEEM_REFUND_REDEEM_REQUEST_ID` |
 | `admin-replace-nonce-e2e` | 12 | The deployer replaces an unbroadcast withdrawal's nonce with a self-transfer, and the withdrawal, attested unviable, re-mints its burned vault tokens | `REPLACE_NONCE_DEPOSIT_REQUEST_ID` / `REPLACE_NONCE_WITHDRAW_REQUEST_ID` / `REPLACE_NONCE_REPLACEMENT_REQUEST_ID` |
+| `concurrent-flush-e2e` | 10 | Two wallets race to flush the same items: the user's transactions never fail, the losing flush is retried, and a lone canary deposit afterwards shows the stack is healthy. Runs last, as its concurrent load is the most likely to strain the local stack | `CONCURRENT_FLUSH_DEPOSIT_REQUEST_ID` / `CONCURRENT_FLUSH_CANARY_REQUEST_ID` |
 
-120 tests total across these specs. The six offline specs (51 tests, no stack
-needed) are not pinned and run after them, so a full run reports 171. The
+130 tests total across these specs. The six offline specs (51 tests, no stack
+needed) are not pinned and run after them, so a full run reports 181. The
 suite runs against a Sepolia fork, and the setup pipeline
 verifies that the Uniswap router and the stataUSDC wrapper are deployed on it
 before any spec runs, so a fork missing either fails the run at setup with an
