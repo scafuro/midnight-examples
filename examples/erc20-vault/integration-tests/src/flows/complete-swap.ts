@@ -2,8 +2,9 @@
 // flush it, then settle through `completeSwap` with the request id, the output
 // bytes the attestation signs, and two fresh RANDOM mint nonces so neither minted
 // coin can be linked back to the request or to the other.
-import { bytesToBigint, OutputKind, type RequestIdHex, requestIdHex } from "@sig-net/midnight";
+import { OutputKind, type RequestIdHex, requestIdHex } from "@sig-net/midnight";
 import {
+  pureCircuits,
   readVaultLedger,
   type SwapRequest,
   VAULT_SWAP_REQUESTS_PATH,
@@ -14,25 +15,6 @@ import type { VaultContext } from "../vault-context.ts";
 import { pollRespondBidirectional } from "./poll-respond-bidirectional.ts";
 import { queueAndFlushAttestation } from "./queue-attestation.ts";
 import type { RespondOutcome } from "./respond-output.ts";
-
-/**
- * The input an executed swap spent, read from its attested output. The swap's
- * respond schema packs `amountIn` as a uint64, 8 little-endian bytes, which is
- * the layout `completeSwap` deserialises as a Compact `Uint<64>`.
- *
- * @param outcome - The attested outcome of a swap from {@link pollRespondBidirectional}.
- * @returns The attested `amountIn`, or `undefined` when the swap never executed.
- * @throws {Error} If an executed outcome's output is not 8 bytes.
- */
-export function swapAmountIn(outcome: RespondOutcome): bigint | undefined {
-  if (outcome.event.outputKind !== OutputKind.executed) return undefined;
-  if (outcome.serializedOutput.length !== 8) {
-    throw new Error(
-      `an executed swap attests an 8-byte amountIn; got ${String(outcome.serializedOutput.length)} bytes`,
-    );
-  }
-  return bytesToBigint(outcome.serializedOutput);
-}
 
 /** What {@link settleSwap} settled. */
 export interface SwapSettlement {
@@ -82,7 +64,10 @@ export async function settleSwap(
   const { entry } = ledger.outputRequestBuffer.lookup(ledger.evictionMap.lookup(requestId));
   const { request } = ledger.swapArgsMap.lookup(entry.inIndex);
 
-  const amountIn = swapAmountIn(outcome);
+  const amountIn =
+    outcome.event.outputKind === OutputKind.executed
+      ? pureCircuits.swapAmountIn(outcome.serializedOutput)
+      : undefined;
   console.log(
     amountIn === undefined
       ? `the MPC attested the swap as ${OutputKind[outcome.event.outputKind]}: ` +

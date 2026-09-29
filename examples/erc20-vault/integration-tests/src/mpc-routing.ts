@@ -1,9 +1,9 @@
 // The CONTRACT-FIXED MPC routing of every vault SignBidirectionalEvent, needed to
 // rebuild expected event records off-chain: TS mirrors of the vault contract's
 // in-circuit constants, which MUST stay in lockstep with erc20-vault.compact, and
-// the swap's and the supply's schemas read from its compiled pure circuits. The vault contract
-// package's round-trip simulator tests assert the same values against the real
-// compiled contract.
+// the swap's, the supply's and the redeem's schemas read from its compiled pure
+// circuits. The vault contract package's round-trip simulator tests assert the
+// same values against the real compiled contract.
 
 import {
   asciiPadded,
@@ -17,11 +17,10 @@ import { pureCircuits as vaultCircuits } from "@sig-net/midnight-examples-erc20-
 /**
  * What the MPC reports back about an ERC20 `transfer` or `approve`, and about a
  * plain transfer: a single bool. Serves as both the output-deserialization and
- * the respond-serialization schema of every vault event except a swap's and a
- * supply's. Stored
- * at its EXACT byte width (schemas are exact-width by protocol convention, never
- * zero-padded: off-chain readers recover the declared width from the stored
- * bytes).
+ * the respond-serialization schema of every vault event except a swap's, a
+ * supply's and a redeem's. Stored at its EXACT byte width (schemas are
+ * exact-width by protocol convention, never zero-padded: off-chain readers
+ * recover the declared width from the stored bytes).
  */
 export const ERC20_TRANSFER_RESULT_SCHEMA = '[{"name":"success","type":"bool"}]';
 
@@ -50,8 +49,8 @@ export interface VaultMpcRouting {
 
 /**
  * The routing the vault contract bakes into every event it records except a
- * swap's and a supply's: ECDSA, an unused signature destination, no extras, the MPC's Ethereum
- * routing key as the execution destination, and
+ * swap's, a supply's and a redeem's: ECDSA, an unused signature destination,
+ * no extras, the MPC's Ethereum routing key as the execution destination, and
  * {@link ERC20_TRANSFER_RESULT_SCHEMA} in both directions.
  */
 export const TRANSFER_RESULT_MPC_ROUTING: VaultMpcRouting = {
@@ -89,4 +88,15 @@ export const SUPPLY_MPC_ROUTING: VaultMpcRouting = {
   ...TRANSFER_RESULT_MPC_ROUTING,
   outputDeserializationSchema: vaultCircuits.supplyOutputSchema(),
   respondSerializationSchema: vaultCircuits.supplyRespondSchema(),
+};
+
+/**
+ * The routing of a redeem event: {@link TRANSFER_RESULT_MPC_ROUTING}'s fields
+ * with the redeem's own schemas, which decode the wrapper `redeem`'s uint256
+ * assets and pack them as a uint64.
+ */
+export const REDEEM_MPC_ROUTING: VaultMpcRouting = {
+  ...TRANSFER_RESULT_MPC_ROUTING,
+  outputDeserializationSchema: vaultCircuits.redeemOutputSchema(),
+  respondSerializationSchema: vaultCircuits.redeemRespondSchema(),
 };
