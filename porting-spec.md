@@ -25,14 +25,15 @@ task is the first unticked one whose dependencies are ticked.
 - [x] **P1a** Approvals (router and stata) (`372965d`, all 123 tests on a
       fresh vault `6505fd4a…1300f1`, fakenet 0.30.0)
 - [x] **P1b** Nonce replacement (`372965d`, same run)
-- [ ] **P2a** Swap (merged in `e3152b0`, e2e on a fresh vault in progress)
-- [ ] **P2b** Supply (merged in `e3152b0`, e2e on a fresh vault in progress)
-- [ ] **P3** Redeem, with the width-8 pure decoders (merged in `e3152b0`, e2e
-      on a fresh vault in progress)
+- [x] **P2a** Swap (`e3152b0`, all 171 tests on a fresh vault
+      `39732880…aa31b83`, fakenet 0.31.0)
+- [x] **P2b** Supply (`e3152b0`, same run)
+- [x] **P3** Redeem, with the width-8 pure decoders (`e3152b0`, same run)
 - [x] **S1** Contract unit test sweep (`cb740fc`, 411 contract tests, every
       assert and `requireInitialised` site caught when disabled, chunk-shape
       tests dropped)
-- [ ] **S2** SDK flush tests
+- [x] **S2** SDK flush tests (`bf0d6a6`, 24 tests over a fake chain, 18
+      mutations of `vault-queue.ts` caught)
 - [ ] **S3** Live concurrency and time budget
 - [ ] **S4** Documentation sweep
 
