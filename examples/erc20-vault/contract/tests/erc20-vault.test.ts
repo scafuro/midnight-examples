@@ -64,6 +64,7 @@ import {
   queuedRequestKey,
   VAULT_APPROVE_REQUESTS_PATH,
   VAULT_DEPOSIT_REQUESTS_PATH,
+  VAULT_REDEEM_REQUESTS_PATH,
   VAULT_REPLACE_NONCE_REQUESTS_PATH,
   VAULT_SUPPLY_REQUESTS_PATH,
   VAULT_SWAP_REQUESTS_PATH,
@@ -4060,6 +4061,557 @@ describe("completeSupply settle", () => {
   });
 });
 
+// ---- Redeem fixtures ----
+
+// The ERC-4626 redeem(uint256,address,address) selector: the TS mirror of the literal
+// `Bytes [0xba, 0x08, 0x76, 0x52]` hardcoded in erc20-vault.compact.
+const STATA_REDEEM_SELECTOR = new Uint8Array([0xba, 0x08, 0x76, 0x52]);
+
+// The redeem's schemas at their exact contract-declared widths: the round trip below
+// is the lockstep check for the compiled redeemOutputSchema and redeemRespondSchema.
+const REDEEM_OUTPUT_SCHEMA = asciiPadded('[{"name":"assets","type":"uint256"}]', 36);
+const REDEEM_RESPOND_SCHEMA = asciiPadded('[{"name":"assets","type":"uint64"}]', 35);
+
+// The shares a redeem surrenders, distinct from AMOUNT so the round trip shows the
+// request's own field reaching the calldata.
+const REDEEM_SHARES = 360_679n;
+
+// The underlying assets an executed redeem is attested with (principal plus accrued
+// interest), packed by the compiled respond schema to its 8-byte width, the way the
+// MPC packs them.
+const REDEEM_ASSETS = 2_780_944n;
+const OUTPUT_REDEEM = serializeRespondOutput(pureCircuits.redeemRespondSchema(), {
+  assets: REDEEM_ASSETS,
+});
+
+// completeRedeem takes an 8-byte output on every verdict and ignores it on a failure.
+const OUTPUT_REDEEM_IGNORED = new Uint8Array(8);
+
+/**
+ * A redeem's `startRedeem` arguments: the input index, the `RedeemRequest` and the
+ * surrendered wrapper coin. The nonce and gas are the vault's, and the contract
+ * pins both token addresses, so the caller passes none of them.
+ */
+interface RedeemCallArgs {
+  inIndex: bigint;
+  redeem: { shares: bigint };
+  coin: ReturnType<typeof vaultCoin>;
+}
+
+/**
+ * Known-good redeem call args, the base every test varies from.
+ * Shared across tests: NEVER mutate. Build a variation as an explicit spread
+ * of this base with the delta inline (see {@link REDEEM_REJECTION_CASES}).
+ */
+const VALID_REDEEM: RedeemCallArgs = {
+  inIndex: 41n,
+  redeem: { shares: REDEEM_SHARES },
+  coin: vaultCoin(REDEEM_SHARES, STATA_TOKEN_COLOR),
+};
+
+// The gas every redeem copies at start: the vault's default fees at its redeem limit.
+const DEFAULT_REDEEM_GAS = { ...DEFAULT_VAULT_GAS, gasLimit: 500_000n };
+
+/** Queue a redeem: startRedeem with its args in circuit order. */
+const queueRedeem = (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  args: RedeemCallArgs,
+) => contract.circuits.startRedeem(ctx, args.inIndex, args.redeem, args.coin);
+
+/** Queue, flush and send a redeem, returning the send's context and the request key. */
+const redeem = async (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  args: RedeemCallArgs,
+) => {
+  const queued = (await queueRedeem(contract, ctx, args)).context;
+  const flushed = await flush(contract, queued, [args.inIndex], []);
+  const outKey = flushedRequestKey(ledgerOf(flushed), Action.redeem, args.inIndex);
+  const sent = await contract.circuits.sendRedeem(flushed, outKey);
+  return { context: sent.context, outKey };
+};
+
+// ---- Redeem tests ----
+
+describe("redeem round-trip", () => {
+  it("stores a vault-path stataToken redeem built from the flushed entry and its args", async () => {
+    const { contract, ctx } = await deployInitialised();
+
+    const { context: next, outKey } = await redeem(contract, ctx, VALID_REDEEM);
+    const state = next.callContext.currentQueryContext.state;
+
+    const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalRedeemMap);
+    const rawLedger = readSignetRequestsLedgerFromState(state, VAULT_REDEEM_REQUESTS_PATH);
+    expect(typedIndex.size).toBe(1);
+    expect(rawLedger.requestsIndex).toEqual(typedIndex);
+    const [idHex, record] = first(typedIndex.entries(), "indexed redeem request");
+
+    // The notification names THIS vault and the bidirectionalRedeemMap.
+    const notificationEvent = first(
+      decodeSignetLogEvents(next.events, SIGNET_ADDRESS),
+      "signet notification event",
+    );
+    expect(notificationEvent.name).toBe(SignetEventName.SignBidirectionalEvent);
+    const notificationPost = decodeSignBidirectionalEventNotificationPayload(
+      notificationEvent.payload,
+    );
+    expect(requestIdHex(notificationPost.requestId)).toBe(idHex);
+    expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
+      version: 1,
+      callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
+      requestsPath: [...VAULT_REDEEM_REQUESTS_PATH],
+    });
+
+    // The vault's own account signs a call to the pinned wrapper at the first
+    // nonce the flush assigned, under the vault's redeem gas copied at start.
+    expect(record.sender).toEqual({ bytes: VAULT_ADDRESS_BYTES });
+    expect(record.path).toEqual(asciiPadded("vault", 32));
+    const { calldata, ...envelope } = record.txParams;
+    expect(envelope).toEqual({
+      to: STATA_TOKEN,
+      chainId: CHAIN_ID,
+      nonce: 0n,
+      ...DEFAULT_REDEEM_GAS,
+      value: 0n,
+      accessListEntryCount: 0n,
+      accessList: [],
+    });
+    expect(record.executionDest).toEqual(EXPECTED_ROUTING.executionDest);
+    expect(record.keyVersion).toBe(MPC_KEY_VERSION);
+    expect(record.algo).toBe(EXPECTED_ROUTING.algo);
+    expect(record.signatureDest).toBe(EXPECTED_ROUTING.signatureDest);
+    expect(record.params).toEqual(EXPECTED_ROUTING.params);
+    expect(record.txParamType).toBe(TxParamType.evmType2);
+    expect(record.outputDeserializationSchema).toEqual(REDEEM_OUTPUT_SCHEMA);
+    expect(record.respondSerializationSchema).toEqual(REDEEM_RESPOND_SCHEMA);
+
+    // Contract-built calldata: redeem(shares, receiver = owner = the vault's own account).
+    expect(calldata.is_some).toBe(true);
+    expect(calldata.value.selector).toEqual(STATA_REDEEM_SELECTOR);
+    expect(calldata.value.noWords).toBe(3n);
+    expect(calldata.value.words).toHaveLength(3);
+    expect(calldata.value.words[0]).toEqual(numericAbiWord(REDEEM_SHARES));
+    expect(calldata.value.words[1]).toEqual(evmAddressAbiWord(VAULT_EVM));
+    expect(calldata.value.words[2]).toEqual(evmAddressAbiWord(VAULT_EVM));
+
+    expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
+
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    expect(entry).toEqual({
+      action: Action.redeem,
+      nonceIsVault: true,
+      evmNonce: 0n,
+      inIndex: VALID_REDEEM.inIndex,
+      commitment: pureCircuits.ownershipCommitment(VALID_REDEEM.inIndex, SECRET_KEY),
+      argsHash: expect.any(Uint8Array) as Uint8Array,
+    });
+    expect(lastSeen).toBe(EVM_START_HEIGHT);
+    expect(ledger(state).redeemArgsMap.lookup(VALID_REDEEM.inIndex)).toEqual({
+      request: VALID_REDEEM.redeem,
+      gas: DEFAULT_REDEEM_GAS,
+    });
+    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+    expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
+    expect(ledger(state).globalEvmNonce).toBe(1n);
+  });
+
+  it("start burns the surrendered wrapper coin: received by the vault, then paid in full to the burn address", async () => {
+    const { contract, ctx } = await deployInitialised();
+
+    const started = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
+    const zswap = zswapState(started);
+
+    expect(zswap.inputs).toHaveLength(1);
+    const consumed = first(zswap.inputs, "consumed coin");
+    expect(consumed.color).toEqual(STATA_TOKEN_COLOR);
+    expect(consumed.value).toBe(REDEEM_SHARES);
+
+    expect(zswap.outputs).toHaveLength(2);
+    const received = first(
+      zswap.outputs.filter((output) => !output.recipient.is_left),
+      "contract-owned receive output",
+    );
+    expect(received.recipient.right.bytes).toEqual(VAULT_ADDRESS_BYTES);
+    expect(received.coinInfo).toEqual({
+      nonce: consumed.nonce,
+      color: consumed.color,
+      value: consumed.value,
+    });
+    const burnOutput = first(
+      zswap.outputs.filter((output) => output.recipient.is_left),
+      "burn output",
+    );
+    expect(burnOutput.coinInfo.color).toEqual(STATA_TOKEN_COLOR);
+    expect(burnOutput.coinInfo.value).toBe(REDEEM_SHARES);
+    expect(burnOutput.recipient.left.bytes).toEqual(BURN_ADDRESS_BYTES);
+  });
+
+  it("a redeem flushed behind a supply takes the next vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedSupply = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+    const queuedBoth = (await queueRedeem(contract, queuedSupply, VALID_REDEEM)).context;
+
+    const flushed = await flush(
+      contract,
+      queuedBoth,
+      [VALID_SUPPLY.inIndex, VALID_REDEEM.inIndex],
+      [],
+    );
+
+    const state = ledgerOf(flushed);
+    const supplyKey = flushedRequestKey(state, Action.supply, VALID_SUPPLY.inIndex);
+    const redeemKey = flushedRequestKey(state, Action.redeem, VALID_REDEEM.inIndex);
+    expect(state.outputRequestBuffer.lookup(supplyKey).entry.evmNonce).toBe(0n);
+    expect(state.outputRequestBuffer.lookup(redeemKey).entry.evmNonce).toBe(1n);
+    expect(state.globalEvmNonce).toBe(2n);
+  });
+});
+
+/** One row of the redeem rejection table: full inputs to expected error. */
+interface RedeemRejectionCase {
+  /** Test name, completing the sentence "rejects <name>". */
+  name: string;
+  /** Complete call args passed to startRedeem. */
+  args: RedeemCallArgs;
+  /** Error startRedeem must throw. */
+  throws: RegExp;
+}
+
+const REDEEM_REJECTION_CASES: RedeemRejectionCase[] = [
+  {
+    name: "zero shares",
+    args: {
+      ...VALID_REDEEM,
+      redeem: { shares: 0n },
+      coin: vaultCoin(0n, STATA_TOKEN_COLOR),
+    },
+    throws: /shares must be positive/,
+  },
+  {
+    name: "shares above Uint<64> max (unrefundable)",
+    args: {
+      ...VALID_REDEEM,
+      redeem: { shares: UINT64_MAX + 1n },
+      coin: vaultCoin(UINT64_MAX + 1n, STATA_TOKEN_COLOR),
+    },
+    throws: /shares exceeds Uint<64> max/,
+  },
+  {
+    name: "a coin of the underlying's colour, not the wrapper's",
+    args: { ...VALID_REDEEM, coin: vaultCoin(REDEEM_SHARES, STATA_UNDERLYING_COLOR) },
+    throws: /Coin is not the vault token for the wrapper/,
+  },
+  {
+    name: "a coin whose value differs from the shares",
+    args: { ...VALID_REDEEM, coin: vaultCoin(REDEEM_SHARES + 1n, STATA_TOKEN_COLOR) },
+    throws: /Coin value must equal shares/,
+  },
+];
+
+describe("redeem validation", () => {
+  it.each(REDEEM_REJECTION_CASES)("rejects $name", async ({ args, throws }) => {
+    const { contract, ctx } = await deployInitialised();
+    await expect(queueRedeem(contract, ctx, args)).rejects.toThrow(throws);
+  });
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(queueRedeem(contract, ctx, VALID_REDEEM)).rejects.toThrow(/Not initialised/);
+  });
+
+  it("rejects an index the input buffer holds", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
+    await expect(queueRedeem(contract, queued, VALID_REDEEM)).rejects.toThrow(
+      /Index already in use/,
+    );
+  });
+
+  it("rejects an index another action's queued request holds", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+    await expect(
+      queueRedeem(contract, queued, { ...VALID_REDEEM, inIndex: VALID_SUPPLY.inIndex }),
+    ).rejects.toThrow(/Index already in use/);
+  });
+
+  it("rejects an index the flush freed while its args stay in redeemArgsMap", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
+    const flushed = await flush(contract, queued, [VALID_REDEEM.inIndex], []);
+    expect(ledgerOf(flushed).inputRequestBuffer.member(VALID_REDEEM.inIndex)).toBe(false);
+    await expect(queueRedeem(contract, flushed, VALID_REDEEM)).rejects.toThrow(
+      /Index already in use/,
+    );
+  });
+});
+
+describe("sendRedeem", () => {
+  it("is permissionless: a stranger sends the redeemer's request as queued", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
+    const flushed = await flush(contract, queued, [VALID_REDEEM.inIndex], []);
+    const outKey = flushedRequestKey(ledgerOf(flushed), Action.redeem, VALID_REDEEM.inIndex);
+
+    const sent = (
+      await contract.circuits.sendRedeem(await strangerContext("sendRedeem", flushed), outKey)
+    ).context;
+    const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalRedeemMap);
+    expect(index.size).toBe(1);
+    const record = first(index.values(), "redeem request");
+    expect(record.path).toEqual(asciiPadded("vault", 32));
+    expect(record.txParams.nonce).toBe(0n);
+  });
+
+  it("rejects a key the flush has not moved", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
+    await expect(contract.circuits.sendRedeem(queued, bytes(32, 0x5a))).rejects.toThrow(
+      /Request not flushed/,
+    );
+  });
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(contract.circuits.sendRedeem(ctx, bytes(32, 0x5a))).rejects.toThrow(
+      /Not initialised/,
+    );
+  });
+
+  it("rejects a second send of the same request", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const { context: sent, outKey } = await redeem(contract, ctx, VALID_REDEEM);
+    await expect(contract.circuits.sendRedeem(sent, outKey)).rejects.toThrow(
+      /Request already sent/,
+    );
+  });
+
+  it("rejects a flushed supply's key, and sendSupply rejects a flushed redeem's", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedSupply = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
+    const queuedBoth = (await queueRedeem(contract, queuedSupply, VALID_REDEEM)).context;
+    const flushed = await flush(
+      contract,
+      queuedBoth,
+      [VALID_SUPPLY.inIndex, VALID_REDEEM.inIndex],
+      [],
+    );
+    const supplyKey = flushedRequestKey(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
+    const redeemKey = flushedRequestKey(ledgerOf(flushed), Action.redeem, VALID_REDEEM.inIndex);
+
+    await expect(contract.circuits.sendRedeem(flushed, supplyKey)).rejects.toThrow(/Wrong action/);
+    await expect(contract.circuits.sendSupply(flushed, redeemKey)).rejects.toThrow(/Wrong action/);
+  });
+});
+
+/**
+ * Deploy + initialise + redeem(VALID_REDEEM): the arrange step of every
+ * complete-redeem test. Returns the sent redeem's request id (the single redeem
+ * map key) alongside the threaded context.
+ */
+const redeemRequested = async () => {
+  const { contract, ctx } = await deployInitialised();
+  const { context: next } = await redeem(contract, ctx, VALID_REDEEM);
+  const index = toSignBidirectionalEventIndex(ledgerOf(next).bidirectionalRedeemMap);
+  const idHex = first(index.keys(), "redeem request id");
+  return { contract, ctx: next, requestId: requestIdBytes(idHex) };
+};
+
+/** Arrange a flushed attestation of the given verdict for the requested redeem. */
+interface RedeemVerdictCase {
+  /** Test name, completing the sentence "<name> and consumes the request". */
+  name: string;
+  /** The verdict the MPC attests. */
+  outputKind: OutputKind;
+  /** The output the MPC signs (empty under a failure kind). */
+  signedOutput: Uint8Array;
+  /** The output completeRedeem is passed. */
+  presentedOutput: Uint8Array;
+  /** The mints completeRedeem must request. */
+  mints: [string, bigint][];
+}
+
+const REDEEM_VERDICT_CASES: RedeemVerdictCase[] = [
+  {
+    name: "an executed redeem mints the attested assets as the underlying's vault token",
+    outputKind: OutputKind.executed,
+    signedOutput: OUTPUT_REDEEM,
+    presentedOutput: OUTPUT_REDEEM,
+    mints: [[STATA_UNDERLYING_MINT_KEY, REDEEM_ASSETS]],
+  },
+  {
+    name: "a reverted redeem (failed) re-mints the surrendered shares",
+    outputKind: OutputKind.failed,
+    signedOutput: OUTPUT_EMPTY,
+    presentedOutput: OUTPUT_REDEEM_IGNORED,
+    mints: [[STATA_TOKEN_MINT_KEY, REDEEM_SHARES]],
+  },
+  {
+    name: "a redeem whose nonce another transaction took (unviable) re-mints the surrendered shares",
+    outputKind: OutputKind.unviable,
+    signedOutput: OUTPUT_EMPTY,
+    presentedOutput: OUTPUT_REDEEM_IGNORED,
+    mints: [[STATA_TOKEN_MINT_KEY, REDEEM_SHARES]],
+  },
+];
+
+describe("completeRedeem settle", () => {
+  it.each(REDEEM_VERDICT_CASES)(
+    "$name and consumes the request",
+    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+      const { contract, ctx, requestId } = await redeemRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        signedOutput,
+        ATTESTED_HEIGHT,
+      );
+      const attested =
+        outputKind === OutputKind.executed
+          ? await attest8(contract, ctx, attestation, signedOutput)
+          : await attestFailure(contract, ctx, attestation);
+
+      const next = (
+        await contract.circuits.completeRedeem(attested, requestId, presentedOutput, MINT_NONCE)
+      ).context;
+
+      expect(shieldedMintsOf(next)).toEqual(mints);
+      const state = ledgerOf(next);
+      expect(state.bidirectionalRedeemMap.isEmpty()).toBe(true);
+      expect(state.redeemArgsMap.isEmpty()).toBe(true);
+      expect(state.outputRequestBuffer.isEmpty()).toBe(true);
+      expect(state.outputAttestationBuffer.isEmpty()).toBe(true);
+      expect(state.evictionMap.isEmpty()).toBe(true);
+    },
+  );
+
+  it.each(REDEEM_VERDICT_CASES)(
+    "rejects a caller other than the redeemer when $name",
+    async ({ outputKind, signedOutput, presentedOutput }) => {
+      const { contract, ctx, requestId } = await redeemRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        signedOutput,
+        ATTESTED_HEIGHT,
+      );
+      const attested =
+        outputKind === OutputKind.executed
+          ? await attest8(contract, ctx, attestation, signedOutput)
+          : await attestFailure(contract, ctx, attestation);
+
+      await expect(
+        contract.circuits.completeRedeem(
+          await strangerContext("completeRedeem", attested),
+          requestId,
+          presentedOutput,
+          MINT_NONCE,
+        ),
+      ).rejects.toThrow(/Not the requester/);
+    },
+  );
+
+  it("rejects an asset amount other than the one the execution was attested with", async () => {
+    // Presenting more assets would mint underlying the vault account never received.
+    const { contract, ctx, requestId } = await redeemRequested();
+    const attested = await attest8(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_REDEEM, ATTESTED_HEIGHT),
+      OUTPUT_REDEEM,
+    );
+    await expect(
+      contract.circuits.completeRedeem(
+        attested,
+        requestId,
+        serializeRespondOutput(pureCircuits.redeemRespondSchema(), { assets: REDEEM_ASSETS + 1n }),
+        MINT_NONCE,
+      ),
+    ).rejects.toThrow(/Output does not match the attestation/);
+  });
+
+  it.each([
+    { name: "queueAttestation8", outputKind: OutputKind.executed, output: OUTPUT_REDEEM },
+    { name: "queueAttestation0", outputKind: OutputKind.failed, output: OUTPUT_EMPTY },
+  ])(
+    "$name refuses an attestation at or below the redeem's lastSeen",
+    async ({ outputKind, output }) => {
+      const { contract, ctx, requestId } = await redeemRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        output,
+        EVM_START_HEIGHT,
+      );
+      await expect(
+        outputKind === OutputKind.executed
+          ? contract.circuits.queueAttestation8(ctx, attestation, output)
+          : contract.circuits.queueAttestation0(ctx, attestation, output),
+      ).rejects.toThrow(/Stale attestation/);
+    },
+  );
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(
+      contract.circuits.completeRedeem(ctx, bytes(32, 0x5a), OUTPUT_REDEEM_IGNORED, MINT_NONCE),
+    ).rejects.toThrow(/Not initialised/);
+  });
+
+  it("settles once: a second completeRedeem for the same request rejects", async () => {
+    const { contract, ctx, requestId } = await redeemRequested();
+    const attested = await attest8(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_REDEEM, ATTESTED_HEIGHT),
+      OUTPUT_REDEEM,
+    );
+    const next = (
+      await contract.circuits.completeRedeem(attested, requestId, OUTPUT_REDEEM, MINT_NONCE)
+    ).context;
+    await expect(
+      contract.circuits.completeRedeem(next, requestId, OUTPUT_REDEEM, MINT_NONCE),
+    ).rejects.toThrow(/Request not sent/);
+  });
+
+  it("completeRedeem rejects a supply's request id, and completeSupply a redeem's", async () => {
+    const { contract, ctx, requestId: supplyId } = await supplyRequested();
+    const redeemed = (await redeem(contract, ctx, VALID_REDEEM)).context;
+    const redeemId = requestIdBytes(
+      first(
+        toSignBidirectionalEventIndex(ledgerOf(redeemed).bidirectionalRedeemMap).keys(),
+        "redeem request id",
+      ),
+    );
+    const supplyQueued = (
+      await contract.circuits.queueAttestation8(
+        redeemed,
+        respond(MPC_RESPONSE_SECRET, supplyId, OutputKind.executed, OUTPUT_SUPPLY, ATTESTED_HEIGHT),
+        OUTPUT_SUPPLY,
+      )
+    ).context;
+    const bothQueued = (
+      await contract.circuits.queueAttestation8(
+        supplyQueued,
+        respond(MPC_RESPONSE_SECRET, redeemId, OutputKind.executed, OUTPUT_REDEEM, ATTESTED_HEIGHT),
+        OUTPUT_REDEEM,
+      )
+    ).context;
+    const attested = await flush(contract, bothQueued, [], [supplyId, redeemId]);
+
+    await expect(
+      contract.circuits.completeRedeem(attested, supplyId, OUTPUT_SUPPLY, MINT_NONCE),
+    ).rejects.toThrow(/Wrong action/);
+    await expect(
+      contract.circuits.completeSupply(attested, redeemId, OUTPUT_REDEEM, MINT_NONCE),
+    ).rejects.toThrow(/Wrong action/);
+  });
+});
+
 interface VaultCall {
   contractAddress: string;
   publicTranscript: unknown;
@@ -4297,6 +4849,44 @@ describe("throughput: requests never pin shared state, only the flush does", () 
       flushSlots([VALID_SUPPLY.inIndex], []),
     );
     expect(replay(stateOf(withdrawFlush.context), supplyFlush, true)).toMatch(/^REJECTED/);
+  });
+
+  it("two concurrent startRedeems from different callers both apply", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const alice = await queueRedeem(contract, ctx, VALID_REDEEM);
+    const bobCtx = await strangerContext("startRedeem", ctx);
+    const bob = await queueRedeem(contract, bobCtx, {
+      ...VALID_REDEEM,
+      inIndex: VALID_REDEEM.inIndex + 1n,
+    });
+    expect(replay(stateOf(alice.context), bob, true)).toBe("applied");
+  });
+
+  it("a redeem start applies after a concurrent flush moved the vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    const withdrawFlush = await contract.circuits.flushQueue(
+      queued,
+      flushSlots([VALID_WITHDRAW.inIndex], []),
+    );
+    const redeemStart = await queueRedeem(contract, queued, VALID_REDEEM);
+    expect(ledgerOf(withdrawFlush.context).globalEvmNonce).toBe(1n);
+    expect(replay(stateOf(withdrawFlush.context), redeemStart, true)).toBe("applied");
+  });
+
+  it("a flush moving a redeem conflicts with a concurrent flush moving a withdrawal on the vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedRedeem = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
+    const queuedBoth = (await queueWithdraw(contract, queuedRedeem, VALID_WITHDRAW)).context;
+    const withdrawFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([VALID_WITHDRAW.inIndex], []),
+    );
+    const redeemFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([VALID_REDEEM.inIndex], []),
+    );
+    expect(replay(stateOf(withdrawFlush.context), redeemFlush, true)).toMatch(/^REJECTED/);
   });
 });
 
@@ -4617,6 +5207,35 @@ describe("gas parameters reach the constructed transaction", () => {
       maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
       maxPriorityFeePerGas: DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
       gasLimit: DEFAULT_SUPPLY_GAS_LIMIT,
+    });
+  });
+
+  it("sendRedeem carries the updated fee envelope and the REDEEM gas limit", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const configured = (await setGasParams(contract, ctx, NEW_GAS_PARAMS)).context;
+
+    const next = (await redeem(contract, configured, VALID_REDEEM)).context;
+
+    expect(envelopeOf(ledgerOf(next).bidirectionalRedeemMap)).toEqual({
+      maxFeePerGas: NEW_MAX_FEE_PER_GAS,
+      maxPriorityFeePerGas: NEW_MAX_PRIORITY_FEE_PER_GAS,
+      gasLimit: NEW_REDEEM_GAS_LIMIT,
+    });
+  });
+
+  it("a redeem keeps the gas it was queued with when setGasParams runs before its send", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
+    const flushed = await flush(contract, queued, [VALID_REDEEM.inIndex], []);
+    const outKey = flushedRequestKey(ledgerOf(flushed), Action.redeem, VALID_REDEEM.inIndex);
+    const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
+
+    const sent = (await contract.circuits.sendRedeem(reconfigured, outKey)).context;
+
+    expect(envelopeOf(ledgerOf(sent).bidirectionalRedeemMap)).toEqual({
+      maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
+      maxPriorityFeePerGas: DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+      gasLimit: DEFAULT_REDEEM_GAS_LIMIT,
     });
   });
 

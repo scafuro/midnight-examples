@@ -201,7 +201,7 @@ export circuit setGasParams(
 // Keep at least two variants: a one-variant enum in a hashed struct compiles to a
 // field element the ledger parses as zero bytes, and proofs then fail the proof
 // server's alignment check.
-export enum Action { deposit, withdraw, swap, supply, approve, replaceNonce }
+export enum Action { deposit, withdraw, swap, supply, redeem, approve, replaceNonce }
 
 // The EIP-1559 fee envelope of a request's EVM transaction, fixed at start.
 export struct GasParams {
@@ -470,7 +470,7 @@ export struct ReplaceNonceArgs {
 }
 
 // Nonce replacement requests (no calldata, 34-byte schemas).
-// Compiled path for MPC notification: [2, 3] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [2, 1] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalReplaceNonceMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the replacement queued under it, from start to complete.
@@ -554,11 +554,11 @@ export circuit sendReplaceNonce(outKey: Bytes<32>): [] {
   bidirectionalReplaceNonceMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalReplaceNonceMap's compiled ledger path, [2, 3]).
+  // Notify the MPC (bidirectionalReplaceNonceMap's compiled ledger path, [2, 1]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [2, 3, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [2, 1, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -604,7 +604,7 @@ export struct ApproveArgs {
 }
 
 // Approve requests of both spenders (2-word ERC20 approve, 34-byte schemas).
-// Compiled path for MPC notification: [2, 5] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [2, 3] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalApproveMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the approval queued under it, from start to complete.
@@ -718,11 +718,11 @@ export circuit sendApprove(outKey: Bytes<32>): [] {
   bidirectionalApproveMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalApproveMap's compiled ledger path, [2, 5]).
+  // Notify the MPC (bidirectionalApproveMap's compiled ledger path, [2, 3]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [2, 5, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [2, 3, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -773,7 +773,7 @@ export struct DepositArgs {
 }
 
 // Deposit requests (2-word ERC20 transfer, 34-byte schemas).
-// Compiled path for MPC notification: [2, 7] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [2, 5] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalDepositMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the deposit queued under it, from start to complete.
@@ -865,11 +865,11 @@ export circuit sendDeposit(outKey: Bytes<32>): [] {
   bidirectionalDepositMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [2, 7]).
+  // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [2, 5]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [2, 7, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [2, 5, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -934,7 +934,7 @@ export struct WithdrawArgs {
 }
 
 // Withdraw requests (2-word ERC20 transfer, 34-byte schemas).
-// Compiled path for MPC notification: [2, 9] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [2, 7] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalWithdrawMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 34, 34>;
 
 // inIndex -> the arguments of the withdrawal queued under it, from start to complete.
@@ -1036,11 +1036,11 @@ export circuit sendWithdraw(outKey: Bytes<32>): [] {
   bidirectionalWithdrawMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalWithdrawMap's compiled ledger path, [2, 9]).
+  // Notify the MPC (bidirectionalWithdrawMap's compiled ledger path, [2, 7]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [2, 9, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [2, 7, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -1122,7 +1122,7 @@ struct ExactOutputSingleReturnValue {
 }
 
 // Swap requests (7-word exactOutputSingle, 38-byte output and 37-byte respond schemas).
-// Compiled path for MPC notification: [2, 11] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [2, 9] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalSwapMap: SignBidirectionalEventMapV1<EvmType2TxParams<7, 0, 0>, 38, 37>;
 
 // inIndex -> the arguments of the swap queued under it, from start to complete.
@@ -1238,11 +1238,11 @@ export circuit sendSwap(outKey: Bytes<32>): [] {
   bidirectionalSwapMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalSwapMap's compiled ledger path, [2, 11]).
+  // Notify the MPC (bidirectionalSwapMap's compiled ledger path, [2, 9]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [2, 11, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [2, 9, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -1338,7 +1338,7 @@ export struct SupplyArgs {
 }
 
 // Supply requests (2-word ERC-4626 deposit, 36-byte output and 35-byte respond schemas).
-// Compiled path for MPC notification: [2, 13] (read from managed/erc20-vault/compiler/contract-info.json).
+// Compiled path for MPC notification: [2, 11] (read from managed/erc20-vault/compiler/contract-info.json).
 export ledger bidirectionalSupplyMap: SignBidirectionalEventMapV1<EvmType2TxParams<2, 0, 0>, 36, 35>;
 
 // inIndex -> the arguments of the supply queued under it, from start to complete.
@@ -1438,11 +1438,11 @@ export circuit sendSupply(outKey: Bytes<32>): [] {
   bidirectionalSupplyMap.insert(requestId, request);
   evictionMap.insert(requestId, disclosedKey);
 
-  // Notify the MPC (bidirectionalSupplyMap's compiled ledger path, [2, 13]).
+  // Notify the MPC (bidirectionalSupplyMap's compiled ledger path, [2, 11]).
   signetSigner.signBidirectional(
     requestId,
     constructSignBidirectionalEventNotificationV1(
-      kernel.self(), 2 as Uint<8>, [2, 13, 0, 0] as Vector<4, Uint<8>>,
+      kernel.self(), 2 as Uint<8>, [2, 11, 0, 0] as Vector<4, Uint<8>>,
     ),
   );
 }
@@ -1487,6 +1487,195 @@ export circuit completeSupply(
     mintShieldedToken(
       vaultTokenDomainSeparator(stataUnderlying),
       args.request.amount as Uint<64>,
+      disclose(mintNonce),
+      caller
+    );
+  }
+}
+
+// ==== Redeem =========================================================================
+// redeem(shares, vaultEvmAddress, vaultEvmAddress) on stataToken, signed by the MPC with
+// the vault's own account at a nonce the flush assigns, under the vault's gas settings.
+// The wrapper burns shares the vault account owns, so no allowance is involved, and pays
+// the vault account the underlying they are worth. Exact-input, so there is no change.
+
+// The wrapper's redeem returns the underlying assets it paid out as a uint256.
+export pure circuit redeemOutputSchema(): Bytes<36> {
+  return "[{\"name\":\"assets\",\"type\":\"uint256\"}]" as Bytes<36>;
+}
+
+// The MPC re-packs the assets as a uint64, the width completeRedeem mints.
+export pure circuit redeemRespondSchema(): Bytes<35> {
+  return "[{\"name\":\"assets\",\"type\":\"uint64\"}]" as Bytes<35>;
+}
+
+// redeemRespondSchema()'s output decoded, packed by the MPC to 8 bytes.
+struct RedeemReturnValue {
+  assets: Uint<64>;
+}
+
+export struct RedeemRequest {
+  // The stataToken shares to redeem.
+  shares: Uint<128>;
+}
+
+export struct RedeemArgs {
+  request: RedeemRequest;
+  gas: GasParams;
+}
+
+// Redeem requests (3-word ERC-4626 redeem, 36-byte output and 35-byte respond schemas).
+// Compiled path for MPC notification: [2, 13] (read from managed/erc20-vault/compiler/contract-info.json).
+export ledger bidirectionalRedeemMap: SignBidirectionalEventMapV1<EvmType2TxParams<3, 0, 0>, 36, 35>;
+
+// inIndex -> the arguments of the redeem queued under it, from start to complete.
+export ledger redeemArgsMap: Map<Uint<64>, RedeemArgs>;
+
+circuit redeemArgsHash(args: RedeemArgs): Bytes<32> {
+  return upgradeFromTransient(transientHash<[Bytes<32>, RedeemArgs]>([
+    pad(32, "vault:redeem:args"),
+    args
+  ]));
+}
+
+// Queues the redeem under inIndex, a caller-chosen random index, and burns the
+// surrendered stataToken vault coin: the coin spend is the authorisation. The vault's
+// account signs and pays, so the gas is the vault's own setting at start.
+export circuit startRedeem(
+  inIndex: Uint<64>,
+  redeemRequest: RedeemRequest,
+  coin: ShieldedCoinInfo
+): [] {
+  requireInitialised();
+  assert(redeemRequest.shares > 0 as Uint<128>, "shares must be positive");
+  // completeRedeem re-mints via a Uint<64> API, so reject unrefundable shares.
+  assert(redeemRequest.shares <= 18446744073709551615 as Uint<128>, "shares exceeds Uint<64> max");
+
+  assert(
+    coin.color == tokenType(vaultTokenDomainSeparator(stataToken), kernel.self()),
+    "Coin is not the vault token for the wrapper"
+  );
+  assert(coin.value == redeemRequest.shares, "Coin value must equal shares");
+  receiveShielded(disclose(coin));
+  sendImmediateShielded(disclose(coin), shieldedBurnAddress(), disclose(coin).value);
+
+  const disclosedIndex = disclose(inIndex);
+  assert(
+    !inputRequestBuffer.member(disclosedIndex) && !redeemArgsMap.member(disclosedIndex),
+    "Index already in use"
+  );
+
+  const args = disclose(RedeemArgs {
+    request: redeemRequest,
+    gas: GasParams {
+      gasLimit: vaultGasLimits.redeem,
+      maxFeePerGas: vaultMaxFeePerGas,
+      maxPriorityFeePerGas: vaultMaxPriorityFeePerGas,
+    },
+  });
+  redeemArgsMap.insert(disclosedIndex, args);
+  inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
+    action: Action.redeem,
+    nonceIsVault: true,
+    evmNonce: 0 as Uint<64>,
+    inIndex: inIndex,
+    commitment: ownershipCommitment(inIndex, callerSecretKey()),
+    argsHash: redeemArgsHash(args),
+  }));
+}
+
+// Records the flushed redeem's SignBidirectionalEvent and notifies the MPC.
+// Permissionless: the entry and its args fix every byte of the EVM transaction, so a
+// second send of the same entry names the same request id and is refused.
+export circuit sendRedeem(outKey: Bytes<32>): [] {
+  requireInitialised();
+  const disclosedKey = disclose(outKey);
+  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  assert(entry.action == Action.redeem, "Wrong action");
+  const args = redeemArgsMap.lookup(entry.inIndex);
+  // The pinned receiver and owner keep the assets in, and burn the shares from, the
+  // vault account, which backs the minted coins.
+  const calldata = EvmCalldata<3> {
+    selector: Bytes [0xba, 0x08, 0x76, 0x52], // redeem(uint256,address,address)
+    noWords: 3 as Uint<16>,
+    words: [
+      numericAbiWord(args.request.shares),
+      evmAddressAbiWord(vaultEvmAddress),
+      evmAddressAbiWord(vaultEvmAddress),
+    ]
+  };
+  const txParams = EvmType2TxParams<3, 0, 0> {
+    chainId: evmChainId,
+    nonce: entry.evmNonce,
+    maxPriorityFeePerGas: args.gas.maxPriorityFeePerGas,
+    maxFeePerGas: args.gas.maxFeePerGas,
+    gasLimit: args.gas.gasLimit,
+    to: stataToken,
+    value: 0 as Uint<128>,
+    calldata: some<EvmCalldata<3>>(calldata),
+    accessListEntryCount: 0,
+    accessList: []
+  };
+  const request = constructSignBidirectionalEventV1<EvmType2TxParams<3, 0, 0>, 36, 35>(
+    mpcKeyVersion, kernel.self(), pad(32, "vault"),
+    MPCSignatureAlgorithm.ecdsa, TxParamType.evmType2, txParams, ethereumCaip2Id(),
+    MPCDestination.unused, pad(64, ""), redeemOutputSchema(), redeemRespondSchema()
+  );
+  const requestId = calculateEvmType2RequestIdV1<3, 0, 0, 36, 35>(request);
+  assert(!bidirectionalRedeemMap.member(requestId), "Request already sent");
+  bidirectionalRedeemMap.insert(requestId, request);
+  evictionMap.insert(requestId, disclosedKey);
+
+  // Notify the MPC (bidirectionalRedeemMap's compiled ledger path, [2, 13]).
+  signetSigner.signBidirectional(
+    requestId,
+    constructSignBidirectionalEventNotificationV1(
+      kernel.self(), 2 as Uint<8>, [2, 13, 0, 0] as Vector<4, Uint<8>>,
+    ),
+  );
+}
+
+// Settles a redeem on either verdict. Executed: checks the output against the
+// attestation, then mints the attested assets as the stataUnderlying vault coin. Failed
+// or unviable: the wrapper burned nothing, so the surrendered stataToken shares are
+// re-minted, and serializedOutput is ignored. Either mint goes to the caller.
+// Redeemer-gated, one settle per request. mintNonce must be caller-chosen RANDOM: one
+// derived from the (public) requestId would link the minted coin to the redeem.
+export circuit completeRedeem(
+  requestId: RequestId,
+  serializedOutput: Bytes<8>,
+  mintNonce: Bytes<32>,
+): [] {
+  requireInitialised();
+  const disclosedId = disclose(requestId);
+  const settled = settleRequest(disclosedId, Action.redeem);
+  const entry = settled[0];
+  const record = settled[1];
+  const args = redeemArgsMap.lookup(entry.inIndex);
+  redeemArgsMap.remove(entry.inIndex);
+  assert(bidirectionalRedeemMap.member(disclosedId), "Request event missing");
+  bidirectionalRedeemMap.remove(disclosedId);
+
+  const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
+  if (record.outputKind == OutputKind.executed) {
+    const output = disclose(serializedOutput);
+    assert(
+      calculateSignetAttestationDigestV1<8>(
+        disclosedId, record.blockHeight, record.outputKind, output
+      ) == record.digest,
+      "Output does not match the attestation"
+    );
+    mintShieldedToken(
+      vaultTokenDomainSeparator(stataUnderlying),
+      deserialize<RedeemReturnValue, 8>(output).assets,
+      disclose(mintNonce),
+      caller
+    );
+  } else {
+    mintShieldedToken(
+      vaultTokenDomainSeparator(stataToken),
+      args.request.shares as Uint<64>,
       disclose(mintNonce),
       caller
     );

@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import {
   VAULT_APPROVE_REQUESTS_PATH,
   VAULT_DEPOSIT_REQUESTS_PATH,
+  VAULT_REDEEM_REQUESTS_PATH,
   VAULT_REPLACE_NONCE_REQUESTS_PATH,
   VAULT_SUPPLY_REQUESTS_PATH,
   VAULT_SWAP_REQUESTS_PATH,
@@ -39,12 +40,13 @@ const compiledFieldIndex = (name: string): readonly number[] => {
 
 describe("exported ledger paths match the compiled contract-info.json", () => {
   it.each([
-    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [2, 7]],
-    ["bidirectionalWithdrawMap", VAULT_WITHDRAW_REQUESTS_PATH, [2, 9]],
-    ["bidirectionalApproveMap", VAULT_APPROVE_REQUESTS_PATH, [2, 5]],
-    ["bidirectionalReplaceNonceMap", VAULT_REPLACE_NONCE_REQUESTS_PATH, [2, 3]],
-    ["bidirectionalSwapMap", VAULT_SWAP_REQUESTS_PATH, [2, 11]],
-    ["bidirectionalSupplyMap", VAULT_SUPPLY_REQUESTS_PATH, [2, 13]],
+    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [2, 5]],
+    ["bidirectionalWithdrawMap", VAULT_WITHDRAW_REQUESTS_PATH, [2, 7]],
+    ["bidirectionalApproveMap", VAULT_APPROVE_REQUESTS_PATH, [2, 3]],
+    ["bidirectionalReplaceNonceMap", VAULT_REPLACE_NONCE_REQUESTS_PATH, [2, 1]],
+    ["bidirectionalSwapMap", VAULT_SWAP_REQUESTS_PATH, [2, 9]],
+    ["bidirectionalSupplyMap", VAULT_SUPPLY_REQUESTS_PATH, [2, 11]],
+    ["bidirectionalRedeemMap", VAULT_REDEEM_REQUESTS_PATH, [2, 13]],
     // The literal column is deliberate: the notification vectors in
     // erc20-vault.compact are hand-written, so a re-chunk that moves a path
     // must fail here even when the exported constant was updated with it.
@@ -54,11 +56,11 @@ describe("exported ledger paths match the compiled contract-info.json", () => {
   });
 });
 
-describe("the admin-updateable gas parameters sit in chunk 1", () => {
+describe("the admin-updateable gas parameters straddle chunks 0 and 1", () => {
   it.each([
-    ["vaultMaxFeePerGas", [1, 0]],
-    ["vaultMaxPriorityFeePerGas", [1, 1]],
-    ["vaultGasLimits", [1, 2]],
+    ["vaultMaxFeePerGas", [0, 2]],
+    ["vaultMaxPriorityFeePerGas", [0, 3]],
+    ["vaultGasLimits", [1, 0]],
   ] as const)("%s", (fieldName, compiledPath) => {
     expect(compiledFieldIndex(fieldName)).toEqual(compiledPath);
   });
