@@ -22,6 +22,8 @@ const FILE_ORDER = [
   "false-claimer.test.ts",
   "bearer-transfer.test.ts",
   "approve-e2e.test.ts",
+  "swap-e2e.test.ts",
+  "swap-refund-e2e.test.ts",
   "admin-replace-nonce-e2e.test.ts",
 ];
 
