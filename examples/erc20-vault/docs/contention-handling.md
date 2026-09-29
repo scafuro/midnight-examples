@@ -58,8 +58,8 @@ carries:
 - **The nonce.** `nonceIsVault` is `false` when the caller names the nonce,
   which is taken verbatim: a deposit names the depositor's own account nonce,
   and a nonce replacement names the vault account nonce it replaces. It is
-  `true` for a withdrawal or an approval, which the vault's account signs at a
-  nonce the caller does not choose: the start writes 0, and the flush replaces
+  `true` for a withdrawal, a swap or an approval, which the vault's account
+  signs at a nonce the caller does not choose: the start writes 0, and the flush replaces
   it with the vault's next nonce.
 - **The input index** it was queued under, which is public already.
 - **An ownership commitment**, `ownershipCommitment(inIndex, secret key)`. The
@@ -73,9 +73,10 @@ index: `depositArgsMap` holds each deposit's `DepositArgs` (the
 the gas envelope), `withdrawArgsMap` each withdrawal's `WithdrawArgs` (the
 `WithdrawRequest` and the vault's gas envelope at start), `approveArgsMap`
 each approval's `ApproveArgs` (the `ApproveRequest`, naming the ERC20 and the
-spender, and the vault's gas envelope at start), and `replaceNonceArgsMap`
-each nonce replacement's `ReplaceNonceArgs` (the vault's gas envelope at
-start). The start circuit writes them, the send and complete circuits read
+spender, and the vault's gas envelope at start), `replaceNonceArgsMap` each
+nonce replacement's `ReplaceNonceArgs` (the vault's gas envelope at start),
+and `swapArgsMap` each swap's `SwapArgs` (the `SwapRequest` and the vault's
+gas envelope at start). The start circuit writes them, the send and complete circuits read
 them, and the complete circuit removes them. The flush never touches them, so
 its cost does not grow with the actions the vault supports.
 The start circuit refuses an index that either the input buffer or its args
@@ -291,8 +292,8 @@ the record's storage is width-independent.
 
 ## Vault-signed requests
 
-A withdrawal or an approval is signed by the vault's own EVM account, so it
-needs the account's next nonce, and no two requests may get the same one. That
+A withdrawal, a swap or an approval is signed by the vault's own EVM account,
+so it needs the account's next nonce, and no two requests may get the same one. That
 nonce is the second shared cell, and it follows the same rule: the flush is its
 only reader and writer.
 
@@ -340,6 +341,29 @@ transaction:
    assigned, and records it in `bidirectionalApproveMap`.
 3. **Complete.** `completeApprove` settles every verdict by closing the
    request. It mints nothing, as the start surrendered nothing.
+
+The swap lifecycle is the same six steps. It buys an exact amount of one ERC20
+with at most a capped amount of another, through the pinned Uniswap router and
+the allowance a router approval granted:
+
+1. **Start.** `startSwap` takes the input index, the `SwapRequest` and the
+   vault coin of `erc20AddressIn`, whose value must equal `amountInMaximum`.
+   It burns the coin, copies the vault's gas settings into `swapArgsMap`, and
+   queues the entry with `nonceIsVault` set.
+2. **Send.** `sendSwap` builds `exactOutputSingle` on `uniswapRouter`, buying
+   exactly `amountOut` of `erc20AddressOut` for at most `amountInMaximum` of
+   `erc20AddressIn` and delivering it to `vaultEvmAddress`, with the
+   derivation path `"vault"` and the nonce the flush assigned, and records it
+   in `bidirectionalSwapMap`.
+3. **Queue the attestation.** The MPC decodes the router's `uint256` return,
+   the input the swap spent, and attests it packed as a `uint64`, so an
+   executed swap is queued with `queueAttestation8`.
+4. **Complete.** `completeSwap` settles every verdict. An executed swap mints
+   exactly `amountOut` of `erc20AddressOut` and the unspent
+   `amountInMaximum - amountIn` of `erc20AddressIn` as change, a zero-value
+   coin on an exact spend, under two caller-chosen nonces that must differ. A
+   failed or unviable swap spent nothing, so it re-mints `amountInMaximum` of
+   `erc20AddressIn`. Every mint goes to the swapper.
 
 ## Nonce replacement
 
