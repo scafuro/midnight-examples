@@ -53,7 +53,9 @@ As illustrated, the flow comprises 9 steps:
     ([`vaultTokenDomainSeparator`](../../contract/src/erc20-vault.compact))
     and burns it with the same pair of calls a
     [withdraw](../withdraw/withdraw.md) uses. The coin spend IS the
-    authorisation.
+    authorisation. `erc20AddressOut` must be one the deployer allowed
+    ([`allowedTokens`](../../contract/src/erc20-vault.compact)), as the
+    complete mints its vault token.
   - The trade is EXACT-OUTPUT, and that is what makes the optimistic burn
     safe: `amountOut` is an input of the
     [`SwapRequest`](../../contract/src/erc20-vault.compact), asserted to fit

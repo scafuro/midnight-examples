@@ -153,6 +153,10 @@ const VAULT_EVM = bytes(20, 0xee);
 // The pinned Uniswap SwapRouter02 (initialise arg + swap `to`).
 const ROUTER = bytes(20, 0x11);
 const ERC20 = bytes(20, 0xaa);
+// The ERC20 a swap buys.
+const ERC20_OUT = bytes(20, 0xbb);
+// An ERC20 the vault never allows.
+const UNLISTED_ERC20 = bytes(20, 0x99);
 // The pinned Aave USDC pair (initialise args): the underlying and its stataUSDC wrapper.
 const STATA_UNDERLYING = bytes(20, 0xdd); // supply burns this colour, redeem mints it
 const STATA_TOKEN = bytes(20, 0xcc); // supply/redeem `to`; supply mints this colour
@@ -273,11 +277,12 @@ const ledgerOf = (ctx: CircuitContext<VaultPrivateState>) => ledger(stateOf(ctx)
 /**
  * Deploy + initialise(VAULT_EVM, CHAIN_ID, MPC_RESPONSE_KEY) as
  * the deployer: the ready-to-use vault, with the MPC response key stored and
- * `evmStartHeight` as its last seen height.
+ * `evmStartHeight` as its last seen height. The deployer then allows ERC20 and
+ * ERC20_OUT, the tokens the tests deposit and swap into.
  */
 const deployInitialised = async (evmStartHeight: bigint = EVM_START_HEIGHT) => {
   const { contract, ctx } = await deployContract();
-  const next = (
+  const initialised = (
     await contract.circuits.initialise(
       ctx,
       VAULT_EVM,
@@ -290,6 +295,8 @@ const deployInitialised = async (evmStartHeight: bigint = EVM_START_HEIGHT) => {
       evmStartHeight,
     )
   ).context;
+  const erc20Allowed = (await contract.circuits.addAllowedToken(initialised, ERC20)).context;
+  const next = (await contract.circuits.addAllowedToken(erc20Allowed, ERC20_OUT)).context;
   return { contract, ctx: next };
 };
 
@@ -505,6 +512,66 @@ describe("initialise", () => {
     expect(state.evmChainId).toBe(CHAIN_ID);
     expect(state.mpcResponseKey).toEqual(MPC_RESPONSE_KEY);
   });
+
+  it("allows stataUnderlying and nothing else", async () => {
+    const { contract, ctx } = await deployContract();
+    const initialised = (
+      await contract.circuits.initialise(
+        ctx,
+        VAULT_EVM,
+        ROUTER,
+        STATA_UNDERLYING,
+        STATA_TOKEN,
+        CHAIN_ID,
+        MPC_RESPONSE_KEY,
+        MPC_KEY_VERSION,
+        EVM_START_HEIGHT,
+      )
+    ).context;
+    const state = ledgerOf(initialised);
+    expect([...state.allowedTokens]).toEqual([STATA_UNDERLYING]);
+  });
+});
+
+describe("addAllowedToken", () => {
+  it("allows the ERC20, so a deposit of it is then accepted", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const unlisted = {
+      ...VALID_DEPOSIT,
+      deposit: { erc20Address: UNLISTED_ERC20, amount: AMOUNT },
+    };
+    await expect(queueDeposit(contract, ctx, unlisted)).rejects.toThrow(/ERC20 not allowed/);
+
+    const allowed = (await contract.circuits.addAllowedToken(ctx, UNLISTED_ERC20)).context;
+    expect(ledgerOf(allowed).allowedTokens.member(UNLISTED_ERC20)).toBe(true);
+    const queued = (await queueDeposit(contract, allowed, unlisted)).context;
+    expect(ledgerOf(queued).depositArgsMap.member(unlisted.inIndex)).toBe(true);
+  });
+
+  it("leaves the set unchanged when the ERC20 is already allowed", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const before = ledgerOf(ctx).allowedTokens.size();
+    const readded = (await contract.circuits.addAllowedToken(ctx, ERC20)).context;
+    expect(ledgerOf(readded).allowedTokens.size()).toBe(before);
+    expect(ledgerOf(readded).allowedTokens.member(ERC20)).toBe(true);
+  });
+
+  it("is deployer-gated", async () => {
+    const { contract, ctx } = await deployInitialised();
+    await expect(
+      contract.circuits.addAllowedToken(
+        await strangerContext("addAllowedToken", ctx),
+        UNLISTED_ERC20,
+      ),
+    ).rejects.toThrow(/Not the deployer/);
+  });
+
+  it("rejects the zero address", async () => {
+    const { contract, ctx } = await deployInitialised();
+    await expect(contract.circuits.addAllowedToken(ctx, ZERO_ADDRESS)).rejects.toThrow(
+      /ERC20 address cannot be zero/,
+    );
+  });
 });
 
 describe("deposit round-trip", () => {
@@ -634,7 +701,12 @@ const DEPOSIT_REJECTION_CASES: DepositRejectionCase[] = [
   {
     name: "a zero ERC20 address",
     args: { ...VALID_DEPOSIT, deposit: { erc20Address: ZERO_ADDRESS, amount: AMOUNT } },
-    throws: /ERC20 address cannot be zero/,
+    throws: /ERC20 not allowed/,
+  },
+  {
+    name: "an ERC20 the vault does not allow",
+    args: { ...VALID_DEPOSIT, deposit: { erc20Address: UNLISTED_ERC20, amount: AMOUNT } },
+    throws: /ERC20 not allowed/,
   },
   {
     name: "a zero amount",
@@ -2863,8 +2935,7 @@ const EXACT_OUTPUT_SINGLE_SELECTOR = new Uint8Array([0x50, 0x23, 0xb4, 0xdf]);
 const EXPECTED_SWAP_OUTPUT_SCHEMA = asciiPadded('[{"name":"amountIn","type":"uint256"}]', 38);
 const EXPECTED_SWAP_RESPOND_SCHEMA = asciiPadded('[{"name":"amountIn","type":"uint64"}]', 37);
 
-// The ERC20 a swap buys, with its own vault token colour.
-const ERC20_OUT = bytes(20, 0xbb);
+// The vault token colour of ERC20_OUT, the ERC20 a swap buys.
 const VAULT_TOKEN_COLOR_OUT = hexToBytes(
   rawTokenType(pureCircuits.vaultTokenDomainSeparator(ERC20_OUT), VAULT_ADDRESS),
 );
@@ -3093,7 +3164,12 @@ const SWAP_REJECTION_CASES: SwapRejectionCase[] = [
   {
     name: "a zero output ERC20 address",
     args: { ...VALID_SWAP, swap: { ...VALID_SWAP.swap, erc20AddressOut: ZERO_ADDRESS } },
-    throws: /erc20AddressOut cannot be zero/,
+    throws: /erc20AddressOut not allowed/,
+  },
+  {
+    name: "an output ERC20 the vault does not allow",
+    args: { ...VALID_SWAP, swap: { ...VALID_SWAP.swap, erc20AddressOut: UNLISTED_ERC20 } },
+    throws: /erc20AddressOut not allowed/,
   },
   {
     name: "a zero amountOut",
@@ -3144,6 +3220,19 @@ describe("swap validation", () => {
   it("rejects before initialise", async () => {
     const { contract, ctx } = await deployContract();
     await expect(queueSwap(contract, ctx, VALID_SWAP)).rejects.toThrow(/Not initialised/);
+  });
+
+  it("accepts an output ERC20 once addAllowedToken allows it", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const unlisted = {
+      ...VALID_SWAP,
+      swap: { ...VALID_SWAP.swap, erc20AddressOut: UNLISTED_ERC20 },
+    };
+    await expect(queueSwap(contract, ctx, unlisted)).rejects.toThrow(/erc20AddressOut not allowed/);
+
+    const allowed = (await contract.circuits.addAllowedToken(ctx, UNLISTED_ERC20)).context;
+    const queued = (await queueSwap(contract, allowed, unlisted)).context;
+    expect(ledgerOf(queued).swapArgsMap.member(unlisted.inIndex)).toBe(true);
   });
 
   it("rejects an index the input buffer holds", async () => {
@@ -6398,6 +6487,11 @@ const UNKNOWN_KEY = bytes(32, 0x5a);
 
 describe("before initialise", () => {
   it.each([
+    {
+      name: "addAllowedToken",
+      call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>
+        contract.circuits.addAllowedToken(ctx, ERC20),
+    },
     {
       name: "flushQueue",
       call: (contract: Contract<VaultPrivateState>, ctx: CircuitContext<VaultPrivateState>) =>

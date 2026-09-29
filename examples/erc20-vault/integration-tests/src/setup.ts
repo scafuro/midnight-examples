@@ -1,6 +1,6 @@
 // The example's setup pipeline: compose the ordered steps
 // (environment check -> wallet seeds + root funding -> EVM chain + output
-// source + trace RPC check + test token -> MPC key derivation -> signet deploy -> fakenet responder hand-off ->
+// source + trace RPC check + test token + allowed tokens -> MPC key derivation -> signet deploy -> fakenet responder hand-off ->
 // vault zk compile + deploy -> MPC response key -> derived EVM addresses ->
 // fork dealing -> fork dependency check -> MPC hand-off printout) from the
 // harness's generic steps plus the vault-specific steps below. The vitest
@@ -51,7 +51,7 @@ import type { TestProject } from "vitest/node";
 
 import { stataAvailable } from "./evm-stata.ts";
 import { uniswapAvailable } from "./evm-swap.ts";
-import { dealForkEvmAccounts, SEPOLIA_USDC } from "./fork-funding.ts";
+import { dealForkEvmAccounts, SEPOLIA_EURC, SEPOLIA_USDC } from "./fork-funding.ts";
 import { assertDebugTraceAvailable } from "./observed-execution.ts";
 import { OutputSource, parseOutputSource } from "./output-source.ts";
 import { resolveUserIdentity } from "./vault-identity.ts";
@@ -66,6 +66,7 @@ import { resolveUserIdentity } from "./vault-identity.ts";
 export const VAULT_PIPELINE_KEYS = [
   "EVM_CHAIN_ID",
   "ERC20_ADDRESS",
+  "EVM_ALLOWED_TOKENS",
   "MPC_ROOT_KEY",
   "MPC_SECP256K1_PUBKEY",
   "MIDNIGHT_SIGNET_CONTRACT_ADDRESS",
@@ -348,6 +349,22 @@ function ensureErc20Address(env: NodeJS.ProcessEnv): void {
 }
 
 /**
+ * Default `EVM_ALLOWED_TOKENS` to the ERC20s the suites deposit and swap into beyond the
+ * stata underlying `initialise` allows: `ERC20_ADDRESS` and Sepolia EURC. The happy-day
+ * initialise spec allows them, and every later spec relies on it.
+ *
+ * @param env - The suite's env accumulator (reads `ERC20_ADDRESS`).
+ */
+function ensureAllowedTokens(env: NodeJS.ProcessEnv): void {
+  if (env.EVM_ALLOWED_TOKENS) {
+    logSkip("default EVM_ALLOWED_TOKENS", `EVM_ALLOWED_TOKENS is set (${env.EVM_ALLOWED_TOKENS})`);
+    return;
+  }
+  env.EVM_ALLOWED_TOKENS = `${requireEnv(env, "ERC20_ADDRESS")},${SEPOLIA_EURC}`;
+  console.log(`defaulted EVM_ALLOWED_TOKENS=${env.EVM_ALLOWED_TOKENS}`);
+}
+
+/**
  * Verify the EVM protocols the vault's circuits call are deployed at `EVM_RPC_URL`: the Uniswap
  * SwapRouter02 behind the swap flows, and the stataUSDC wrapper behind the supply/redeem flows.
  * Both are pinned Sepolia addresses, so an absent one is a fork misconfiguration, and catching it
@@ -392,6 +409,7 @@ const STEPS: readonly SetupStep[] = [
   ["setup: default RESPOND_OUTPUT_SOURCE to the EVM node's trace", ensureRespondOutputSource],
   ["setup: verify EVM_RPC_URL serves debug_traceTransaction", verifyTraceRpc],
   ["setup: default ERC20_ADDRESS to real Sepolia USDC", ensureErc20Address],
+  ["setup: default EVM_ALLOWED_TOKENS to the ERC20s the suites move", ensureAllowedTokens],
   ["setup: check/derive MPC root key", ensureMpcRootKey],
   [
     "setup: check/derive MPC_SECP256K1_PUBKEY public key",

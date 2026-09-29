@@ -64,9 +64,11 @@ As illustrated, the flow comprises 10 steps:
     ([`newInputIndex`](../../contract/src/vault-queue.ts)), their deposit
     account's EVM nonce, the gas envelope that account pays, and the
     [`DepositRequest`](../../contract/src/erc20-vault.compact) (the ERC20 and
-    the amount). The amount is bounded to `Uint<64>` here, as the mint in
-    step 10 takes that width, and an index already held by
-    `inputRequestBuffer` or `depositArgsMap` is refused.
+    the amount). The ERC20 must be one the deployer allowed
+    ([`allowedTokens`](../../contract/src/erc20-vault.compact)), the amount is
+    bounded to `Uint<64>` here, as the mint in step 10 takes that width, and
+    an index already held by `inputRequestBuffer` or `depositArgsMap` is
+    refused.
   - The circuit writes the deposit's arguments into
     [`depositArgsMap`](../../contract/src/erc20-vault.compact) under the input
     index: the request, the gas, and the **derivation path**. The path is not

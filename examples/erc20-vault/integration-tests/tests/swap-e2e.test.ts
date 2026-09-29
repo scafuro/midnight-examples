@@ -46,6 +46,7 @@ import {
 } from "../src/flows/poll-respond-bidirectional.ts";
 import { pollSignatureResponse } from "../src/flows/poll-signature-response.ts";
 import { startSwap } from "../src/flows/start-swap.ts";
+import { SEPOLIA_EURC } from "../src/fork-funding.ts";
 import { POLL_TIMEOUT_MS } from "../src/poll-timeout.ts";
 import { createVaultSession } from "../src/vault-session.ts";
 import { vaultTokenType } from "../src/vault-token.ts";
@@ -78,8 +79,6 @@ const requireEnv = (name: string): string => requireEnvOf(env, name);
 // afterAll.
 const session = createVaultSession(env);
 
-// EURC on Sepolia, the ERC20 the swap buys.
-const EURC = "0x08210F9170F89Ab7658F0B5E3fF39b0E03C594D4";
 // The USDC/EURC pool's fee tier.
 const FEE = 500n;
 // exactOutput: receive EXACTLY 1 EURC. The fork pool's price is arbitrary (thin
@@ -97,8 +96,16 @@ const CAP_SLIPPAGE_BPS = 1000n;
  * @returns The quoted `amountInMaximum`.
  */
 const quotedCap = async (rpcUrl: string, erc20Address: string): Promise<bigint> =>
-  (await quoteExactOutputSingle(rpcUrl, erc20Address, EURC, FEE, AMOUNT_OUT, CAP_SLIPPAGE_BPS))
-    .amountInMaximum;
+  (
+    await quoteExactOutputSingle(
+      rpcUrl,
+      erc20Address,
+      SEPOLIA_EURC,
+      FEE,
+      AMOUNT_OUT,
+      CAP_SLIPPAGE_BPS,
+    )
+  ).amountInMaximum;
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault swap e2e", () => {
   installFlowHooks();
@@ -208,7 +215,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault swap e2e", () =
 
       const context = await session.vaultContext();
       swapRequestId = await startSwap(context, {
-        erc20AddressOut: EURC,
+        erc20AddressOut: SEPOLIA_EURC,
         fee: FEE,
         amountOut: AMOUNT_OUT,
         amountInMaximum,
@@ -325,7 +332,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault swap e2e", () =
 
       const vaultContractAddress = requireEnv("MIDNIGHT_VAULT_CONTRACT_ADDRESS");
       const inColor = vaultTokenType(requireEnv("ERC20_ADDRESS"), vaultContractAddress);
-      const outColor = vaultTokenType(EURC, vaultContractAddress);
+      const outColor = vaultTokenType(SEPOLIA_EURC, vaultContractAddress);
       const wallet = await session.wallet();
       const before = (await wallet.facade.waitForSyncedState()).shielded.balances;
       const inBefore = before[inColor] ?? 0n;

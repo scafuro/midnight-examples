@@ -25,6 +25,7 @@ import {
 } from "@sig-net/midnight";
 import { calculateSignetAttestationDigest } from "@sig-net/midnight/testing";
 import {
+  evmAddressBytes,
   printVaultState,
   readVaultLedger,
   VAULT_DEPOSIT_REQUESTS_PATH,
@@ -34,6 +35,7 @@ import {
 } from "@sig-net/midnight-examples-erc20-vault-contract";
 import {
   InitialiseVaultOutcome,
+  resolveAllowedTokens,
   resolveInitialiseConfig,
 } from "@sig-net/midnight-examples-erc20-vault-deploy";
 import {
@@ -51,6 +53,7 @@ import { formatEther, JsonRpcProvider, parseEther, parseUnits, type Transaction 
 import { afterAll, describe, expect, it } from "vitest";
 
 import { fundingSummary } from "../src/evm-logging.ts";
+import { addAllowedTokens } from "../src/flows/add-allowed-tokens.ts";
 import { broadcastEvm } from "../src/flows/broadcast-evm.ts";
 import { settleDeposit } from "../src/flows/complete-deposit.ts";
 import { settleWithdraw } from "../src/flows/complete-withdraw.ts";
@@ -101,7 +104,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault happy-day e2e",
   });
 
   it(
-    "initialise [erc-vault contract method call]: seal vault EVM address + MPC response key and read back state",
+    "initialise [erc-vault contract method call]: seal vault EVM address + MPC response key, allow the suites' ERC20s and read back state",
     async () => {
       const context = await session.vaultContext();
       const readLedger = () =>
@@ -115,6 +118,12 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault happy-day e2e",
         logSkip("initialise", "vault is already initialised (rerun against a kept contract)");
       }
 
+      // Every later spec deposits or swaps into these. A rerun adds only the missing ones.
+      const allowedTokens = resolveAllowedTokens(env);
+      expect(allowedTokens, "setup defaults EVM_ALLOWED_TOKENS").not.toHaveLength(0);
+      const added = await addAllowedTokens(context, allowedTokens);
+      console.log(`allowed ${String(added.length)} new ERC20(s)`);
+
       await printVaultState(context.providers.publicDataProvider, context.vaultContractAddress);
 
       const state = await readLedger();
@@ -126,6 +135,11 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault happy-day e2e",
       // The stored MPC response key, verbatim: the sender-scoped key claim and
       // completeWithdraw verify responses against.
       expect(state.mpcResponseKey).toEqual(parseSecp256k1PublicKey(config.mpcResponseKey));
+      // initialise allows the stata underlying itself, the deployer every listed ERC20.
+      expect(state.allowedTokens.member(state.stataUnderlying)).toBe(true);
+      for (const token of allowedTokens) {
+        expect(state.allowedTokens.member(evmAddressBytes(token)), `${token} allowed`).toBe(true);
+      }
     },
     15 * MINUTE,
   );

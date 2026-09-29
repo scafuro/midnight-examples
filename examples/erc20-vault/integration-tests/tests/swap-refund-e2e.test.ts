@@ -47,6 +47,7 @@ import {
 } from "../src/flows/poll-respond-bidirectional.ts";
 import { pollSignatureResponse } from "../src/flows/poll-signature-response.ts";
 import { startSwap } from "../src/flows/start-swap.ts";
+import { SEPOLIA_EURC } from "../src/fork-funding.ts";
 import { POLL_TIMEOUT_MS } from "../src/poll-timeout.ts";
 import { createVaultSession } from "../src/vault-session.ts";
 import { vaultTokenType } from "../src/vault-token.ts";
@@ -79,8 +80,6 @@ const requireEnv = (name: string): string => requireEnvOf(env, name);
 // afterAll.
 const session = createVaultSession(env);
 
-// EURC on Sepolia, the ERC20 the swap asks for.
-const EURC = "0x08210F9170F89Ab7658F0B5E3fF39b0E03C594D4";
 // The USDC/EURC pool's fee tier.
 const FEE = 500n;
 // exactOutput: ask for EXACTLY 3 EURC while capping the spend below its cost.
@@ -95,7 +94,7 @@ const AMOUNT_OUT = 3_000_000n;
  * @returns The `amountInMaximum` the router must revert above.
  */
 const doomedCap = async (rpcUrl: string, erc20Address: string): Promise<bigint> =>
-  (await quoteExactOutputSingle(rpcUrl, erc20Address, EURC, FEE, AMOUNT_OUT)).amountIn / 2n;
+  (await quoteExactOutputSingle(rpcUrl, erc20Address, SEPOLIA_EURC, FEE, AMOUNT_OUT)).amountIn / 2n;
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault swap refund e2e", () => {
   installFlowHooks();
@@ -208,7 +207,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault swap refund e2e
 
       const context = await session.vaultContext();
       swapRequestId = await startSwap(context, {
-        erc20AddressOut: EURC,
+        erc20AddressOut: SEPOLIA_EURC,
         fee: FEE,
         amountOut: AMOUNT_OUT,
         amountInMaximum,

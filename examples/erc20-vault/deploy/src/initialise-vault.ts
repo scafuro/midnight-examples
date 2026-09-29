@@ -6,10 +6,6 @@
 // The circuit gates the call on the deployer identity sealed at deploy time,
 // which is what stops anyone else pointing a fresh vault at their own address.
 
-import { findDeployedContract } from "@midnight-ntwrk/midnight-js/contracts";
-// midnight-js reads a process-global network id (unlike compact-js, which
-// takes it explicitly), so joining a deployed contract needs it set.
-import { setNetworkId } from "@midnight-ntwrk/midnight-js/network-id";
 import type { PublicDataProvider } from "@midnight-ntwrk/midnight-js/types";
 import {
   deriveMidnightResponseKey,
@@ -17,29 +13,17 @@ import {
   parseSecp256k1PublicKey,
   SIGNET_DEFAULT_KEY_VERSION,
 } from "@sig-net/midnight";
+import { envOrUndefined, resolveMpcRootPublicKey } from "@sig-net/midnight-contract-deploy";
 import {
-  deriveAccountKeys,
-  ensureFeeReady,
-  envOrUndefined,
-  getDeployConfig,
-  getFaucetUrl,
-  parseIdentitySecretKey,
-  resolveMpcRootPublicKey,
-  withSyncedWalletFacade,
-} from "@sig-net/midnight-contract-deploy";
-import {
-  createVaultPrivateState,
   type DeployedVaultContract,
   deriveVaultEvmAddress,
   evmAddressBytes,
   readVaultLedger,
-  VAULT_PRIVATE_STATE_ID,
 } from "@sig-net/midnight-examples-erc20-vault-contract";
 import { getEvmBlockNumber, getEvmChainId } from "@sig-net/midnight-examples-lib";
 
+import { resolveVaultContractAddress, withDeployerVault } from "./deployer-vault.ts";
 import { resolveEvmTargets, type VaultEvmTargets } from "./evm-targets.ts";
-import { vaultCompiledContract } from "./vault-contract-binding.ts";
-import { buildVaultProviders } from "./vault-providers.ts";
 
 /** What an {@link initialiseVaultContract} call did. */
 export enum InitialiseVaultOutcome {
@@ -76,17 +60,6 @@ export interface VaultInitialiseConfig {
   readonly mpcResponseKey: string;
   /** The MPC root key version the response key and every vault request are derived under. */
   readonly mpcKeyVersion: bigint;
-}
-
-// A required environment value, with a message naming what produces it.
-function requireValue(
-  env: Record<string, string | undefined>,
-  name: string,
-  produces: string,
-): string {
-  const value = envOrUndefined(env, name);
-  if (!value) throw new Error(`${name} is required to initialise the vault: ${produces}`);
-  return value;
 }
 
 // Guard a value the caller may have pinned in the environment against the value
@@ -330,13 +303,10 @@ export async function initialiseVaultContract(
 /**
  * Join a deployed vault as the deployer and initialise it: the standalone
  * counterpart of {@link initialiseVaultContract} for entrypoints that hold no
- * session. The deployer identity resolves exactly as the deploy resolves it
- * (`VAULT_DEPLOYER_SECRET_KEY`, falling back to the `DEPLOYER_SEED` bytes), so
- * the caller and the commitment sealed at deploy agree by construction.
+ * session.
  *
- * @param env - The environment: the deploy SDK's Midnight node configuration, `DEPLOYER_SEED`,
- *   `VAULT_DEPLOYER_SECRET_KEY`, and everything {@link resolveInitialiseConfig} reads.
- *   Defaults to `process.env`.
+ * @param env - The environment: everything {@link withDeployerVault} and
+ *   {@link resolveInitialiseConfig} read. Defaults to `process.env`.
  * @param contractAddress - The vault to initialise. Defaults to `MIDNIGHT_VAULT_CONTRACT_ADDRESS`.
  * @returns Whether this call initialised the vault or found it already initialised.
  * @throws {WalletUnfundedError} If the deployer wallet holds neither NIGHT nor
@@ -349,53 +319,13 @@ export async function initialiseVault(
   env: Record<string, string | undefined> = process.env,
   contractAddress?: string,
 ): Promise<InitialiseVaultOutcome> {
-  // A blank explicit address is treated as absent, so a caller threading an
-  // unset value through still gets the environment's answer (or its error).
-  const explicitAddress = contractAddress?.trim();
-  const vaultContractAddress =
-    explicitAddress === undefined || explicitAddress === ""
-      ? requireValue(
-          env,
-          "MIDNIGHT_VAULT_CONTRACT_ADDRESS",
-          "it names the vault to initialise (the deploy prints it)",
-        )
-      : explicitAddress;
-
-  const deployConfig = getDeployConfig(env);
-  const nodeConfig = deployConfig.midnightNodeConfig;
-  setNetworkId(nodeConfig.networkId);
+  const vaultContractAddress = resolveVaultContractAddress(env, contractAddress, "initialise");
 
   // Resolve the arguments before starting a wallet: a missing variable or a
   // preset contradicting the derivation should fail here, not after a sync.
   const config = await resolveInitialiseConfig(env, vaultContractAddress);
 
-  const secretKey = parseIdentitySecretKey(
-    "VAULT_DEPLOYER_SECRET_KEY",
-    env,
-    deployConfig.deployerSeed,
+  return withDeployerVault(env, vaultContractAddress, (vault, publicDataProvider) =>
+    initialiseVaultContract(vault, publicDataProvider, vaultContractAddress, config),
   );
-  const accountKeys = deriveAccountKeys(deployConfig.deployerSeed, nodeConfig.networkId);
-
-  return withSyncedWalletFacade(accountKeys, nodeConfig, async (facade, state) => {
-    await ensureFeeReady(
-      facade,
-      accountKeys,
-      state,
-      nodeConfig.networkId,
-      getFaucetUrl(env, nodeConfig.networkId),
-    );
-    const providers = buildVaultProviders(facade, accountKeys, nodeConfig);
-    const vault = await findDeployedContract(providers, {
-      contractAddress: vaultContractAddress,
-      compiledContract: vaultCompiledContract,
-      privateStateId: VAULT_PRIVATE_STATE_ID,
-      initialPrivateState: createVaultPrivateState(secretKey),
-    });
-    return initialiseVaultContract(
-      vault,
-      providers.publicDataProvider,
-      vaultContractAddress,
-      config,
-    );
-  });
 }

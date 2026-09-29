@@ -12,10 +12,10 @@
 // other or with a flush.
 // See ../docs/contention-handling.md.
 //
-// Layout: configuration, the admin circuits that send no EVM transaction (initialisation
-// and gas settings), the request queue every action shares, the admin actions that do
-// (nonce replacement and approvals), then the application's actions. Each action's
-// section holds its request types, its ledger fields and its circuits.
+// Layout: configuration, the admin circuits that send no EVM transaction (initialisation,
+// gas settings and allowed tokens), the request queue every action shares, the admin
+// actions that do (nonce replacement and approvals), then the application's actions.
+// Each action's section holds its request types, its ledger fields and its circuits.
 
 pragma language_version >= 0.25;
 
@@ -63,6 +63,12 @@ export ledger uniswapRouter: Bytes<20>;
 // The pinned Aave USDC pair: underlying ERC20 + its ERC-4626 wrapper (stataUSDC).
 export ledger stataUnderlying: Bytes<20>;
 export ledger stataToken: Bytes<20>;
+
+// The ERC20s startDeposit may move in and startSwap may buy: stataUnderlying, allowed by
+// initialise(), and every ERC20 addAllowedToken() adds. Every other mint re-mints a
+// surrendered coin's ERC20 or one of the pinned stata pair, so the actions that spend a
+// vault coin need no check. An action minting any other ERC20 must check this set.
+export ledger allowedTokens: Set<Bytes<20>>;
 
 circuit requireInitialised(): [] {
   assert(initialised, "Not initialised");
@@ -141,6 +147,8 @@ export circuit initialise(
   uniswapRouter = disclose(swapRouter);
   stataUnderlying = disclose(stataUnderlyingAddr);
   stataToken = disclose(stataTokenAddr);
+  // Otherwise no stataUnderlying vault coin could ever be minted to start a supply.
+  allowedTokens.insert(disclose(stataUnderlyingAddr));
   evmChainId = disclose(chainId);
   mpcResponseKey = disclose(responseKey);
   mpcKeyVersion = disclose(responseKeyVersion);
@@ -194,6 +202,16 @@ export circuit setGasParams(
     supply: disclose(newSupplyGasLimit),
     redeem: disclose(newRedeemGasLimit)
   };
+}
+
+// ==== Allowed tokens =================================================================
+// The deployer grows allowedTokens. The set only grows: no circuit removes a token.
+
+export circuit addAllowedToken(erc20Address: Bytes<20>): [] {
+  requireInitialised();
+  assert(userCommitment(callerSecretKey()) == deployer, "Not the deployer");
+  assert(erc20Address as Field != 0 as Field, "ERC20 address cannot be zero");
+  allowedTokens.insert(disclose(erc20Address));
 }
 
 // ==== Request queue ==================================================================
@@ -793,7 +811,7 @@ export circuit startDeposit(
   depositRequest: DepositRequest
 ): [] {
   requireInitialised();
-  assert(depositRequest.erc20Address as Field != 0 as Field, "ERC20 address cannot be zero");
+  assert(allowedTokens.member(disclose(depositRequest.erc20Address)), "ERC20 not allowed");
   assert(depositRequest.amount > 0 as Uint<128>, "Amount must be positive");
   // completeDeposit mints via a Uint<64> API, so reject unclaimable amounts.
   assert(depositRequest.amount <= 18446744073709551615 as Uint<128>, "Amount exceeds Uint<64> max");
@@ -1140,7 +1158,7 @@ export circuit startSwap(
 ): [] {
   requireInitialised();
   assert(swapRequest.erc20AddressIn as Field != 0 as Field, "erc20AddressIn cannot be zero");
-  assert(swapRequest.erc20AddressOut as Field != 0 as Field, "erc20AddressOut cannot be zero");
+  assert(allowedTokens.member(disclose(swapRequest.erc20AddressOut)), "erc20AddressOut not allowed");
   assert(swapRequest.amountOut > 0 as Uint<128>, "amountOut must be positive");
   assert(swapRequest.amountInMaximum > 0 as Uint<128>, "amountInMaximum must be positive");
   // completeSwap mints both amounts via a Uint<64> API, so reject unclaimable ones.
