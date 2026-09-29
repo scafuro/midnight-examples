@@ -180,9 +180,9 @@ const sendDeposits = async (
 };
 
 /**
- * Deploy, initialise and queue what `arrangement` names, in the simulator. Returns the
- * context, the attested deposits' request ids, and `serve`, which turns a context into
- * the contract state a chain serves.
+ * Deploy, initialise, allow ERC20 and queue what `arrangement` names, in the simulator.
+ * Returns the context, the attested deposits' request ids, and `serve`, which turns a
+ * context into the contract state a chain serves.
  */
 const arrangeVault = async (arrangement: VaultArrangement) => {
   const contract = new Contract<VaultPrivateState>(witnesses);
@@ -228,6 +228,7 @@ const arrangeVault = async (arrangement: VaultArrangement) => {
       100n,
     )
   ).context;
+  ctx = (await contract.circuits.addAllowedToken(ctx, ERC20)).context;
   const attested = await sendDeposits(contract, ctx, arrangement.attested);
   ctx = attested.ctx;
   for (const requestId of attested.requestIds) {

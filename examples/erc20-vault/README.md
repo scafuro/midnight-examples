@@ -27,6 +27,7 @@ action.
 |---|---|
 | [`initialise`](#setup-step-4-pin-the-derived-addresses-and-the-response-key) | Deployment setup rather than an MPC flow: the deployer-gated one-shot that pins the vault's derived EVM address, the EVM chain, the Uniswap router, the Aave stataToken pair, the MPC response key and the EVM height attestations must exceed. |
 | `setGasParams` | The deployer resets the fee envelope and the per-action gas limits of the transactions the vault's own account signs. A request keeps the values it was started with. |
+| `addAllowedToken` | The deployer allows one more ERC20 into the vault. `startDeposit` accepts only an allowed ERC20, and `startSwap` buys only an allowed `erc20AddressOut`. `initialise` allows the stata underlying itself, and no circuit removes a token. |
 | [`flushQueue`](docs/contention-handling.md#the-flush) | The only writer of shared state: moves up to 10 queued requests and attestations into the output buffers, assigning each vault-signed request the vault account's next EVM nonce. Anyone may submit it. |
 | [`queueAttestation0`](docs/contention-handling.md#why-the-queue-takes-the-full-output) / `queueAttestation1` / `queueAttestation8` | Verify an MPC attestation's signature over its full output, at the output's exact width, and queue it for the flush. Anyone may submit one. |
 | [`startDeposit`](docs/deposit/deposit.md) → [`sendDeposit`](docs/deposit/deposit.md) → [`completeDeposit`](docs/deposit/deposit.md) | **The reference flow, documented step by step in the [deposit walkthrough](docs/deposit/deposit.md).** The depositor's derived EVM account transfers the ERC20 to the vault's account, and `completeDeposit` mints the shielded vault token when the attested transfer returned true. |
@@ -651,12 +652,18 @@ exercised on every local e2e run.
 # local, against the docker stack
 yarn deploy:erc20-vault
 
-# a remote network (stagenet): deploy, then run the deployer-gated initialise
+# a remote network (stagenet): deploy, run the deployer-gated initialise,
+# then allow the ERC20s EVM_ALLOWED_TOKENS lists
 yarn deploy-initialise:erc20-vault
 
 # initialise a vault that already exists (recovers a run whose deploy landed
 # but whose initialise did not: initialise is one-shot and idempotent)
 yarn initialise:erc20-vault
+
+# allow every ERC20 EVM_ALLOWED_TOKENS lists that the vault does not allow
+# yet: deposits and swaps accept only allowed ERC20s, so run this whenever
+# the list grows. The vault never removes a token.
+yarn add-allowed-tokens:erc20-vault
 
 # install the circuits a split deploy left missing (recovers a run that died
 # after its base deploy landed, named by MIDNIGHT_VAULT_CONTRACT_ADDRESS, and
@@ -665,7 +672,7 @@ yarn initialise:erc20-vault
 yarn resume-deploy:erc20-vault
 ```
 
-All four read the repo-root `.env` overlaid with the real environment, the same
+All five read the repo-root `.env` overlaid with the real environment, the same
 way the e2e setup does, so one set of variables drives every path. They refuse to
 run when that `.env` names a different `NETWORK_ID` than the run targets and
 still supplies a network-scoped value (a signet address, an MPC key): those are
@@ -721,17 +728,18 @@ failed after that point, the PR says to run it by hand before merging).
 
 ## The e2e suite
 
-Twelve e2e specs run serially in a pinned order (`FILE_ORDER` in
+Thirteen e2e specs run serially in a pinned order (`FILE_ORDER` in
 [`integration-tests/vitest.config.ts`](integration-tests/vitest.config.ts)).
-`happy-day-e2e` runs first because it initialises the vault that the later
-flows build on, and `approve-e2e` runs before the swap and lending specs
+`happy-day-e2e` runs first because it initialises the vault, and allows the
+ERC20s, that the later flows build on, and `approve-e2e` runs before the swap and lending specs
 because it grants the allowances they draw on.
 Each spec is rerun-tolerant against kept contract addresses and prints resume
 ids in banners as it goes, for recovering a run that died mid-flow.
 
 | Spec | Tests | What it proves | Resume var(s) |
 |---|---|---|---|
-| `happy-day-e2e` | 15 | Initialise, then a full deposit round trip and a full withdraw round trip, every leg asserted (incl. the MPC-convention reads a responder does) | `DEPOSIT_REQUEST_ID` / `WITHDRAW_REQUEST_ID` |
+| `happy-day-e2e` | 15 | Initialise and allow the suites' ERC20s, then a full deposit round trip and a full withdraw round trip, every leg asserted (incl. the MPC-convention reads a responder does) | `DEPOSIT_REQUEST_ID` / `WITHDRAW_REQUEST_ID` |
+| `allowed-tokens-e2e` | 4 | Deposits and swaps refuse an ERC20 the vault does not allow, only the deployer can allow one, and once allowed the ledger holds it | none |
 | `deposit-withdrawal-failure-refund` | 9 | A withdrawal whose EVM transfer reverts is attested failed, and `completeWithdraw` re-mints the burned vault tokens | `FAILURE_REFUND_DEPOSIT_REQUEST_ID` / `FAILURE_REFUND_WITHDRAW_REQUEST_ID` |
 | `deposit-claimant-not-caller` | 6 | `completeDeposit` can direct the mint to a different wallet's coin public key, discovered from chain data alone | `DEPOSIT_CLAIMANT_NOT_CALLER_DEPOSIT_REQUEST_ID` |
 | `false-claimer` | 6 | A deposit recorded for identity A is NOT claimable by identity B, even with the valid MPC attestation | `FALSE_CLAIMER_DEPOSIT_REQUEST_ID` |
@@ -745,8 +753,8 @@ ids in banners as it goes, for recovering a run that died mid-flow.
 | `admin-replace-nonce-e2e` | 12 | The deployer replaces an unbroadcast withdrawal's nonce with a self-transfer, and the withdrawal, attested unviable, re-mints its burned vault tokens | `REPLACE_NONCE_DEPOSIT_REQUEST_ID` / `REPLACE_NONCE_WITHDRAW_REQUEST_ID` / `REPLACE_NONCE_REPLACEMENT_REQUEST_ID` |
 | `concurrent-flush-e2e` | 10 | Two wallets race to flush the same items: the user's transactions never fail, the losing flush is retried, and a lone canary deposit afterwards shows the stack is healthy. Runs last, as its concurrent load is the most likely to strain the local stack | `CONCURRENT_FLUSH_DEPOSIT_REQUEST_ID` / `CONCURRENT_FLUSH_CANARY_REQUEST_ID` |
 
-130 tests total across these specs. The six offline specs (51 tests, no stack
-needed) are not pinned and run after them, so a full run reports 181. The
+134 tests total across these specs. The six offline specs (51 tests, no stack
+needed) are not pinned and run after them, so a full run reports 185. The
 suite runs against a Sepolia fork, and the setup pipeline
 verifies that the Uniswap router and the stataUSDC wrapper are deployed on it
 before any spec runs, so a fork missing either fails the run at setup with an

@@ -136,8 +136,9 @@ yarn build:erc20-vault       # requires 'yarn compile:erc20-vault'
 # offline commands above, these need a full local stack running and a
 # populated .env: see the 'Integration Tests' section below for that setup.
 yarn deploy:erc20-vault             # deploy a vault, requires 'yarn compile:erc20-vault:zk'
-yarn deploy-initialise:erc20-vault  # deploy + the deployer-gated initialise (remote networks)
+yarn deploy-initialise:erc20-vault  # deploy + the deployer-gated initialise and allowed ERC20s (remote networks)
 yarn initialise:erc20-vault         # initialise an already-deployed vault (recovers a half-done run)
+yarn add-allowed-tokens:erc20-vault # allow the ERC20s EVM_ALLOWED_TOKENS lists on an initialised vault
 ```
 
 Scripts targeting a particular example carry that example's directory name in full (e.g. `compile:erc20-vault`), so every example gains the same family of scripts. The task prefix decides which of the example's packages run: `test:` and `build:` fan out over every package the example has, `compile:` reaches only its contract package, and `deploy:` or `deploy-initialise:` only its deploy package.
