@@ -27,7 +27,7 @@
 // observation's own success flag and the cache's contents are all
 // unauthenticated, they only decide which bytes get checked. The verified
 // kind and bytes route settlement: the kind picks the queue circuit's width,
-// and `completeDeposit` branches on it.
+// and the action's complete circuit branches on it.
 // The fetched output is UNTRUSTED until that check: the verified bytes go into
 // the queue circuit as an argument, where `verifyRespondBidirectionalEventV1<N>`
 // re-hashes them and verifies the same signature in-circuit. That in-circuit
@@ -340,7 +340,7 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
  * output; under {@link OutputSource.MPCCache} every post is checked over the
  * object the MPC cached before it posted. The respond events are
  * unauthenticated (anyone may post), so the signature check is what selects
- * a trustworthy record here, and the settle circuits run the same check
+ * a trustworthy record here, and the queue circuits run the same check
  * in-circuit, which remains the actual authentication gate.
  *
  * A source failure inside one call (a trace that times out, a cache object
@@ -380,7 +380,7 @@ export async function fetchAttestedRespondOutcome(
     return undefined;
   }
 
-  // The key the settle circuit will verify against, read from the vault's own
+  // The key the queue circuit will verify against, read from the vault's own
   // ledger: checking off-chain against anything else risks accepting a post
   // that cannot prove.
   memo.mpcResponseKey ??= (

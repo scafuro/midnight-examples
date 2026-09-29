@@ -57,7 +57,7 @@ function schemaJson(padded: Uint8Array): string {
  * output, or downloaded from the MPC's output cache) and checks the posted
  * events' signatures against it (see `fetchAttestedRespondOutcome`): the
  * event log is unauthenticated, and that check is what makes a returned
- * record meaningful off-chain. The settle circuits run the same check
+ * record meaningful off-chain. The queue circuits run the same check
  * in-circuit, which is the actual authentication gate. The schemas the
  * recomputation runs are the request record's own, read once here: they are
  * what the MPC ran, and the reader, the pinned response key and the observed

@@ -93,7 +93,8 @@ export interface VaultGasEnvelope {
 }
 
 /**
- * The gas envelope the circuits stamp on a `kind` transaction, read from the ledger.
+ * The gas envelope a `kind` request's start circuit copies into its arguments, read
+ * from the ledger.
  *
  * @param state - The decoded vault ledger state.
  * @param kind - The vault-signed operation.
