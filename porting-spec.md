@@ -879,3 +879,159 @@ Parallel pairs touch separate action sections. Their only shared edits are
 the `Action` enum, `queueAttestation8`, `index.ts`, `vault-ledger.ts`, the
 ledger path test, the deploy circuit count and the e2e run order. All of
 these resolve mechanically.
+
+## 7. Review guide (hand-off for the reviewing session)
+
+This section is for a fresh session reviewing the finished port. It says what
+changed, where the evidence is, and how to confirm the two things the port
+exists for: the contention is gone, and no attestation can be replayed.
+
+### 7.1 What to review
+
+| Repository | Branch | PR | Released as |
+| --- | --- | --- | --- |
+| `sig-net/midnight-examples` | `refactor-contention-handling` | https://github.com/sig-net/midnight-examples/pull/86 (into `dev`) | not released |
+| `sig-net/midnight-integration` (the SDK) | `refactor-contention-handling` | https://github.com/sig-net/midnight-integration/pull/129 | `@sig-net/*` 0.24.0-rc.6 |
+| `sig-net/solana-signet-program` (the fakenet) | `refactor-contention-handling` | https://github.com/sig-net/solana-signet-program/pull/87 | `ghcr.io/sig-net/fakenet:0.31.0` |
+
+The progress list at the top of this file names the merge commit of every
+task. `examples/erc20-vault/docs/contention-handling.md` is the design, and it
+was checked claim by claim against the code in S4.
+
+### 7.2 Evidence logs
+
+The logs are in `review-logs/` at the root of the integrator's worktree
+(`/Users/bernard/Projects/github.com/sig-net/midnight-examples-refactor-contention-handling`).
+The folder is in `.gitignore` and never committed, as the logs print wallet seeds
+and keys, so it exists only in that local checkout.
+
+| File | What it shows |
+| --- | --- |
+| `e2e-all.log` | The full P1 to P3 suite on a fresh vault (`39732880…aa31b83`, fakenet 0.31.0): 171 of 171 tests, 12 e2e specs, no error 170, no proof-server OOM |
+| `e2e-p1d.log` | The P1 suite on a fresh vault (`6505fd4a…1300f1`, fakenet 0.30.0): 123 of 123 tests |
+| `e2e-p1c.log` | A real replay refused: see 7.4 |
+| `e2e-p1.log` | The run that exposed the drain's stale-receipt bug under interval mining (fixed in `f5d5410`) |
+| `agent-s3/run2.log`, `agent-s3/run3.log` | `concurrent-flush-e2e` passing 10 of 10 twice, each with the SDK's `lost a race to another flush` line for the request flush and the attestation flush |
+| `agent-s1/mut/final/census-table.txt` | Every `assert` and `requireInitialised` site (129) with the test that fails when it is disabled |
+| `agent-s1/new-tests-mutations.log` | The contention and flush mutations (M1 to M17) and the test that caught each |
+
+### 7.3 Confirming the contention is gone
+
+**What the contention was.** A Midnight transaction is proven against the
+ledger state its prover saw, and fails if a value it read changed before it
+landed. On `dev`, the circuits users call touch state every request shares.
+The start circuits increment the shared `unflushed` counter, settles stamp
+through `stampIfUnstamped`, which reads the shared `lastSeenEvmHeight`, and the
+vault's EVM nonce is the shared `vaultEvmNonce` counter. So two users acting at
+once collide, and one of their transactions fails. Confirm with:
+
+    git show origin/dev:examples/erc20-vault/contract/src/erc20-vault.compact | grep -nE "unflushed\.|lastSeenEvmHeight|vaultEvmNonce\."
+
+**The rule now.** Shared state has one writer. The only shared cells are
+`globalLastSeen` and `globalEvmNonce`, and they are touched only by
+`initialise` (once) and by `flushRequest` and `flushAttestation`, which only
+`flushQueue` calls. Every other circuit reads and writes only entries keyed by
+its own request. A flush carries no funds or secrets, anyone may submit one,
+and a flush that loses a race is rebuilt and resubmitted.
+
+Check it three ways:
+
+1. **Statically.** Every line naming a shared cell must sit in `initialise`,
+   `flushRequest` or `flushAttestation`, or be a comment or declaration:
+
+       grep -n "globalLastSeen\|globalEvmNonce" examples/erc20-vault/contract/src/erc20-vault.compact
+       grep -n "flushRequest(\|flushAttestation(" examples/erc20-vault/contract/src/erc20-vault.compact
+
+2. **In the simulator.** `describe("contention: user circuits never conflict,
+   only flushes do")` in `contract/tests/erc20-vault.test.ts` builds every user
+   circuit and a busy flush on one shared state and replays each on top of the
+   other, in both orders. User circuits must always apply. Pairs of flushes
+   carrying a common item, a request-only flush after a height-raising flush,
+   and a twin-skipping flush after the open request completes must be rejected,
+   and a rejection must match `READ_CONFLICT`
+   (`/^REJECTED: mismatch between expected /`), so no other failure passes as a
+   conflict. Run:
+
+       yarn compile && yarn workspace @sig-net/midnight-examples-erc20-vault-contract test -t contention
+
+   Then break a circuit so it reads a shared cell (for example make
+   `startDeposit` read `globalLastSeen`), recompile, and watch its row fail.
+   S1 did exactly this (M8 to M17 in `agent-s1/new-tests-mutations.log`).
+
+3. **Live.** `integration-tests/tests/concurrent-flush-e2e.test.ts` runs a
+   user's deposit while a second wallet flushes alongside it. The user's
+   transactions must never fail, and at least one flush must lose its race and
+   recover. Evidence: `agent-s3/run2.log` and `run3.log`. It runs last in
+   `FILE_ORDER` and only under the S3 load limits.
+
+### 7.4 Confirming no attestation can be replayed
+
+**What the replay bugs were.** An attestation is the MPC's signed verdict on a
+request's EVM transaction. On the old design, a request re-issued with the same
+id (the same deposit parameters again) could settle against the attestation
+of its first issue, and `dev`'s #78 patched the deposit case on that design.
+
+**The rule now.** When the flush moves a request, it records the
+`globalLastSeen` of that moment in the request's `OutputRequestEntry.lastSeen`.
+Every attestation must come from a block strictly above it, checked twice:
+when it is queued (`recordAttestation`, the `Stale attestation` assert) and
+again when the request completes (`settleRequest`, the same message). The flush
+folds every attestation height into `globalLastSeen`, so a re-issued request
+records a height at or above its old attestation, which can then never settle
+it. Attestation buffers are keyed by request id, the queue circuit stores the
+digest it computed itself (never the event's), and `completeX` removes the
+request, its event and its arguments.
+
+Check it three ways:
+
+1. **Statically.** Both checks exist:
+
+       grep -n "Stale attestation" examples/erc20-vault/contract/src/erc20-vault.compact
+
+2. **In the simulator.** The queue-time `Stale attestation` rows for every
+   action and width, and the complete-time test
+   "completeDeposit refuses a flushed attestation at or below its entry's
+   lastSeen". The complete-time check cannot be reached through circuit calls
+   alone (the queue check fires first), so that test replaces one ledger field
+   through its compiled path. Also "refuses a second attestation for a request
+   whose first is still queued / is flushed" and the "Request already sent"
+   send tests.
+
+3. **Live, by accident.** In `e2e-p1c.log`, a restart of the local anvil reset
+   the user's EVM nonce, so a new deposit was byte-identical to an earlier one
+   and got the same request id (`19840fb9…`). The fakenet's earlier attestation
+   for that id was offered again, and `queueAttestation1` refused it with
+   `Stale attestation`. That is the replay the port closes, caught on a real
+   stack.
+
+### 7.5 Also worth checking
+
+- **Output bytes match the MPC.** Clients recompute the attested output with
+  the SDK's `executedEvmRespondOutput`, `isEvmContractCall` and
+  `evmTraceOutputFromCallFrame` (0.24.0-rc.6), the MPC's own rules, and the
+  fakenet uses the same functions. Width-8 outputs are decoded by the contract's
+  pure circuits `swapAmountIn`, `supplyShares` and `redeemAssets`.
+- **The fakenet matches the MPC on nonces** (PR 87): it signs whatever the nonce,
+  and attests a Midnight request unviable only when a transaction it signed
+  took the nonce. Nonce replacement relies on that, and `admin-replace-nonce-e2e`
+  proves it.
+- **Error 170 cannot come back through S3.** The load limits in S3 forbid the
+  20-wallet storm that poisoned stacks before, and the benchmark specs were not
+  ported (F1).
+- **CI.** PR 86's CI starts from fresh wallets, so it runs the funding pipeline
+  local runs skip. Its waits were raised to five minutes (`9d13bb8`,
+  `4665900`). Confirm the PR's latest run is green.
+
+### 7.6 Known open items
+
+- **F1:** benchmarking is not ported, by decision.
+- **Diagrams:** `image-fixing-todos.md` lists six diagrams to redraw.
+- **`flushUntil` race:** in `vault-queue.ts` it checks the ledger, then
+  `flushPending` reads it again. If another wallet's flush lands between the two
+  reads, it throws "nothing to flush" instead of returning. Not seen in any run.
+- **Stale text left for later:** two log lines in `integration-tests/src/setup.ts`
+  about which polls trace, the e2e skill's spec list under `.claude/`, and a
+  fixture circuit name in `deploy/tests/deploy-vault.test.ts`.
+- **Not written:** flow pages for approve and nonce replacement.
+- **The local stack:** anvil's one-second blocks grow its container by gigabytes
+  a day, so reset a long-lived stack between sessions.
