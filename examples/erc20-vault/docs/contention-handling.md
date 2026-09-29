@@ -360,9 +360,9 @@ section of the contract. It runs the same six steps with these differences:
    and records it in `bidirectionalReplaceNonceMap`.
 3. **Queue the attestation.** The MPC attests an executed plain transfer with
    the success value it synthesises from the bool schema, one `0x01` byte, so
-   an executed replacement is queued with `queueAttestation1`. The client can
-   only obtain that byte from the MPC's output cache: a trace of the mined
-   transfer returns no data to decode.
+   an executed replacement is queued with `queueAttestation1`. A client
+   recomputes that byte from the respond schema with the SDK's
+   `executedEvmRespondOutput`, as the mined transfer returns no data.
 4. **Complete.** `completeReplaceNonce` closes the request on every verdict,
    as the replacement surrendered nothing.
 

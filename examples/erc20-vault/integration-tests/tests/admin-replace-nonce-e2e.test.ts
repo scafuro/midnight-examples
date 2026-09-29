@@ -20,12 +20,7 @@
 //
 // Tests drive the vault THROUGH the example's typed flow functions (src/flows/),
 // in-process, never a subprocess.
-import {
-  MpcOutputCacheReader,
-  OutputKind,
-  requestIdBytes,
-  type RequestIdHex,
-} from "@sig-net/midnight";
+import { OutputKind, requestIdBytes, type RequestIdHex } from "@sig-net/midnight";
 import {
   readVaultLedger,
   VAULT_REPLACE_NONCE_REQUESTS_PATH,
@@ -63,9 +58,7 @@ import {
 import { pollSignatureResponse } from "../src/flows/poll-signature-response.ts";
 import { startReplaceNonce } from "../src/flows/start-replace-nonce.ts";
 import { startWithdraw } from "../src/flows/start-withdraw.ts";
-import { OutputSource } from "../src/output-source.ts";
 import { POLL_TIMEOUT_MS } from "../src/poll-timeout.ts";
-import type { VaultContext } from "../src/vault-context.ts";
 import { createVaultSession } from "../src/vault-session.ts";
 import { vaultTokenType } from "../src/vault-token.ts";
 
@@ -83,9 +76,6 @@ const MINUTE = 60_000;
 
 // The gas limit startReplaceNonce fixes: the intrinsic gas of a plain transfer.
 const REPLACEMENT_GAS_LIMIT = 21_000n;
-
-// The compose fakenet's output cache, read when the context names no cache.
-const LOCAL_FAKENET_CACHE_URL = "http://127.0.0.1:3040/v1/fakenet";
 
 /**
  * The setup-populated env accumulator: repo-root `.env` overlaid with the
@@ -396,18 +386,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
         expect(replacementRequestId).toBeDefined();
 
         const context = await session.vaultContext();
-        const cacheContext: VaultContext = {
-          ...context,
-          respondOutputSource: OutputSource.MPCCache,
-          mpcOutputCache:
-            context.mpcOutputCache ??
-            new MpcOutputCacheReader({
-              cacheUrl: LOCAL_FAKENET_CACHE_URL,
-              networkId: context.nodeConfig.networkId,
-              signetContractAddress: context.signetContractAddress,
-            }),
-        };
-        replacementAttestation = await pollRespondBidirectional(cacheContext, {
+        replacementAttestation = await pollRespondBidirectional(context, {
           requestId: replacementRequestId,
           intervalMs: 1000,
           timeoutMs: POLL_TIMEOUT_MS,

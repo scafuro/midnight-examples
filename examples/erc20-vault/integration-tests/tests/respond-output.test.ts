@@ -7,6 +7,8 @@
 import { createServer, type Server } from "node:http";
 
 import {
+  type EvmTraceOutput,
+  EvmTraceOutputKind,
   MpcOutputCacheReader,
   OutputKind,
   parseRequestIdHex,
@@ -281,16 +283,27 @@ describe("fetchAttestedRespondOutcome under OutputSource.MPCCache", () => {
   });
 });
 
-// The ERC20 transfer's raw return data as the trace reports it: one ABI word
-// holding `true`, which the vault's schemas pack to TRANSFER_TRUE.
-const TRANSFER_TRUE_RAW = `0x${"00".repeat(31)}01`;
+// The ERC20 transfer's traced return data: one ABI word holding `true`, which
+// the vault's schemas pack to TRANSFER_TRUE.
+const TRANSFER_TRUE_TRACE: EvmTraceOutput = {
+  kind: EvmTraceOutputKind.Output,
+  returnData: `0x${"00".repeat(31)}01`,
+};
+
+// A plain transfer's trace: the top frame carries no output.
+const PLAIN_TRANSFER_TRACE: EvmTraceOutput = { kind: EvmTraceOutputKind.NoReturnData };
 
 /** An observation of {@link REQUEST_ID}'s execution, as the trace stand-in reports it. */
-function observation(success: boolean, output: string | null): ObservedExecution {
+function observation(
+  success: boolean,
+  isContractCall: boolean,
+  trace: EvmTraceOutput | null,
+): ObservedExecution {
   return {
     requestId: REQUEST_ID,
     success,
-    output,
+    isContractCall,
+    trace,
     txHash: `0x${"11".repeat(32)}`,
     blockNumber: BLOCK_HEIGHT,
   };
@@ -323,7 +336,24 @@ describe("fetchAttestedRespondOutcome under OutputSource.EVMNode", () => {
 
   it("recomputes an executed post's output from the observed trace", async () => {
     vi.spyOn(observedModule, "observeExecution").mockResolvedValue(
-      observation(true, TRANSFER_TRUE_RAW),
+      observation(true, true, TRANSFER_TRUE_TRACE),
+    );
+    const event = attest(OutputKind.executed, TRANSFER_TRUE);
+    stubChainReads([event]);
+
+    const outcome = await fetchAttestedRespondOutcome(
+      contextWithCache(undefined),
+      REQUEST_ID,
+      OutputSource.EVMNode,
+      SCHEMAS,
+    );
+
+    expect(outcome).toEqual({ event, serializedOutput: TRANSFER_TRUE, succeeded: true });
+  });
+
+  it("recomputes a plain transfer's executed output from the MPC's schema defaults", async () => {
+    vi.spyOn(observedModule, "observeExecution").mockResolvedValue(
+      observation(true, false, PLAIN_TRANSFER_TRACE),
     );
     const event = attest(OutputKind.executed, TRANSFER_TRUE);
     stubChainReads([event]);
@@ -357,7 +387,7 @@ describe("fetchAttestedRespondOutcome under OutputSource.EVMNode", () => {
   });
 
   it("rejects an executed post when the observation reports a revert", async () => {
-    vi.spyOn(observedModule, "observeExecution").mockResolvedValue(observation(false, null));
+    vi.spyOn(observedModule, "observeExecution").mockResolvedValue(observation(false, true, null));
     stubChainReads([attest(OutputKind.executed, TRANSFER_TRUE)]);
     const progress = new PollProgress("test", 1000);
 
@@ -379,7 +409,7 @@ describe("fetchAttestedRespondOutcome under OutputSource.EVMNode", () => {
   it("observes the execution and reads the response key once across a memoised poll", async () => {
     const observe = vi
       .spyOn(observedModule, "observeExecution")
-      .mockResolvedValue(observation(true, TRANSFER_TRUE_RAW));
+      .mockResolvedValue(observation(true, true, TRANSFER_TRUE_TRACE));
     const event = attest(OutputKind.executed, TRANSFER_TRUE);
     stubChainReads([event]);
     const context = contextWithCache(undefined);

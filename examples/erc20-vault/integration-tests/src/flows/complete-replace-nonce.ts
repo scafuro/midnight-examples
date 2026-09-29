@@ -54,12 +54,6 @@ export interface CompleteReplaceNonceOptions {
  * {@link pollRespondBidirectional} over the nonce replacement map followed by
  * {@link settleReplaceNonce}.
  *
- * An executed self-transfer returns no data, so the MPC attests the success value it
- * synthesises from the respond schema. The `evm-node` output source recomputes an
- * executed output by decoding the traced return data, which fails on empty data, so
- * it never verifies that attestation: poll with a context whose
- * `respondOutputSource` is `mpc-cache`.
- *
  * @param context - The flow context, holding the deployer's identity.
  * @param options - The request id to settle.
  * @throws {Error} If no verifying attestation posts within the poll's deadline.

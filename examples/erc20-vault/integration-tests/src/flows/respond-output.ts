@@ -36,6 +36,7 @@
 import {
   boolAbiWord,
   deserializeEvmOutput,
+  executedEvmRespondOutput,
   type MpcOutputCacheReader,
   OutputKind,
   type RequestIdHex,
@@ -203,13 +204,12 @@ async function evmNodeCandidates(
     );
     return { executed: undefined, failure: EMPTY_OUTPUT };
   }
-  if (!observed.success || observed.output === null) {
+  if (!observed.success || observed.trace === null) {
     return { executed: undefined, failure: EMPTY_OUTPUT };
   }
   try {
-    const decoded = deserializeEvmOutput(schemas.outputDeserializationSchema, observed.output);
     return {
-      executed: serializeRespondOutput(schemas.respondSerializationSchema, decoded),
+      executed: executedEvmRespondOutput(schemas, observed.isContractCall, observed.trace),
       failure: EMPTY_OUTPUT,
     };
   } catch (error) {
