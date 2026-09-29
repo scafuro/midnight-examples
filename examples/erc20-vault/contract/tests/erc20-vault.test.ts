@@ -4247,7 +4247,7 @@ describe("redeem round-trip", () => {
     expect(burnOutput.recipient.left.bytes).toEqual(BURN_ADDRESS_BYTES);
   });
 
-  it("a redeem flushed behind a supply takes the next vault nonce", async () => {
+  it("a redeem flushed behind a supply takes the next vault nonce, and its send signs at it", async () => {
     const { contract, ctx } = await deployInitialised();
     const queuedSupply = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
     const queuedBoth = (await queueRedeem(contract, queuedSupply, VALID_REDEEM)).context;
@@ -4265,6 +4265,13 @@ describe("redeem round-trip", () => {
     expect(state.outputRequestBuffer.lookup(supplyKey).entry.evmNonce).toBe(0n);
     expect(state.outputRequestBuffer.lookup(redeemKey).entry.evmNonce).toBe(1n);
     expect(state.globalEvmNonce).toBe(2n);
+
+    const sent = (await contract.circuits.sendRedeem(flushed, redeemKey)).context;
+    const record = first(
+      toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalRedeemMap).values(),
+      "redeem request",
+    );
+    expect(record.txParams.nonce).toBe(1n);
   });
 });
 
