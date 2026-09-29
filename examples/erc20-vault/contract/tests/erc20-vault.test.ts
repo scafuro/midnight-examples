@@ -5,6 +5,8 @@ import {
   type CircuitContext,
   createCircuitContext,
   createConstructorContext,
+  type EncodedRecipient,
+  type EncodedZswapLocalState,
   rawTokenType,
   sampleContractAddress,
 } from "@midnight-ntwrk/compact-runtime";
@@ -75,8 +77,9 @@ import {
 
 // ---- Fixtures ----
 
-// Dummy coin public key (32-byte hex). Required by the API, unused here.
-const CPK = "0".repeat(64);
+// The coin public key of every simulated caller, where ownPublicKey() mints. Non-zero,
+// so a mint to the caller is told apart from one to the all-zero burn address.
+const CPK = "c0".repeat(32);
 
 const bytes = (length: number, fill: number) => new Uint8Array(length).fill(fill);
 
@@ -158,6 +161,14 @@ const CHAIN_ID = 11155111n;
 // every event the vault records (kernel.self() again).
 const VAULT_ADDRESS = sampleContractAddress();
 const VAULT_ADDRESS_BYTES = hexToBytes(VAULT_ADDRESS);
+
+// The vault token colour for ERC20 at the simulated contract address, computed
+// exactly as a wallet would: the compiled domain-separator circuit plus the
+// runtime's rawTokenType (the off-chain twin of the in-circuit
+// `tokenType(domainSep, kernel.self())`).
+const VAULT_TOKEN_COLOR = hexToBytes(
+  rawTokenType(pureCircuits.vaultTokenDomainSeparator(ERC20), VAULT_ADDRESS),
+);
 
 // The contract-fixed MPC routing of every vault event (mirrors of the
 // in-circuit constants; the round-trip tests below are the lockstep check for
@@ -716,6 +727,33 @@ const attest8 = async (
 
 // ---- Settle fixtures ----
 
+/** The zswap local state a circuit run produced, failing when there is none. */
+const zswapState = (context: CircuitContext<VaultPrivateState>) => {
+  const state = context.callContext.currentZswapLocalState;
+  if (!state) {
+    throw new Error("expected zswap local state on the circuit context");
+  }
+  return state;
+};
+
+/**
+ * The coins a settle minted: the zswap outputs `settled` holds beyond `before`'s, as a
+ * threaded context accumulates the outputs of every circuit run before it.
+ */
+const coinsMinted = (
+  before: CircuitContext<VaultPrivateState>,
+  settled: CircuitContext<VaultPrivateState>,
+): EncodedZswapLocalState["outputs"] =>
+  zswapState(settled).outputs.slice(zswapState(before).outputs.length);
+
+// Where every settle but a deposit naming a recipient mints: the caller's own coin
+// public key, ownPublicKey().
+const TO_CALLER: EncodedRecipient = {
+  is_left: true,
+  left: { bytes: hexToBytes(CPK) },
+  right: { bytes: new Uint8Array(32) },
+};
+
 // The circuit's `Maybe<Either<ZswapCoinPublicKey, ContractAddress>>` recipient
 // argument. Compact's Maybe/Either are plain structs: even a `none` (and the
 // unused Either side of a `some`) carries a fully default-valued payload so
@@ -761,19 +799,19 @@ const depositRequested = async () => {
 // ---- Claim-deposit tests ----
 
 describe("completeDeposit settle", () => {
-  // The mint itself is shielded: the call resolving proves it executed, and
-  // the publicly-observable effect asserted here is the request's consumption.
   it.each([
-    { name: "no recipient: mints to the caller", recipient: CALLER_RECIPIENT },
+    { name: "no recipient: mints to the caller", recipient: CALLER_RECIPIENT, mintedTo: TO_CALLER },
     {
       name: "an explicit wallet recipient: mints to the given coin public key",
       recipient: OTHER_WALLET_RECIPIENT,
+      mintedTo: OTHER_WALLET_RECIPIENT.value,
     },
     {
       name: "an explicit contract recipient: mints to the given contract address",
       recipient: CONTRACT_RECIPIENT,
+      mintedTo: CONTRACT_RECIPIENT.value,
     },
-  ])("$name and consumes the request", async ({ recipient }) => {
+  ])("$name and consumes the request", async ({ recipient, mintedTo }) => {
     const { contract, ctx, requestId } = await depositRequested();
     const attested = await attest(
       contract,
@@ -793,6 +831,12 @@ describe("completeDeposit settle", () => {
     ).context;
 
     expect(next.callContext.currentQueryContext.effects.shieldedMints.size).toBe(1);
+    expect(coinsMinted(attested, next)).toEqual([
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: AMOUNT },
+        recipient: mintedTo,
+      },
+    ]);
     const state = ledgerOf(next);
     expect(state.bidirectionalDepositMap.isEmpty()).toBe(true);
     expect(state.outputRequestBuffer.isEmpty()).toBe(true);
@@ -981,14 +1025,6 @@ describe("completeDeposit settle", () => {
 // Where the vault sends the ERC20 on withdraw.
 const DEST_EVM = bytes(20, 0x77);
 
-// The vault token colour for ERC20 at the simulated contract address, computed
-// exactly as a wallet would: the compiled domain-separator circuit plus the
-// runtime's rawTokenType (the off-chain twin of the in-circuit
-// `tokenType(domainSep, kernel.self())`).
-const VAULT_TOKEN_COLOR = hexToBytes(
-  rawTokenType(pureCircuits.vaultTokenDomainSeparator(ERC20), VAULT_ADDRESS),
-);
-
 // The stdlib's shieldedBurnAddress() recipient: the all-zero coin public key.
 // The burn-output assertions below are the lockstep check for this mirror.
 const BURN_ADDRESS_BYTES = new Uint8Array(32);
@@ -1047,15 +1083,6 @@ const withdraw = async (
   const outKey = flushedRequestKey(ledgerOf(flushed), Action.withdraw, args.inIndex);
   const sent = await contract.circuits.sendWithdraw(flushed, outKey);
   return { context: sent.context, outKey };
-};
-
-/** The zswap local state a circuit run produced, failing when there is none. */
-const zswapState = (context: CircuitContext<VaultPrivateState>) => {
-  const state = context.callContext.currentZswapLocalState;
-  if (!state) {
-    throw new Error("expected zswap local state on the circuit context");
-  }
-  return state;
 };
 
 // ---- Withdraw tests ----
@@ -1455,8 +1482,10 @@ interface WithdrawVerdictCase {
   signedOutput: Uint8Array;
   /** The output completeWithdraw is passed. */
   presentedOutput: Uint8Array;
-  /** The mints completeWithdraw must request. */
+  /** The mints completeWithdraw must request of the ledger: mint key to amount. */
   mints: [string, bigint][];
+  /** The coins those mints create, each with its nonce, colour, value and recipient. */
+  coins: EncodedZswapLocalState["outputs"];
 }
 
 const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
@@ -1466,6 +1495,7 @@ const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
     signedOutput: OUTPUT_SUCCESS,
     presentedOutput: OUTPUT_SUCCESS,
     mints: [],
+    coins: [],
   },
   {
     name: "a transfer that returned false re-mints the surrendered amount",
@@ -1473,6 +1503,12 @@ const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
     signedOutput: OUTPUT_FALSE,
     presentedOutput: OUTPUT_FALSE,
     mints: [[VAULT_TOKEN_MINT_KEY, AMOUNT]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a reverted transfer (failed) re-mints the surrendered amount",
@@ -1480,6 +1516,12 @@ const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_IGNORED,
     mints: [[VAULT_TOKEN_MINT_KEY, AMOUNT]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a transfer whose nonce another transaction took (unviable) re-mints the surrendered amount",
@@ -1487,13 +1529,19 @@ const WITHDRAW_VERDICT_CASES: WithdrawVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_IGNORED,
     mints: [[VAULT_TOKEN_MINT_KEY, AMOUNT]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ],
   },
 ];
 
 describe("completeWithdraw settle", () => {
   it.each(WITHDRAW_VERDICT_CASES)(
     "$name and consumes the request",
-    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+    async ({ outputKind, signedOutput, presentedOutput, mints, coins }) => {
       const { contract, ctx, requestId } = await withdrawRequested();
       const attestation = respond(
         MPC_RESPONSE_SECRET,
@@ -1512,6 +1560,7 @@ describe("completeWithdraw settle", () => {
       ).context;
 
       expect(shieldedMintsOf(next)).toEqual(mints);
+      expect(coinsMinted(attested, next)).toEqual(coins);
       const state = ledgerOf(next);
       expect(state.bidirectionalWithdrawMap.isEmpty()).toBe(true);
       expect(state.withdrawArgsMap.isEmpty()).toBe(true);
@@ -2658,6 +2707,12 @@ describe("completeReplaceNonce settle", () => {
     ).context;
 
     expect(shieldedMintsOf(settled)).toEqual([[VAULT_TOKEN_MINT_KEY, AMOUNT]]);
+    expect(coinsMinted(withdrawUnviable, settled)).toEqual([
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ]);
     expect(ledgerOf(settled).outputRequestBuffer.isEmpty()).toBe(true);
   });
 
@@ -3126,8 +3181,10 @@ interface SwapVerdictCase {
   signedOutput: Uint8Array;
   /** The output completeSwap is passed. */
   presentedOutput: Uint8Array;
-  /** The mints completeSwap must request. */
+  /** The mints completeSwap must request of the ledger: mint key to amount. */
   mints: [string, bigint][];
+  /** The coins those mints create, each with its nonce, colour, value and recipient. */
+  coins: EncodedZswapLocalState["outputs"];
 }
 
 const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
@@ -3140,6 +3197,20 @@ const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
       [VAULT_TOKEN_OUT_MINT_KEY, SWAP_AMOUNT_OUT],
       [VAULT_TOKEN_MINT_KEY, SWAP_AMOUNT_IN_MAX - SWAP_AMOUNT_IN_SPENT],
     ],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR_OUT, value: SWAP_AMOUNT_OUT },
+        recipient: TO_CALLER,
+      },
+      {
+        coinInfo: {
+          nonce: CHANGE_NONCE,
+          color: VAULT_TOKEN_COLOR,
+          value: SWAP_AMOUNT_IN_MAX - SWAP_AMOUNT_IN_SPENT,
+        },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "an exact spend mints amountOut and a zero-value change coin",
@@ -3150,6 +3221,16 @@ const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
       [VAULT_TOKEN_OUT_MINT_KEY, SWAP_AMOUNT_OUT],
       [VAULT_TOKEN_MINT_KEY, 0n],
     ],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR_OUT, value: SWAP_AMOUNT_OUT },
+        recipient: TO_CALLER,
+      },
+      {
+        coinInfo: { nonce: CHANGE_NONCE, color: VAULT_TOKEN_COLOR, value: 0n },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a reverted swap (failed) re-mints the surrendered amountInMaximum",
@@ -3157,6 +3238,12 @@ const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_SWAP_IGNORED,
     mints: [[VAULT_TOKEN_MINT_KEY, SWAP_AMOUNT_IN_MAX]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: SWAP_AMOUNT_IN_MAX },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a swap whose nonce another transaction took (unviable) re-mints the surrendered amountInMaximum",
@@ -3164,6 +3251,12 @@ const SWAP_VERDICT_CASES: SwapVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_SWAP_IGNORED,
     mints: [[VAULT_TOKEN_MINT_KEY, SWAP_AMOUNT_IN_MAX]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: SWAP_AMOUNT_IN_MAX },
+        recipient: TO_CALLER,
+      },
+    ],
   },
 ];
 
@@ -3182,7 +3275,7 @@ describe("swapAmountIn", () => {
 describe("completeSwap settle", () => {
   it.each(SWAP_VERDICT_CASES)(
     "$name and consumes the request",
-    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+    async ({ outputKind, signedOutput, presentedOutput, mints, coins }) => {
       const { contract, ctx, requestId } = await swapRequested();
       const attestation = respond(
         MPC_RESPONSE_SECRET,
@@ -3208,6 +3301,7 @@ describe("completeSwap settle", () => {
 
       // The effects map keys the mints by token, not in the order the circuit minted them.
       expect(new Map(shieldedMintsOf(next))).toEqual(new Map(mints));
+      expect(coinsMinted(attested, next)).toEqual(coins);
       const state = ledgerOf(next);
       expect(state.bidirectionalSwapMap.isEmpty()).toBe(true);
       expect(state.swapArgsMap.isEmpty()).toBe(true);
@@ -3289,6 +3383,12 @@ describe("completeSwap settle", () => {
       )
     ).context;
     expect(shieldedMintsOf(next)).toEqual([[VAULT_TOKEN_MINT_KEY, SWAP_AMOUNT_IN_MAX]]);
+    expect(coinsMinted(attested, next)).toEqual([
+      {
+        coinInfo: { nonce: MINT_NONCE, color: VAULT_TOKEN_COLOR, value: SWAP_AMOUNT_IN_MAX },
+        recipient: TO_CALLER,
+      },
+    ]);
   });
 
   it.each([
@@ -3890,8 +3990,10 @@ interface SupplyVerdictCase {
   signedOutput: Uint8Array;
   /** The output completeSupply is passed. */
   presentedOutput: Uint8Array;
-  /** The mints completeSupply must request. */
+  /** The mints completeSupply must request of the ledger: mint key to amount. */
   mints: [string, bigint][];
+  /** The coins those mints create, each with its nonce, colour, value and recipient. */
+  coins: EncodedZswapLocalState["outputs"];
 }
 
 const SUPPLY_VERDICT_CASES: SupplyVerdictCase[] = [
@@ -3901,6 +4003,12 @@ const SUPPLY_VERDICT_CASES: SupplyVerdictCase[] = [
     signedOutput: OUTPUT_SUPPLY,
     presentedOutput: OUTPUT_SUPPLY,
     mints: [[STATA_TOKEN_MINT_KEY, SUPPLY_SHARES]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_TOKEN_COLOR, value: SUPPLY_SHARES },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a reverted deposit (failed) re-mints the surrendered underlying",
@@ -3908,6 +4016,12 @@ const SUPPLY_VERDICT_CASES: SupplyVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_SUPPLY_IGNORED,
     mints: [[STATA_UNDERLYING_MINT_KEY, AMOUNT]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_UNDERLYING_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a deposit whose nonce another transaction took (unviable) re-mints the surrendered underlying",
@@ -3915,6 +4029,12 @@ const SUPPLY_VERDICT_CASES: SupplyVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_SUPPLY_IGNORED,
     mints: [[STATA_UNDERLYING_MINT_KEY, AMOUNT]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_UNDERLYING_COLOR, value: AMOUNT },
+        recipient: TO_CALLER,
+      },
+    ],
   },
 ];
 
@@ -3933,7 +4053,7 @@ describe("supplyShares", () => {
 describe("completeSupply settle", () => {
   it.each(SUPPLY_VERDICT_CASES)(
     "$name and consumes the request",
-    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+    async ({ outputKind, signedOutput, presentedOutput, mints, coins }) => {
       const { contract, ctx, requestId } = await supplyRequested();
       const attestation = respond(
         MPC_RESPONSE_SECRET,
@@ -3952,6 +4072,7 @@ describe("completeSupply settle", () => {
       ).context;
 
       expect(shieldedMintsOf(next)).toEqual(mints);
+      expect(coinsMinted(attested, next)).toEqual(coins);
       const state = ledgerOf(next);
       expect(state.bidirectionalSupplyMap.isEmpty()).toBe(true);
       expect(state.supplyArgsMap.isEmpty()).toBe(true);
@@ -4460,8 +4581,10 @@ interface RedeemVerdictCase {
   signedOutput: Uint8Array;
   /** The output completeRedeem is passed. */
   presentedOutput: Uint8Array;
-  /** The mints completeRedeem must request. */
+  /** The mints completeRedeem must request of the ledger: mint key to amount. */
   mints: [string, bigint][];
+  /** The coins those mints create, each with its nonce, colour, value and recipient. */
+  coins: EncodedZswapLocalState["outputs"];
 }
 
 const REDEEM_VERDICT_CASES: RedeemVerdictCase[] = [
@@ -4471,6 +4594,12 @@ const REDEEM_VERDICT_CASES: RedeemVerdictCase[] = [
     signedOutput: OUTPUT_REDEEM,
     presentedOutput: OUTPUT_REDEEM,
     mints: [[STATA_UNDERLYING_MINT_KEY, REDEEM_ASSETS]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_UNDERLYING_COLOR, value: REDEEM_ASSETS },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a reverted redeem (failed) re-mints the surrendered shares",
@@ -4478,6 +4607,12 @@ const REDEEM_VERDICT_CASES: RedeemVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_REDEEM_IGNORED,
     mints: [[STATA_TOKEN_MINT_KEY, REDEEM_SHARES]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_TOKEN_COLOR, value: REDEEM_SHARES },
+        recipient: TO_CALLER,
+      },
+    ],
   },
   {
     name: "a redeem whose nonce another transaction took (unviable) re-mints the surrendered shares",
@@ -4485,6 +4620,12 @@ const REDEEM_VERDICT_CASES: RedeemVerdictCase[] = [
     signedOutput: OUTPUT_EMPTY,
     presentedOutput: OUTPUT_REDEEM_IGNORED,
     mints: [[STATA_TOKEN_MINT_KEY, REDEEM_SHARES]],
+    coins: [
+      {
+        coinInfo: { nonce: MINT_NONCE, color: STATA_TOKEN_COLOR, value: REDEEM_SHARES },
+        recipient: TO_CALLER,
+      },
+    ],
   },
 ];
 
@@ -4503,7 +4644,7 @@ describe("redeemAssets", () => {
 describe("completeRedeem settle", () => {
   it.each(REDEEM_VERDICT_CASES)(
     "$name and consumes the request",
-    async ({ outputKind, signedOutput, presentedOutput, mints }) => {
+    async ({ outputKind, signedOutput, presentedOutput, mints, coins }) => {
       const { contract, ctx, requestId } = await redeemRequested();
       const attestation = respond(
         MPC_RESPONSE_SECRET,
@@ -4522,6 +4663,7 @@ describe("completeRedeem settle", () => {
       ).context;
 
       expect(shieldedMintsOf(next)).toEqual(mints);
+      expect(coinsMinted(attested, next)).toEqual(coins);
       const state = ledgerOf(next);
       expect(state.bidirectionalRedeemMap.isEmpty()).toBe(true);
       expect(state.redeemArgsMap.isEmpty()).toBe(true);
