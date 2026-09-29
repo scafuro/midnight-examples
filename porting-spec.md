@@ -36,6 +36,7 @@ task is the first unticked one whose dependencies are ticked.
       mutations of `vault-queue.ts` caught)
 - [ ] **S3** Live concurrency and time budget
 - [ ] **S4** Documentation sweep
+- [ ] **F1** Put back benchmarking (follow-up)
 
 ## 1. Context
 
@@ -782,6 +783,15 @@ established, so keep S3 well away from that load:
   another spec.
 - The time-budget test measures one flush at a time on a quiet stack, with
   no concurrent submissions.
+
+**F1. Put back benchmarking (follow-up, after S4).** The e2e specs test
+functionality only. The benchmark harness (`integration-tests/src/benchmark/`,
+`benchmark-tooling.test.ts`) and the instrumentation already in the flows stay,
+but no spec drives them: the old `benchmark`, `vault-queue-e2e` and
+`vault-queue-benchmark` specs were not ported. This task decides, with the
+user, which timings and costs to record on the flush pattern, and adds the
+specs that record them, under S3's load limits (never the 20-wallet test). It
+also takes over S3's full-width flush time-budget measurement.
 
 **S4. Documentation sweep, scope confirmed with the user first:**
 
