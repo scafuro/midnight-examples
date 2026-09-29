@@ -78,10 +78,12 @@ export async function fundWalletsFromRoot(
       if (state.dust.balance(new Date()) > 0n) continue;
       if (!Object.values(state.unshielded.balances).some((amount) => amount > 0n)) {
         const root: RegisteredWallet = await wallets.wallet(rootSeed, "root");
+        // A root transfer stays pending until it is proven, balanced and
+        // finalised, which takes minutes on a shared CI runner.
         const rootState: FacadeState = await waitForFacadeState(
           root.facade,
           (snapshot) => snapshot.pending.all.length === 0,
-          60_000,
+          300_000,
         );
         if (failures.length > 0) break;
         console.log(
