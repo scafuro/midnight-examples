@@ -39,10 +39,10 @@ const compiledFieldIndex = (name: string): readonly number[] => {
 
 describe("exported ledger paths match the compiled contract-info.json", () => {
   it.each([
-    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [2, 3]],
-    ["bidirectionalWithdrawMap", VAULT_WITHDRAW_REQUESTS_PATH, [2, 5]],
-    ["bidirectionalApproveMap", VAULT_APPROVE_REQUESTS_PATH, [2, 7]],
-    ["bidirectionalReplaceNonceMap", VAULT_REPLACE_NONCE_REQUESTS_PATH, [2, 9]],
+    ["bidirectionalDepositMap", VAULT_DEPOSIT_REQUESTS_PATH, [2, 7]],
+    ["bidirectionalWithdrawMap", VAULT_WITHDRAW_REQUESTS_PATH, [2, 9]],
+    ["bidirectionalApproveMap", VAULT_APPROVE_REQUESTS_PATH, [2, 5]],
+    ["bidirectionalReplaceNonceMap", VAULT_REPLACE_NONCE_REQUESTS_PATH, [2, 3]],
     ["bidirectionalSwapMap", VAULT_SWAP_REQUESTS_PATH, [2, 11]],
     ["bidirectionalSupplyMap", VAULT_SUPPLY_REQUESTS_PATH, [2, 13]],
     // The literal column is deliberate: the notification vectors in
