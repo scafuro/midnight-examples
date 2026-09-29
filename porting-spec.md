@@ -22,8 +22,9 @@ task is the first unticked one whose dependencies are ticked.
       `7ec6c4b6…0a436f`)
 - [x] **P0** Vault nonces and withdraw (`7091e42`, all 46 e2e tests on a
       fresh vault, full-width flushes accepted: see 1.5)
-- [ ] **P1a** Approvals (router and stata)
-- [ ] **P1b** Nonce replacement
+- [x] **P1a** Approvals (router and stata) (`372965d`, all 123 tests on a
+      fresh vault `6505fd4a…1300f1`, fakenet 0.30.0)
+- [x] **P1b** Nonce replacement (`372965d`, same run)
 - [ ] **P2a** Swap
 - [ ] **P2b** Supply
 - [ ] **P3** Redeem
