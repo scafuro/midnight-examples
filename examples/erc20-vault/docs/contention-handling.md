@@ -58,9 +58,9 @@ carries:
 - **The nonce.** `nonceIsVault` is `false` when the caller names the nonce,
   which is taken verbatim: a deposit names the depositor's own account nonce,
   and a nonce replacement names the vault account nonce it replaces. It is
-  `true` for a withdrawal, a swap, a supply or an approval, which the vault's
-  account signs at a nonce the caller does not choose: the start writes 0, and
-  the flush replaces it with the vault's next nonce.
+  `true` for a withdrawal, a swap, a supply, a redeem or an approval, which
+  the vault's account signs at a nonce the caller does not choose: the start
+  writes 0, and the flush replaces it with the vault's next nonce.
 - **The input index** it was queued under, which is public already.
 - **An ownership commitment**, `ownershipCommitment(inIndex, secret key)`. The
   complete circuit recomputes it from the stored index and the caller's
@@ -76,8 +76,10 @@ each approval's `ApproveArgs` (the `ApproveRequest`, naming the ERC20 and the
 spender, and the vault's gas envelope at start), `replaceNonceArgsMap` each
 nonce replacement's `ReplaceNonceArgs` (the vault's gas envelope at start),
 `swapArgsMap` each swap's `SwapArgs` (the `SwapRequest` and the vault's gas
-envelope at start), and `supplyArgsMap` each supply's `SupplyArgs` (the
-`SupplyRequest`, naming the amount, and the vault's gas envelope at start).
+envelope at start), `supplyArgsMap` each supply's `SupplyArgs` (the
+`SupplyRequest`, naming the amount, and the vault's gas envelope at start),
+and `redeemArgsMap` each redeem's `RedeemArgs` (the `RedeemRequest`, naming
+the shares, and the vault's gas envelope at start).
 The start circuit writes them, the send and complete circuits read
 them, and the complete circuit removes them. The flush never touches them, so
 its cost does not grow with the actions the vault supports.
@@ -294,8 +296,9 @@ the record's storage is width-independent.
 
 ## Vault-signed requests
 
-A withdrawal, a swap, a supply or an approval is signed by the vault's own EVM
-account, so it needs the account's next nonce, and no two requests may get the same one. That
+A withdrawal, a swap, a supply, a redeem or an approval is signed by the
+vault's own EVM account, so it needs the account's next nonce, and no two
+requests may get the same one. That
 nonce is the second shared cell, and it follows the same rule: the flush is its
 only reader and writer.
 
@@ -386,6 +389,27 @@ tokenised vault) for shares, drawing on the allowance the stata approval grants:
    minted shares to the vault account, so it mints the attested share count
    as the `stataToken` vault coin to the supplier. A failed or unviable one
    moved nothing, so it re-mints the burned `stataUnderlying` amount.
+
+The redeem lifecycle is the same six steps, the supply's in reverse. It
+redeems shares the vault account holds in the pinned `stataToken` wrapper for
+the `stataUnderlying` they are worth. The vault account owns the shares it
+burns, so no approval is involved:
+
+1. **Start.** `startRedeem` takes the input index, the `RedeemRequest` and the
+   vault coin of `stataToken`, whose value must equal the shares. It burns the
+   coin, copies the vault's gas settings into `redeemArgsMap`, and queues the
+   entry with `nonceIsVault` set. Both tokens are contract-fixed, so the
+   request names only the shares.
+2. **Send.** `sendRedeem` builds `redeem(shares, vaultEvmAddress,
+   vaultEvmAddress)` on `stataToken` with the derivation path `"vault"` and the
+   nonce the flush assigned, and records it in `bidirectionalRedeemMap`.
+3. **Queue the attestation.** The MPC decodes the wrapper's uint256 asset
+   amount and re-packs it as a uint64, so an executed redeem is queued with
+   `queueAttestation8`, and a failed or unviable one with `queueAttestation0`.
+4. **Complete.** `completeRedeem` settles every verdict. An executed redeem
+   paid the vault account the underlying, so it mints the attested asset
+   amount as the `stataUnderlying` vault coin to the redeemer. A failed or
+   unviable one burned nothing, so it re-mints the surrendered shares.
 
 ## Nonce replacement
 

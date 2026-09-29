@@ -1,20 +1,24 @@
-// The supply e2e flow: the vault's own EVM account deposits the pinned
-// stataUnderlying (Aave USDC) into the pinned stataToken wrapper (stataUSDC), and
-// the caller receives the attested shares as shielded stataToken vault coins.
-// The supply runs the six steps: `startSupply` burns the caller's shielded
-// underlying and queues the request, a flush assigns its vault nonce, the send
-// records it for the MPC, then the MPC's width-8 attestation of the shares is
-// queued, flushed and settled by `completeSupply`, which mints them.
+// The supply-then-redeem e2e flow: the vault's own EVM account deposits the
+// pinned stataUnderlying (Aave USDC) into the pinned stataToken wrapper
+// (stataUSDC), the caller receives the attested shares as shielded stataToken
+// vault coins, then redeems those shares, and the caller receives the attested
+// underlying (principal plus accrued interest) as shielded stataUnderlying vault
+// coins. Each action runs the six steps: its start burns the caller's shielded
+// coin and queues the request, a flush assigns its vault nonce, the send records
+// it for the MPC, then the MPC's width-8 attestation is queued, flushed and
+// settled by `completeSupply` (which mints the shares) or `completeRedeem` (which
+// mints the assets).
 //
-// The wrapper's exchange rate is live, so the shares are read from the
-// attestation, never hardcoded. The arrange stage runs a deposit round trip of
-// the underlying first (the caller must hold shielded underlying to surrender,
-// and the vault account must hold the ERC20 the wrapper pulls). Run AFTER
+// The wrapper's exchange rate is live, so the shares and the assets are read
+// from the attestations, never hardcoded. The arrange stage runs a deposit round
+// trip of the underlying first (the caller must hold shielded underlying to
+// surrender, and the vault account must hold the ERC20 the wrapper pulls). The
+// redeem burns shares the vault account owns, so it needs no allowance. Run AFTER
 // tests/happy-day-e2e.test.ts (initialise) and tests/approve-e2e.test.ts (the
 // wrapper's allowance on the underlying), as FILE_ORDER pins. Recovery from a
 // run that died mid-flow (proof-server OOM): rerun this file with
-// SUPPLY_DEPOSIT_REQUEST_ID / SUPPLY_REQUEST_ID set to the ids the failed run
-// printed.
+// SUPPLY_DEPOSIT_REQUEST_ID / SUPPLY_REQUEST_ID / REDEEM_REQUEST_ID set to the
+// ids the failed run printed.
 //
 // Tests drive the vault THROUGH the example's typed flow functions
 // (src/flows/), in-process, never a subprocess.
@@ -22,8 +26,10 @@ import { bytesToHex, OutputKind, requestIdBytes, type RequestIdHex } from "@sig-
 import {
   pureCircuits,
   readVaultLedger,
+  VAULT_REDEEM_REQUESTS_PATH,
   VAULT_SUPPLY_REQUESTS_PATH,
   vaultGasEnvelope,
+  type VaultGasKind,
   type VaultLedgerState,
 } from "@sig-net/midnight-examples-erc20-vault-contract";
 import { waitForFacadeState } from "@sig-net/midnight-examples-lib";
@@ -40,6 +46,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { fundingSummary } from "../src/evm-logging.ts";
 import { broadcastEvm } from "../src/flows/broadcast-evm.ts";
+import { settleRedeem } from "../src/flows/complete-redeem.ts";
 import { settleSupply } from "../src/flows/complete-supply.ts";
 import { runDepositRoundTrip } from "../src/flows/deposit-round-trip.ts";
 import {
@@ -47,6 +54,7 @@ import {
   type RespondOutcome,
 } from "../src/flows/poll-respond-bidirectional.ts";
 import { pollSignatureResponse } from "../src/flows/poll-signature-response.ts";
+import { startRedeem } from "../src/flows/start-redeem.ts";
 import { startSupply } from "../src/flows/start-supply.ts";
 import { POLL_TIMEOUT_MS } from "../src/poll-timeout.ts";
 import type { VaultContext } from "../src/vault-context.ts";
@@ -95,7 +103,7 @@ const vaultLedger = (context: VaultContext): Promise<VaultLedgerState> =>
   readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress);
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
-  "erc20-vault supply e2e: the vault account supplies the underlying for stataToken shares",
+  "erc20-vault supply-redeem e2e: the vault account supplies the underlying for stataToken shares, then redeems them",
   () => {
     installFlowHooks();
 
@@ -104,7 +112,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
     });
 
     it(
-      "funding preflight: user EVM account holds the supplied underlying, vault EVM account holds the supply gas budget",
+      "funding preflight: user EVM account holds the supplied underlying, vault EVM account holds the supply and redeem gas budget",
       async () => {
         const rpcUrl = requireEnv("EVM_RPC_URL");
         const userAddress = requireEnv("EVM_USER_ADDRESS");
@@ -132,10 +140,13 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
           `fund ${userAddress} with >= ${formatUnits(required, decimals)} of ERC20 ${underlying} on EVM`,
         ).toBeGreaterThanOrEqual(required);
 
-        // The vault's derived account sends the wrapper deposit itself, at the
-        // vault's supply gas settings.
-        const { gasLimit, maxFeePerGas } = vaultGasEnvelope(state, "supply");
-        const gasBudget = gasLimit * maxFeePerGas;
+        // The vault's derived account sends the wrapper deposit and the redeem
+        // itself, each at the vault's gas settings for its kind.
+        const cost = (kind: VaultGasKind): bigint => {
+          const { gasLimit, maxFeePerGas } = vaultGasEnvelope(state, kind);
+          return gasLimit * maxFeePerGas;
+        };
+        const gasBudget = cost("supply") + cost("redeem");
         const vaultEth = await getEthBalance(rpcUrl, vaultAddress);
         console.log(
           `${vaultAddress}: ${fundingSummary(vaultEth, gasBudget, 18, "ETH")} (maximum gas fee)`,
@@ -340,6 +351,171 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
           "The vault verified the MPC's execution attestation, minted the",
           "attested shares as shielded stataToken vault coins to the supplier,",
           "and removed the request from its ledger.",
+        ]);
+      },
+      15 * MINUTE,
+    );
+
+    // Populated by the start stage (or REDEEM_REQUEST_ID) for the later stages.
+    let redeemRequestId: RequestIdHex;
+
+    it(
+      "redeem: burn the shielded shares the supply minted, a flush assigns the vault nonce, and the redeem is sent",
+      async () => {
+        if (env.REDEEM_REQUEST_ID) {
+          redeemRequestId = env.REDEEM_REQUEST_ID as RequestIdHex;
+          logSkip("redeem", `REDEEM_REQUEST_ID present, resuming redeem '${redeemRequestId}'`);
+          return;
+        }
+        expect(supplyShares).toBeDefined();
+
+        const context = await session.vaultContext();
+        redeemRequestId = await startRedeem(context, { shares: supplyShares });
+        expect(redeemRequestId).toMatch(/^[0-9a-f]{64}$/);
+
+        banner([
+          "Redeem request recorded on the vault ledger:",
+          "",
+          `  request id: ${redeemRequestId}`,
+          "",
+          "The caller's shielded shares are burned. If a later step dies, resume with",
+          `  SUPPLY_REQUEST_ID=${supplyRequestId}`,
+          `  REDEEM_REQUEST_ID=${redeemRequestId}`,
+        ]);
+      },
+      5 * MINUTE,
+    );
+
+    // Populated by the poll step below for the broadcast step.
+    let signedRedeemTransaction: Transaction;
+
+    it(
+      "pollSignatureResponse: the MPC signs the wrapper redeem with the vault's account",
+      async () => {
+        expect(redeemRequestId).toBeDefined();
+
+        const context = await session.vaultContext();
+        signedRedeemTransaction = await pollSignatureResponse(context, {
+          requestId: redeemRequestId,
+          intervalMs: 1000,
+          timeoutMs: POLL_TIMEOUT_MS,
+          expectedSigner: requireEnv("EVM_VAULT_ADDRESS"),
+          requestsPath: VAULT_REDEEM_REQUESTS_PATH,
+        });
+
+        banner([
+          `MPC signed response for redeem ${redeemRequestId} found from Signet Contract.`,
+          "",
+          `Signed tx hash: ${signedTxHash(signedRedeemTransaction)}`,
+        ]);
+      },
+      POLL_TIMEOUT_MS + 5 * MINUTE,
+    );
+
+    it(
+      "broadcast the wrapper redeem: it mines on the EVM side",
+      async () => {
+        expect(signedRedeemTransaction).toBeDefined();
+        const context = await session.vaultContext();
+
+        // broadcastEvm waits for one confirmation and throws if the tx
+        // reverted. An already-mined tx (rerun) short-circuits.
+        const receipt = await broadcastEvm(context, { transaction: signedRedeemTransaction });
+
+        banner([`The wrapper redeem mined on EVM: ${receipt.hash}`]);
+      },
+      3 * MINUTE,
+    );
+
+    // Populated by the poll step below for the settle step.
+    let redeemAttestation: RespondOutcome;
+    // The attested assets the settle mints.
+    let redeemAssets: bigint;
+
+    it(
+      "pollRespondBidirectional: the MPC attests the redeem as executed, carrying the paid-out assets",
+      async () => {
+        expect(redeemRequestId).toBeDefined();
+
+        const context = await session.vaultContext();
+        redeemAttestation = await pollRespondBidirectional(context, {
+          requestId: redeemRequestId,
+          intervalMs: 1000,
+          timeoutMs: POLL_TIMEOUT_MS,
+          requestsPath: VAULT_REDEEM_REQUESTS_PATH,
+        });
+
+        // The broadcast step saw the redeem mine, so the MPC must attest an
+        // execution whose 8-byte output packs the wrapper's asset amount.
+        expect(
+          redeemAttestation.event.outputKind,
+          "a mined wrapper redeem must be attested under OutputKind.executed",
+        ).toBe(OutputKind.executed);
+        expect(redeemAttestation.serializedOutput).toHaveLength(8);
+        redeemAssets = pureCircuits.redeemAssets(redeemAttestation.serializedOutput);
+        expect(redeemAssets).toBeGreaterThan(0n);
+
+        banner([
+          `Found execution attestation for redeem ${redeemRequestId}:`,
+          "",
+          `  assets:       ${String(redeemAssets)}`,
+          `  block height: ${String(redeemAttestation.event.blockHeight)}`,
+        ]);
+      },
+      POLL_TIMEOUT_MS + 5 * MINUTE,
+    );
+
+    it(
+      "completeRedeem: the execution attestation mints the assets as stataUnderlying vault coins and consumes the request",
+      async () => {
+        expect(redeemRequestId).toBeDefined();
+        expect(redeemAttestation).toBeDefined();
+
+        const context = await session.vaultContext();
+        const state = await vaultLedger(context);
+        const isRequestOnLedger = async () =>
+          (await vaultLedger(context)).bidirectionalRedeemMap.member(
+            requestIdBytes(redeemRequestId),
+          );
+
+        // Rerun against a kept contract address: if a prior run already settled
+        // this request the entry is gone and completeRedeem would reject with
+        // "Request not sent", so skip cleanly instead.
+        if (!(await isRequestOnLedger())) {
+          logSkip(
+            "completeRedeem",
+            `redeem ${redeemRequestId} already settled (not on the ledger)`,
+          );
+          return;
+        }
+
+        const color = vaultTokenType(
+          `0x${bytesToHex(state.stataUnderlying)}`,
+          context.vaultContractAddress,
+        );
+        const wallet = await session.wallet();
+        const balanceBefore =
+          (await wallet.facade.waitForSyncedState()).shielded.balances[color] ?? 0n;
+
+        await settleRedeem(context, redeemAttestation);
+
+        expect(
+          await isRequestOnLedger(),
+          "completeRedeem must consume the request from the ledger",
+        ).toBe(false);
+        // The mint is a coin addressed to this wallet, so its balance shows it.
+        const minted = await waitForFacadeState(
+          wallet.facade,
+          (synced) => (synced.shielded.balances[color] ?? 0n) >= balanceBefore + redeemAssets,
+        );
+        expect(minted.shielded.balances[color] ?? 0n).toBe(balanceBefore + redeemAssets);
+
+        banner([
+          `Redeem ${redeemRequestId} settled with a MINT of ${String(redeemAssets)} of the underlying.`,
+          "",
+          "The vault verified the MPC's execution attestation, minted the",
+          "attested assets as shielded stataUnderlying vault coins to the",
+          "redeemer, and removed the request from its ledger.",
         ]);
       },
       15 * MINUTE,
