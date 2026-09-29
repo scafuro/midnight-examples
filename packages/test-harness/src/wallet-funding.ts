@@ -12,6 +12,11 @@ import { waitForFacadeState } from "@sig-net/midnight-examples-lib";
 
 import { explainDustSpendRejection } from "./steps.ts";
 
+// Every funding wait's deadline. A transfer is proven, balanced, finalised and
+// then seen by the receiving wallet's sync, which takes over two minutes on a
+// shared CI runner while the next transfers are proving.
+const FUNDING_WAIT_MS = 300_000;
+
 /** A wallet to make fee-ready, transferring NIGHT only when it has neither NIGHT nor DUST. */
 export interface WalletFundingRecipient {
   /** Seed accepted by the SDK's wallet registry. */
@@ -28,7 +33,7 @@ async function confirmFeeReady(wallets: WalletRegistry, child: RegisteredWallet)
     (snapshot) =>
       Object.values(snapshot.unshielded.balances).some((amount) => amount > 0n) ||
       snapshot.dust.balance(new Date()) > 0n,
-    120_000,
+    FUNDING_WAIT_MS,
   );
   const dust: bigint = await ensureFeeReady(
     child.facade,
@@ -74,16 +79,18 @@ export async function fundWalletsFromRoot(
       if (recipient.amount <= 0n)
         throw new Error(`NIGHT amount must be positive: ${recipient.label}`);
       const child: RegisteredWallet = await wallets.wallet(recipient.seed, recipient.label);
-      const state: FacadeState = await waitForFacadeState(child.facade, () => true, 120_000);
+      const state: FacadeState = await waitForFacadeState(
+        child.facade,
+        () => true,
+        FUNDING_WAIT_MS,
+      );
       if (state.dust.balance(new Date()) > 0n) continue;
       if (!Object.values(state.unshielded.balances).some((amount) => amount > 0n)) {
         const root: RegisteredWallet = await wallets.wallet(rootSeed, "root");
-        // A root transfer stays pending until it is proven, balanced and
-        // finalised, which takes minutes on a shared CI runner.
         const rootState: FacadeState = await waitForFacadeState(
           root.facade,
           (snapshot) => snapshot.pending.all.length === 0,
-          300_000,
+          FUNDING_WAIT_MS,
         );
         if (failures.length > 0) break;
         console.log(

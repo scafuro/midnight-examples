@@ -249,10 +249,10 @@ describe("pipelined wallet funding", () => {
     });
     const assertion: Promise<void> = (async () => {
       await expect(fundWalletsFromRoot(registry, ROOT_SEED, [recipient])).rejects.toThrow(
-        "120000 ms",
+        "300000 ms",
       );
     })();
-    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(300_000);
     await assertion;
     late.resolve(state);
     await vi.advanceTimersByTimeAsync(0);
