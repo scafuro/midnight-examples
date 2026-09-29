@@ -13,6 +13,7 @@ import {
 import { ContractState, CostModel, QueryContext } from "@midnightntwrk/onchain-runtime-v4";
 import {
   asciiPadded,
+  assembleCalldata,
   bytesToHex,
   calculateRequestId,
   decodeSignBidirectionalEventNotificationPayload,
@@ -63,6 +64,7 @@ import {
   queuedRequestKey,
   VAULT_APPROVE_REQUESTS_PATH,
   VAULT_DEPOSIT_REQUESTS_PATH,
+  VAULT_REPLACE_NONCE_REQUESTS_PATH,
   VAULT_WITHDRAW_REQUESTS_PATH,
   type VaultPrivateState,
   witnesses,
@@ -478,7 +480,7 @@ describe("deposit round-trip", () => {
     expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
       version: 1,
       callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
-      requestsPath: [1, 9],
+      requestsPath: [...VAULT_DEPOSIT_REQUESTS_PATH],
     });
 
     // The contract-composed envelope: the deposit's token on the
@@ -1069,7 +1071,7 @@ describe("withdraw round-trip", () => {
     expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
       version: 1,
       callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
-      requestsPath: [1, 11],
+      requestsPath: [...VAULT_WITHDRAW_REQUESTS_PATH],
     });
 
     // The vault's own account signs: the derivation path is the contract-fixed
@@ -1727,7 +1729,7 @@ describe("approve round-trip", () => {
       expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
         version: 1,
         callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
-        requestsPath: [1, 13],
+        requestsPath: [...VAULT_APPROVE_REQUESTS_PATH],
       });
 
       expect(record.sender).toEqual({ bytes: VAULT_ADDRESS_BYTES });
@@ -2139,6 +2141,556 @@ describe("completeApprove settle", () => {
   });
 });
 
+// ---- Replace nonce fixtures ----
+
+/**
+ * A replacement's `startReplaceNonce` arguments: the input index and the vault
+ * account nonce to replace. The gas is the vault's fee settings at a fixed
+ * 21000 limit, so the caller passes none.
+ */
+interface ReplaceNonceCallArgs {
+  inIndex: bigint;
+  evmNonce: bigint;
+}
+
+/**
+ * Known-good replace-nonce call args, the base every test varies from.
+ * Shared across tests: NEVER mutate. Build a variation as an explicit spread
+ * of this base with the delta inline.
+ */
+const VALID_REPLACE_NONCE: ReplaceNonceCallArgs = {
+  inIndex: 21n,
+  evmNonce: 3n,
+};
+
+// The gas every replacement copies at start: the vault's default fees at the
+// intrinsic gas of a plain transfer.
+const REPLACEMENT_GAS = { ...DEFAULT_VAULT_GAS, gasLimit: 21_000n };
+
+/** Queue a replacement: startReplaceNonce with its args in circuit order. */
+const queueReplaceNonce = (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  args: ReplaceNonceCallArgs,
+) => contract.circuits.startReplaceNonce(ctx, args.inIndex, args.evmNonce);
+
+/** Queue, flush and send a replacement, returning the send's context and the request key. */
+const replaceNonce = async (
+  contract: Contract<VaultPrivateState>,
+  ctx: CircuitContext<VaultPrivateState>,
+  args: ReplaceNonceCallArgs,
+) => {
+  const queued = (await queueReplaceNonce(contract, ctx, args)).context;
+  const outKey = queuedRequestKey(ledgerOf(queued), args.inIndex);
+  const flushed = await flush(contract, queued, [args.inIndex], []);
+  const sent = await contract.circuits.sendReplaceNonce(flushed, outKey);
+  return { context: sent.context, outKey };
+};
+
+// ---- Replace nonce tests ----
+
+describe("replace nonce round-trip", () => {
+  it("stores an empty 21000-gas self-transfer at the named nonce, signed by the vault's account", async () => {
+    const { contract, ctx } = await deployInitialised();
+
+    const { context: next, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+    const state = next.callContext.currentQueryContext.state;
+
+    const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalReplaceNonceMap);
+    const rawLedger = readSignetRequestsLedgerFromState(state, VAULT_REPLACE_NONCE_REQUESTS_PATH);
+    expect(typedIndex.size).toBe(1);
+    expect(rawLedger.requestsIndex).toEqual(typedIndex);
+    const [idHex, record] = first(typedIndex.entries(), "indexed replacement request");
+
+    // The notification names THIS vault and the bidirectionalReplaceNonceMap.
+    const notificationEvent = first(
+      decodeSignetLogEvents(next.events, SIGNET_ADDRESS),
+      "signet notification event",
+    );
+    expect(notificationEvent.name).toBe(SignetEventName.SignBidirectionalEvent);
+    const notificationPost = decodeSignBidirectionalEventNotificationPayload(
+      notificationEvent.payload,
+    );
+    expect(requestIdHex(notificationPost.requestId)).toBe(idHex);
+    expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
+      version: 1,
+      callerAddress: bytesToHex(VAULT_ADDRESS_BYTES),
+      requestsPath: [...VAULT_REPLACE_NONCE_REQUESTS_PATH],
+    });
+
+    // The vault's own account signs a zero-value transfer to itself at the
+    // nonce the deployer named, with no calldata.
+    expect(record.sender).toEqual({ bytes: VAULT_ADDRESS_BYTES });
+    expect(record.path).toEqual(asciiPadded("vault", 32));
+    const { calldata, ...envelope } = record.txParams;
+    expect(envelope).toEqual({
+      to: VAULT_EVM,
+      chainId: CHAIN_ID,
+      nonce: VALID_REPLACE_NONCE.evmNonce,
+      ...REPLACEMENT_GAS,
+      value: 0n,
+      accessListEntryCount: 0n,
+      accessList: [],
+    });
+    expect(calldata.is_some).toBe(false);
+    expect(assembleCalldata(calldata)).toBe("0x");
+    expect(record.executionDest).toEqual(EXPECTED_ROUTING.executionDest);
+    expect(record.keyVersion).toBe(MPC_KEY_VERSION);
+    expect(record.algo).toBe(EXPECTED_ROUTING.algo);
+    expect(record.signatureDest).toBe(EXPECTED_ROUTING.signatureDest);
+    expect(record.params).toEqual(EXPECTED_ROUTING.params);
+    expect(record.txParamType).toBe(TxParamType.evmType2);
+    expect(record.outputDeserializationSchema).toEqual(
+      EXPECTED_ROUTING.outputDeserializationSchema,
+    );
+    expect(record.respondSerializationSchema).toEqual(EXPECTED_ROUTING.respondSerializationSchema);
+
+    expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
+
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    expect(entry).toEqual({
+      action: Action.replaceNonce,
+      nonceIsVault: false,
+      evmNonce: VALID_REPLACE_NONCE.evmNonce,
+      inIndex: VALID_REPLACE_NONCE.inIndex,
+      commitment: pureCircuits.ownershipCommitment(VALID_REPLACE_NONCE.inIndex, SECRET_KEY),
+      argsHash: expect.any(Uint8Array) as Uint8Array,
+    });
+    expect(lastSeen).toBe(EVM_START_HEIGHT);
+    expect(ledger(state).replaceNonceArgsMap.lookup(VALID_REPLACE_NONCE.inIndex)).toEqual({
+      gas: REPLACEMENT_GAS,
+    });
+    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+    expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
+  });
+
+  it("replaces a flushed withdrawal's nonce without advancing the vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const { context: withdrawn } = await withdraw(contract, ctx, VALID_WITHDRAW);
+    const replacement = { ...VALID_REPLACE_NONCE, evmNonce: 0n };
+
+    const replaced = (await replaceNonce(contract, withdrawn, replacement)).context;
+
+    const state = ledgerOf(replaced);
+    const nonceOf = (map: Parameters<typeof toSignBidirectionalEventIndex>[0]) =>
+      first(toSignBidirectionalEventIndex(map).values(), "recorded request").txParams.nonce;
+    expect(nonceOf(state.bidirectionalWithdrawMap)).toBe(0n);
+    expect(nonceOf(state.bidirectionalReplaceNonceMap)).toBe(0n);
+    expect(state.globalEvmNonce).toBe(1n);
+  });
+
+  it("a withdrawal flushed beside a replacement still takes the next vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedReplacement = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
+    const replacementKey = queuedRequestKey(
+      ledgerOf(queuedReplacement),
+      VALID_REPLACE_NONCE.inIndex,
+    );
+    const queuedBoth = (await queueWithdraw(contract, queuedReplacement, VALID_WITHDRAW)).context;
+
+    const flushed = await flush(
+      contract,
+      queuedBoth,
+      [VALID_REPLACE_NONCE.inIndex, VALID_WITHDRAW.inIndex],
+      [],
+    );
+
+    const state = ledgerOf(flushed);
+    const withdrawKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
+    expect(state.outputRequestBuffer.lookup(replacementKey).entry.evmNonce).toBe(
+      VALID_REPLACE_NONCE.evmNonce,
+    );
+    expect(state.outputRequestBuffer.lookup(withdrawKey).entry.evmNonce).toBe(0n);
+    expect(state.globalEvmNonce).toBe(1n);
+  });
+
+  it("a second replacement of the same nonce waits as a twin while the first is open", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const { context: sent, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+    const repeat = { ...VALID_REPLACE_NONCE, inIndex: VALID_REPLACE_NONCE.inIndex + 1n };
+    const queuedRepeat = (await queueReplaceNonce(contract, sent, repeat)).context;
+    expect(queuedRequestKey(ledgerOf(queuedRepeat), repeat.inIndex)).toEqual(outKey);
+
+    const flushed = await flush(contract, queuedRepeat, [repeat.inIndex], []);
+
+    expect(ledgerOf(flushed).inputRequestBuffer.member(repeat.inIndex)).toBe(true);
+    expect(ledgerOf(flushed).outputRequestBuffer.size()).toBe(1n);
+  });
+});
+
+describe("replace nonce validation", () => {
+  it("is deployer-gated: a stranger is refused and nothing is queued", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const stranger = await strangerContext("startReplaceNonce", ctx);
+
+    await expect(queueReplaceNonce(contract, stranger, VALID_REPLACE_NONCE)).rejects.toThrow(
+      /Not the deployer/,
+    );
+    expect(ledgerOf(ctx).inputRequestBuffer.isEmpty()).toBe(true);
+    expect(ledgerOf(ctx).replaceNonceArgsMap.isEmpty()).toBe(true);
+  });
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).rejects.toThrow(
+      /Not initialised/,
+    );
+  });
+
+  it("rejects an index the input buffer holds", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
+    await expect(
+      queueReplaceNonce(contract, queued, { ...VALID_REPLACE_NONCE, evmNonce: 4n }),
+    ).rejects.toThrow(/Index already in use/);
+  });
+
+  it("rejects an index another action's queued request holds", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
+    await expect(
+      queueReplaceNonce(contract, queued, {
+        ...VALID_REPLACE_NONCE,
+        inIndex: VALID_WITHDRAW.inIndex,
+      }),
+    ).rejects.toThrow(/Index already in use/);
+  });
+
+  it("rejects an index the flush freed while its args stay in replaceNonceArgsMap", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
+    const flushed = await flush(contract, queued, [VALID_REPLACE_NONCE.inIndex], []);
+    expect(ledgerOf(flushed).inputRequestBuffer.member(VALID_REPLACE_NONCE.inIndex)).toBe(false);
+    await expect(
+      queueReplaceNonce(contract, flushed, { ...VALID_REPLACE_NONCE, evmNonce: 4n }),
+    ).rejects.toThrow(/Index already in use/);
+  });
+});
+
+describe("sendReplaceNonce", () => {
+  it("is permissionless: a stranger sends the deployer's replacement as queued", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
+    const outKey = queuedRequestKey(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
+    const flushed = await flush(contract, queued, [VALID_REPLACE_NONCE.inIndex], []);
+
+    const sent = (
+      await contract.circuits.sendReplaceNonce(
+        await strangerContext("sendReplaceNonce", flushed),
+        outKey,
+      )
+    ).context;
+    const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalReplaceNonceMap);
+    expect(index.size).toBe(1);
+    const record = first(index.values(), "replacement request");
+    expect(record.path).toEqual(asciiPadded("vault", 32));
+    expect(record.txParams.nonce).toBe(VALID_REPLACE_NONCE.evmNonce);
+  });
+
+  it("rejects a key the flush has not moved", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
+    const outKey = queuedRequestKey(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
+    await expect(contract.circuits.sendReplaceNonce(queued, outKey)).rejects.toThrow(
+      /Request not flushed/,
+    );
+  });
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(contract.circuits.sendReplaceNonce(ctx, bytes(32, 0x5a))).rejects.toThrow(
+      /Not initialised/,
+    );
+  });
+
+  it("rejects a second send of the same request", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const { context: sent, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+    await expect(contract.circuits.sendReplaceNonce(sent, outKey)).rejects.toThrow(
+      /Request already sent/,
+    );
+  });
+
+  it("rejects a flushed withdrawal's key, and sendWithdraw rejects a flushed replacement's", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedReplacement = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
+    const replacementKey = queuedRequestKey(
+      ledgerOf(queuedReplacement),
+      VALID_REPLACE_NONCE.inIndex,
+    );
+    const queuedBoth = (await queueWithdraw(contract, queuedReplacement, VALID_WITHDRAW)).context;
+    const flushed = await flush(
+      contract,
+      queuedBoth,
+      [VALID_REPLACE_NONCE.inIndex, VALID_WITHDRAW.inIndex],
+      [],
+    );
+    const withdrawKey = flushedRequestKey(
+      ledgerOf(flushed),
+      Action.withdraw,
+      VALID_WITHDRAW.inIndex,
+    );
+
+    await expect(contract.circuits.sendReplaceNonce(flushed, withdrawKey)).rejects.toThrow(
+      /Wrong action/,
+    );
+    await expect(contract.circuits.sendWithdraw(flushed, replacementKey)).rejects.toThrow(
+      /Wrong action/,
+    );
+  });
+});
+
+/**
+ * Deploy + initialise + replaceNonce(VALID_REPLACE_NONCE): the arrange step of
+ * every complete-replace-nonce test. Returns the sent replacement's request id
+ * (the single replace-nonce map key) alongside the threaded context.
+ */
+const replaceNonceRequested = async () => {
+  const { contract, ctx } = await deployInitialised();
+  const { context: next } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+  const index = toSignBidirectionalEventIndex(ledgerOf(next).bidirectionalReplaceNonceMap);
+  const idHex = first(index.keys(), "replacement request id");
+  return { contract, ctx: next, requestId: requestIdBytes(idHex) };
+};
+
+/** Arrange a flushed attestation of the given verdict for the requested replacement. */
+interface ReplaceNonceVerdictCase {
+  /** Test name, completing the sentence "<name>: closes the request". */
+  name: string;
+  /** The verdict the MPC attests. */
+  outputKind: OutputKind;
+  /** The output the MPC signs (empty under a failure kind). */
+  signedOutput: Uint8Array;
+  /** The output completeReplaceNonce is passed. */
+  presentedOutput: Uint8Array;
+}
+
+const REPLACE_NONCE_VERDICT_CASES: ReplaceNonceVerdictCase[] = [
+  {
+    name: "an executed self-transfer, attested with the synthesised success byte",
+    outputKind: OutputKind.executed,
+    signedOutput: OUTPUT_SUCCESS,
+    presentedOutput: OUTPUT_SUCCESS,
+  },
+  {
+    name: "a reverted self-transfer (failed)",
+    outputKind: OutputKind.failed,
+    signedOutput: OUTPUT_EMPTY,
+    presentedOutput: OUTPUT_IGNORED,
+  },
+  {
+    name: "a self-transfer whose nonce another transaction took (unviable)",
+    outputKind: OutputKind.unviable,
+    signedOutput: OUTPUT_EMPTY,
+    presentedOutput: OUTPUT_IGNORED,
+  },
+];
+
+describe("completeReplaceNonce settle", () => {
+  it.each(REPLACE_NONCE_VERDICT_CASES)(
+    "$name: closes the request and mints nothing",
+    async ({ outputKind, signedOutput, presentedOutput }) => {
+      const { contract, ctx, requestId } = await replaceNonceRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        signedOutput,
+        ATTESTED_HEIGHT,
+      );
+      const attested =
+        outputKind === OutputKind.executed
+          ? await attest(contract, ctx, attestation, signedOutput)
+          : await attestFailure(contract, ctx, attestation);
+
+      const next = (
+        await contract.circuits.completeReplaceNonce(attested, requestId, presentedOutput)
+      ).context;
+
+      expect(shieldedMintsOf(next)).toEqual([]);
+      const state = ledgerOf(next);
+      expect(state.bidirectionalReplaceNonceMap.isEmpty()).toBe(true);
+      expect(state.replaceNonceArgsMap.isEmpty()).toBe(true);
+      expect(state.outputRequestBuffer.isEmpty()).toBe(true);
+      expect(state.outputAttestationBuffer.isEmpty()).toBe(true);
+      expect(state.evictionMap.isEmpty()).toBe(true);
+    },
+  );
+
+  it.each(REPLACE_NONCE_VERDICT_CASES)(
+    "rejects a caller other than the deployer who started it: $name",
+    async ({ outputKind, signedOutput, presentedOutput }) => {
+      const { contract, ctx, requestId } = await replaceNonceRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        signedOutput,
+        ATTESTED_HEIGHT,
+      );
+      const attested =
+        outputKind === OutputKind.executed
+          ? await attest(contract, ctx, attestation, signedOutput)
+          : await attestFailure(contract, ctx, attestation);
+
+      await expect(
+        contract.circuits.completeReplaceNonce(
+          await strangerContext("completeReplaceNonce", attested),
+          requestId,
+          presentedOutput,
+        ),
+      ).rejects.toThrow(/Not the requester/);
+    },
+  );
+
+  it("rejects an output other than the one the execution was attested with", async () => {
+    const { contract, ctx, requestId } = await replaceNonceRequested();
+    const attested = await attest(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    await expect(
+      contract.circuits.completeReplaceNonce(attested, requestId, OUTPUT_FALSE),
+    ).rejects.toThrow(/Output does not match the attestation/);
+  });
+
+  it.each([
+    { name: "queueAttestation1", outputKind: OutputKind.executed, output: OUTPUT_SUCCESS },
+    { name: "queueAttestation0", outputKind: OutputKind.unviable, output: OUTPUT_EMPTY },
+  ])(
+    "$name refuses an attestation at or below the replacement's lastSeen",
+    async ({ outputKind, output }) => {
+      const { contract, ctx, requestId } = await replaceNonceRequested();
+      const attestation = respond(
+        MPC_RESPONSE_SECRET,
+        requestId,
+        outputKind,
+        output,
+        EVM_START_HEIGHT,
+      );
+      await expect(
+        outputKind === OutputKind.executed
+          ? contract.circuits.queueAttestation1(ctx, attestation, output)
+          : contract.circuits.queueAttestation0(ctx, attestation, output),
+      ).rejects.toThrow(/Stale attestation/);
+    },
+  );
+
+  it("rejects before initialise", async () => {
+    const { contract, ctx } = await deployContract();
+    await expect(
+      contract.circuits.completeReplaceNonce(ctx, bytes(32, 0x5a), OUTPUT_IGNORED),
+    ).rejects.toThrow(/Not initialised/);
+  });
+
+  it("settles once: a second completeReplaceNonce for the same request rejects", async () => {
+    const { contract, ctx, requestId } = await replaceNonceRequested();
+    const attested = await attest(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    const next = (await contract.circuits.completeReplaceNonce(attested, requestId, OUTPUT_SUCCESS))
+      .context;
+    await expect(
+      contract.circuits.completeReplaceNonce(next, requestId, OUTPUT_SUCCESS),
+    ).rejects.toThrow(/Request not sent/);
+  });
+
+  it("the replaced withdrawal settles through its unviable attestation and re-mints", async () => {
+    const { contract, ctx, requestId: withdrawId } = await withdrawRequested();
+    const replaced = (await replaceNonce(contract, ctx, { ...VALID_REPLACE_NONCE, evmNonce: 0n }))
+      .context;
+    const replacementId = requestIdBytes(
+      first(
+        toSignBidirectionalEventIndex(ledgerOf(replaced).bidirectionalReplaceNonceMap).keys(),
+        "replacement request id",
+      ),
+    );
+    const replacementMined = await attest(
+      contract,
+      replaced,
+      respond(
+        MPC_RESPONSE_SECRET,
+        replacementId,
+        OutputKind.executed,
+        OUTPUT_SUCCESS,
+        ATTESTED_HEIGHT,
+      ),
+      OUTPUT_SUCCESS,
+    );
+    const replacementClosed = (
+      await contract.circuits.completeReplaceNonce(replacementMined, replacementId, OUTPUT_SUCCESS)
+    ).context;
+    // The MPC attests the replaced withdrawal unviable at the replacement's block.
+    const withdrawUnviable = await attestFailure(
+      contract,
+      replacementClosed,
+      respond(MPC_RESPONSE_SECRET, withdrawId, OutputKind.unviable, OUTPUT_EMPTY, ATTESTED_HEIGHT),
+    );
+
+    const settled = (
+      await contract.circuits.completeWithdraw(
+        withdrawUnviable,
+        withdrawId,
+        OUTPUT_IGNORED,
+        MINT_NONCE,
+      )
+    ).context;
+
+    expect(shieldedMintsOf(settled)).toEqual([[VAULT_TOKEN_MINT_KEY, AMOUNT]]);
+    expect(ledgerOf(settled).outputRequestBuffer.isEmpty()).toBe(true);
+  });
+
+  it("completeReplaceNonce rejects a withdrawal's request id, and completeWithdraw a replacement's", async () => {
+    const { contract, ctx, requestId: withdrawId } = await withdrawRequested();
+    const replaced = (await replaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
+    const replacementId = requestIdBytes(
+      first(
+        toSignBidirectionalEventIndex(ledgerOf(replaced).bidirectionalReplaceNonceMap).keys(),
+        "replacement request id",
+      ),
+    );
+    const withdrawQueued = (
+      await contract.circuits.queueAttestation1(
+        replaced,
+        respond(
+          MPC_RESPONSE_SECRET,
+          withdrawId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      )
+    ).context;
+    const bothQueued = (
+      await contract.circuits.queueAttestation1(
+        withdrawQueued,
+        respond(
+          MPC_RESPONSE_SECRET,
+          replacementId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      )
+    ).context;
+    const attested = await flush(contract, bothQueued, [], [withdrawId, replacementId]);
+
+    await expect(
+      contract.circuits.completeReplaceNonce(attested, withdrawId, OUTPUT_SUCCESS),
+    ).rejects.toThrow(/Wrong action/);
+    await expect(
+      contract.circuits.completeWithdraw(attested, replacementId, OUTPUT_SUCCESS, MINT_NONCE),
+    ).rejects.toThrow(/Wrong action/);
+  });
+});
+
 interface VaultCall {
   contractAddress: string;
   publicTranscript: unknown;
@@ -2287,6 +2839,32 @@ describe("throughput: requests never pin shared state, only the flush does", () 
       flushSlots([APPROVE_INDEX], []),
     );
     expect(replay(stateOf(withdrawFlush.context), approvalFlush, true)).toMatch(/^REJECTED/);
+  });
+
+  it("two concurrent startReplaceNonces under different indexes both apply", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const firstRun = await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+    const secondRun = await queueReplaceNonce(contract, ctx, {
+      inIndex: VALID_REPLACE_NONCE.inIndex + 1n,
+      evmNonce: VALID_REPLACE_NONCE.evmNonce + 1n,
+    });
+    expect(replay(stateOf(firstRun.context), secondRun, true)).toBe("applied");
+  });
+
+  it("a replacement-only flush applies after a concurrent flush moved the vault nonce", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queuedReplacement = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
+    const queuedBoth = (await queueWithdraw(contract, queuedReplacement, VALID_WITHDRAW)).context;
+    const withdrawFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([VALID_WITHDRAW.inIndex], []),
+    );
+    const replacementFlush = await contract.circuits.flushQueue(
+      queuedBoth,
+      flushSlots([VALID_REPLACE_NONCE.inIndex], []),
+    );
+    expect(ledgerOf(withdrawFlush.context).globalEvmNonce).toBe(1n);
+    expect(replay(stateOf(withdrawFlush.context), replacementFlush, true)).toBe("applied");
   });
 });
 
@@ -2520,6 +3098,35 @@ describe("gas parameters reach the constructed transaction", () => {
       maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
       maxPriorityFeePerGas: DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
       gasLimit: DEFAULT_APPROVE_GAS_LIMIT,
+    });
+  });
+
+  it("sendReplaceNonce carries the updated fee envelope at the fixed 21000 gas limit", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const configured = (await setGasParams(contract, ctx, NEW_GAS_PARAMS)).context;
+
+    const next = (await replaceNonce(contract, configured, VALID_REPLACE_NONCE)).context;
+
+    expect(envelopeOf(ledgerOf(next).bidirectionalReplaceNonceMap)).toEqual({
+      maxFeePerGas: NEW_MAX_FEE_PER_GAS,
+      maxPriorityFeePerGas: NEW_MAX_PRIORITY_FEE_PER_GAS,
+      gasLimit: 21_000n,
+    });
+  });
+
+  it("a replacement keeps the fees it was queued with when setGasParams runs before its send", async () => {
+    const { contract, ctx } = await deployInitialised();
+    const queued = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
+    const outKey = queuedRequestKey(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
+    const flushed = await flush(contract, queued, [VALID_REPLACE_NONCE.inIndex], []);
+    const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
+
+    const sent = (await contract.circuits.sendReplaceNonce(reconfigured, outKey)).context;
+
+    expect(envelopeOf(ledgerOf(sent).bidirectionalReplaceNonceMap)).toEqual({
+      maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
+      maxPriorityFeePerGas: DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+      gasLimit: 21_000n,
     });
   });
 

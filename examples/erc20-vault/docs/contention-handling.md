@@ -55,10 +55,12 @@ A request entry (`RequestBufferEntry`) has one size for every action. It
 carries:
 
 - **The action.**
-- **The nonce.** `nonceIsVault` is `false` for a deposit: `evmNonce` is the
-  depositor's own account nonce, taken verbatim. It is `true` for a withdrawal
-  or an approval, which the vault's account signs: the start writes 0, and the
-  flush replaces it with the vault's next nonce.
+- **The nonce.** `nonceIsVault` is `false` when the caller names the nonce,
+  which is taken verbatim: a deposit names the depositor's own account nonce,
+  and a nonce replacement names the vault account nonce it replaces. It is
+  `true` for a withdrawal or an approval, which the vault's account signs at a
+  nonce the caller does not choose: the start writes 0, and the flush replaces
+  it with the vault's next nonce.
 - **The input index** it was queued under, which is public already.
 - **An ownership commitment**, `ownershipCommitment(inIndex, secret key)`. The
   complete circuit recomputes it from the stored index and the caller's
@@ -69,12 +71,13 @@ The arguments themselves live in the action's own args map, keyed by the input
 index: `depositArgsMap` holds each deposit's `DepositArgs` (the
 `DepositRequest`, the MPC derivation path of the depositor's EVM account, and
 the gas envelope), `withdrawArgsMap` each withdrawal's `WithdrawArgs` (the
-`WithdrawRequest` and the vault's gas envelope at start), and `approveArgsMap`
+`WithdrawRequest` and the vault's gas envelope at start), `approveArgsMap`
 each approval's `ApproveArgs` (the `ApproveRequest`, naming the ERC20 and the
-spender, and the vault's gas envelope at start). The start circuit
-writes them, the send and complete circuits read them, and the complete circuit
-removes them. The flush never touches them, so its cost does not grow with the
-actions the vault supports.
+spender, and the vault's gas envelope at start), and `replaceNonceArgsMap`
+each nonce replacement's `ReplaceNonceArgs` (the vault's gas envelope at
+start). The start circuit writes them, the send and complete circuits read
+them, and the complete circuit removes them. The flush never touches them, so
+its cost does not grow with the actions the vault supports.
 The start circuit refuses an index that either the input buffer or its args
 map already holds.
 
@@ -289,9 +292,9 @@ the record's storage is width-independent.
 ## Vault-signed requests
 
 A withdrawal or an approval is signed by the vault's own EVM account, so it
-needs the account's next nonce, and no two requests may get the same one. That nonce is
-the second shared cell, and it follows the same rule: the flush is its only
-reader and writer.
+needs the account's next nonce, and no two requests may get the same one. That
+nonce is the second shared cell, and it follows the same rule: the flush is its
+only reader and writer.
 
 - **A request slot assigns it.** An entry with `nonceIsVault` set takes the
   current `globalEvmNonce` before its request key is computed, and the cell
@@ -337,6 +340,40 @@ transaction:
    assigned, and records it in `bidirectionalApproveMap`.
 3. **Complete.** `completeApprove` settles every verdict by closing the
    request. It mints nothing, as the start surrendered nothing.
+
+## Nonce replacement
+
+A vault-signed transaction that can never be mined (its fee below what the
+network will take, or never broadcast at all) holds its nonce, and every
+later vault transaction waits behind it. The deployer unsticks the account by
+replacing that nonce with a zero-value self-transfer, the Replace nonce
+section of the contract. It runs the same six steps with these differences:
+
+1. **Start.** `startReplaceNonce` is deployer-gated and takes the input index
+   and the vault account nonce to replace. It copies the vault's fee settings
+   at a 21000 gas limit into `replaceNonceArgsMap`, and queues the entry with
+   `nonceIsVault` unset, so the flush takes the named nonce verbatim and
+   leaves `globalEvmNonce` alone. Nothing checks the nonce against
+   `globalEvmNonce`: the deployer is trusted with it.
+2. **Send.** `sendReplaceNonce` builds the transfer of zero to
+   `vaultEvmAddress`, with no calldata, under the derivation path `"vault"`,
+   and records it in `bidirectionalReplaceNonceMap`.
+3. **Queue the attestation.** The MPC attests an executed plain transfer with
+   the success value it synthesises from the bool schema, one `0x01` byte, so
+   an executed replacement is queued with `queueAttestation1`. The client can
+   only obtain that byte from the MPC's output cache: a trace of the mined
+   transfer returns no data to decode.
+4. **Complete.** `completeReplaceNonce` closes the request on every verdict,
+   as the replacement surrendered nothing.
+
+The request whose nonce was replaced can then never execute. The MPC attests
+it unviable at the block holding the replacement, which lies above its
+`lastSeen`, and its complete circuit takes the failure branch: a withdrawal
+re-mints what it burned. An MPC that posts no attestation for a replaced
+request leaves it open, and whatever it surrendered stays burned. A
+replacement that races the original transaction decides which of the two
+mines, so the deployer replaces a nonce only when the original is in flight
+nowhere.
 
 ## Costs
 
