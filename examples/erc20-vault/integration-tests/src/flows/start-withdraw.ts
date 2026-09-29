@@ -30,7 +30,7 @@ import {
 
 import { logEvmFeeCap, logTokenAmount } from "../evm-logging.ts";
 import { ERC20_TRANSFER_SELECTOR } from "../evm-transfer.ts";
-import { VAULT_MPC_ROUTING } from "../mpc-routing.ts";
+import { TRANSFER_RESULT_MPC_ROUTING } from "../mpc-routing.ts";
 import type { VaultContext } from "../vault-context.ts";
 import { vaultTokenType } from "../vault-token.ts";
 import { flushUntil } from "./vault-queue.ts";
@@ -130,7 +130,7 @@ export async function startWithdraw(
     sender: { bytes: hexToBytes(stripHexPrefix(context.vaultContractAddress)) },
     keyVersion,
     path: VAULT_PATH_BYTES,
-    ...VAULT_MPC_ROUTING,
+    ...TRANSFER_RESULT_MPC_ROUTING,
     txParamType: TxParamType.evmType2,
     txParams: {
       to: erc20,
