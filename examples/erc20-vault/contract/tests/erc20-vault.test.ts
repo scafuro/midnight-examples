@@ -2,6 +2,7 @@
 // @midnight-ntwrk/compact-runtime. No ledger, no network, no proving.
 
 import {
+  ChargedState,
   type CircuitContext,
   createCircuitContext,
   createConstructorContext,
@@ -9,6 +10,8 @@ import {
   type EncodedZswapLocalState,
   rawTokenType,
   sampleContractAddress,
+  StateMap,
+  StateValue,
 } from "@midnight-ntwrk/compact-runtime";
 // This tree's wasm ContractState class: see signetStateProvider for why the
 // portal-linked signet module's state must round-trip through it.
@@ -74,6 +77,7 @@ import {
   type VaultPrivateState,
   witnesses,
 } from "../src/index.ts";
+import { compiledFieldIndex } from "./compiled-ledger.ts";
 
 // ---- Fixtures ----
 
@@ -265,9 +269,10 @@ const ledgerOf = (ctx: CircuitContext<VaultPrivateState>) => ledger(stateOf(ctx)
 
 /**
  * Deploy + initialise(VAULT_EVM, CHAIN_ID, MPC_RESPONSE_KEY) as
- * the deployer: the ready-to-use vault, with the MPC response key stored.
+ * the deployer: the ready-to-use vault, with the MPC response key stored and
+ * `evmStartHeight` as its last seen height.
  */
-const deployInitialised = async () => {
+const deployInitialised = async (evmStartHeight: bigint = EVM_START_HEIGHT) => {
   const { contract, ctx } = await deployContract();
   const next = (
     await contract.circuits.initialise(
@@ -279,7 +284,7 @@ const deployInitialised = async () => {
       CHAIN_ID,
       MPC_RESPONSE_KEY,
       MPC_KEY_VERSION,
-      EVM_START_HEIGHT,
+      evmStartHeight,
     )
   ).context;
   return { contract, ctx: next };
@@ -5568,4 +5573,312 @@ describe("attested block heights", () => {
     expect(record.path).toEqual(DEPLOYER_COMMITMENT);
     expect(record.txParams.nonce).toBe(VALID_DEPOSIT.evmNonce);
   });
+});
+
+describe("queueing and settling attestations", () => {
+  it("queueAttestation0 rejects a failure signed by a key other than the stored MPC response key", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    await expect(
+      contract.circuits.queueAttestation0(
+        ctx,
+        respond(IMPOSTER_SECRET, requestId, OutputKind.failed, OUTPUT_EMPTY, ATTESTED_HEIGHT),
+        OUTPUT_EMPTY,
+      ),
+    ).rejects.toThrow(/Invalid attestation signature/);
+  });
+
+  it("refuses a second attestation for a request whose first is still queued", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const attestation = respond(
+      MPC_RESPONSE_SECRET,
+      requestId,
+      OutputKind.executed,
+      OUTPUT_SUCCESS,
+      ATTESTED_HEIGHT,
+    );
+    const queued = (await contract.circuits.queueAttestation1(ctx, attestation, OUTPUT_SUCCESS))
+      .context;
+    await expect(
+      contract.circuits.queueAttestation1(queued, attestation, OUTPUT_SUCCESS),
+    ).rejects.toThrow(/Attestation already queued/);
+  });
+
+  it("refuses a second attestation for a request whose first is flushed", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const attestation = respond(
+      MPC_RESPONSE_SECRET,
+      requestId,
+      OutputKind.executed,
+      OUTPUT_SUCCESS,
+      ATTESTED_HEIGHT,
+    );
+    const attested = await attest(contract, ctx, attestation, OUTPUT_SUCCESS);
+    await expect(
+      contract.circuits.queueAttestation1(attested, attestation, OUTPUT_SUCCESS),
+    ).rejects.toThrow(/Attestation already flushed/);
+  });
+
+  it("completeDeposit refuses an attestation that is queued but not yet flushed", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const queued = (
+      await contract.circuits.queueAttestation1(
+        ctx,
+        respond(
+          MPC_RESPONSE_SECRET,
+          requestId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      )
+    ).context;
+    await expect(
+      contract.circuits.completeDeposit(
+        queued,
+        requestId,
+        OUTPUT_SUCCESS,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+    ).rejects.toThrow(/Attestation not flushed/);
+  });
+});
+
+// ---- Hand-built ledgers ----
+
+// Some guards hold invariants no sequence of circuit calls breaks: a send records the
+// event and the evictionMap entry while the output entry is open, and a complete removes
+// all three together. These helpers build the broken ledger by hand, so each such guard
+// is seen firing.
+
+/** The value of the vault ledger field `name` in `ctx`'s state. */
+const ledgerFieldOf = (ctx: CircuitContext<VaultPrivateState>, name: string): StateValue =>
+  compiledFieldIndex(name).reduce((node, index) => {
+    const child = node.asArray()?.at(index);
+    if (!child) {
+      throw new Error(`ledger field ${name} has no node at index ${String(index)}`);
+    }
+    return child;
+  }, ctx.callContext.currentQueryContext.state.state);
+
+/** `node` with the value at `path` below it replaced by `value`. */
+const replacedAt = (node: StateValue, path: readonly number[], value: StateValue): StateValue => {
+  const [index, ...rest] = path;
+  if (index === undefined) {
+    return value;
+  }
+  const children = node.asArray();
+  if (!children) {
+    throw new Error("a ledger path runs through a node that is not an array");
+  }
+  return children.reduce(
+    (rebuilt, child, i) => rebuilt.arrayPush(i === index ? replacedAt(child, rest, value) : child),
+    StateValue.newArray(),
+  );
+};
+
+/**
+ * Re-enter `ctx`'s state as its own caller, about to call `circuitId`, with the vault
+ * ledger field `name` replaced by `value`.
+ */
+const withLedgerField = async (
+  circuitId: string,
+  ctx: CircuitContext<VaultPrivateState>,
+  name: string,
+  value: StateValue,
+): Promise<CircuitContext<VaultPrivateState>> =>
+  createCircuitContext(
+    circuitId,
+    VAULT_ADDRESS,
+    CPK,
+    new ChargedState(
+      replacedAt(ctx.callContext.currentQueryContext.state.state, compiledFieldIndex(name), value),
+    ),
+    createVaultPrivateState(SECRET_KEY),
+    await signetStateProvider(),
+    undefined,
+    undefined,
+    undefined,
+    BLOCK_HASH,
+  );
+
+const EMPTY_MAP = StateValue.newMap(new StateMap());
+
+/** One complete circuit, arranged to reach its event check with a flushed failure. */
+interface EventMissingCase {
+  /** The complete circuit the row calls. */
+  name: string;
+  /** The action's event map, emptied by hand before the complete. */
+  eventMap: string;
+  /** Deploy, initialise and send one request of the action. */
+  requested: () => Promise<{
+    contract: Contract<VaultPrivateState>;
+    ctx: CircuitContext<VaultPrivateState>;
+    requestId: Uint8Array;
+  }>;
+  /** The complete call, passed every argument a failure verdict takes. */
+  complete: (
+    contract: Contract<VaultPrivateState>,
+    ctx: CircuitContext<VaultPrivateState>,
+    requestId: Uint8Array,
+  ) => Promise<unknown>;
+}
+
+const EVENT_MISSING_CASES: EventMissingCase[] = [
+  {
+    name: "completeDeposit",
+    eventMap: "bidirectionalDepositMap",
+    requested: depositRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeDeposit(
+        ctx,
+        requestId,
+        OUTPUT_IGNORED,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+  },
+  {
+    name: "completeWithdraw",
+    eventMap: "bidirectionalWithdrawMap",
+    requested: withdrawRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeWithdraw(ctx, requestId, OUTPUT_IGNORED, MINT_NONCE),
+  },
+  {
+    name: "completeApprove",
+    eventMap: "bidirectionalApproveMap",
+    requested: approveRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeApprove(ctx, requestId, OUTPUT_IGNORED),
+  },
+  {
+    name: "completeReplaceNonce",
+    eventMap: "bidirectionalReplaceNonceMap",
+    requested: replaceNonceRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeReplaceNonce(ctx, requestId, OUTPUT_IGNORED),
+  },
+  {
+    name: "completeSwap",
+    eventMap: "bidirectionalSwapMap",
+    requested: swapRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeSwap(ctx, requestId, OUTPUT_SWAP_IGNORED, MINT_NONCE, CHANGE_NONCE),
+  },
+  {
+    name: "completeSupply",
+    eventMap: "bidirectionalSupplyMap",
+    requested: supplyRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeSupply(ctx, requestId, OUTPUT_SUPPLY_IGNORED, MINT_NONCE),
+  },
+  {
+    name: "completeRedeem",
+    eventMap: "bidirectionalRedeemMap",
+    requested: redeemRequested,
+    complete: (contract, ctx, requestId) =>
+      contract.circuits.completeRedeem(ctx, requestId, OUTPUT_REDEEM_IGNORED, MINT_NONCE),
+  },
+];
+
+describe("invariant guards, on a ledger built by hand", () => {
+  it("queueAttestation1 refuses a sent request whose output entry is gone", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const broken = await withLedgerField(
+      "queueAttestation1",
+      ctx,
+      "outputRequestBuffer",
+      EMPTY_MAP,
+    );
+    await expect(
+      contract.circuits.queueAttestation1(
+        broken,
+        respond(
+          MPC_RESPONSE_SECRET,
+          requestId,
+          OutputKind.executed,
+          OUTPUT_SUCCESS,
+          ATTESTED_HEIGHT,
+        ),
+        OUTPUT_SUCCESS,
+      ),
+    ).rejects.toThrow(/Request not open/);
+  });
+
+  it("completeDeposit refuses an attested request whose output entry is gone", async () => {
+    const { contract, ctx, requestId } = await depositRequested();
+    const attested = await attest(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    const broken = await withLedgerField(
+      "completeDeposit",
+      attested,
+      "outputRequestBuffer",
+      EMPTY_MAP,
+    );
+    await expect(
+      contract.circuits.completeDeposit(
+        broken,
+        requestId,
+        OUTPUT_SUCCESS,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+    ).rejects.toThrow(/Request not open/);
+  });
+
+  it("completeDeposit refuses a flushed attestation at or below its entry's lastSeen", async () => {
+    // Queueing already refuses such an attestation, and nothing re-stamps an open
+    // entry, so the entry comes from a vault that flushed the same deposit later.
+    const { contract, ctx, requestId, outKey } = await depositRequested();
+    const attested = await attest(
+      contract,
+      ctx,
+      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
+      OUTPUT_SUCCESS,
+    );
+    const later = await deployInitialised(ATTESTED_HEIGHT);
+    const laterQueued = (await queueDeposit(later.contract, later.ctx, VALID_DEPOSIT)).context;
+    const laterFlushed = await flush(later.contract, laterQueued, [VALID_DEPOSIT.inIndex], []);
+
+    const restamped = await withLedgerField(
+      "completeDeposit",
+      attested,
+      "outputRequestBuffer",
+      ledgerFieldOf(laterFlushed, "outputRequestBuffer"),
+    );
+    expect(ledgerOf(restamped).outputRequestBuffer.lookup(outKey).lastSeen).toBe(ATTESTED_HEIGHT);
+    expect(ledgerOf(restamped).outputAttestationBuffer.lookup(requestId).blockHeight).toBe(
+      ATTESTED_HEIGHT,
+    );
+
+    await expect(
+      contract.circuits.completeDeposit(
+        restamped,
+        requestId,
+        OUTPUT_SUCCESS,
+        MINT_NONCE,
+        CALLER_RECIPIENT,
+      ),
+    ).rejects.toThrow(/Stale attestation/);
+  });
+
+  it.each(EVENT_MISSING_CASES)(
+    "$name refuses a settled request whose event is gone",
+    async ({ name, eventMap, requested, complete }) => {
+      const { contract, ctx, requestId } = await requested();
+      const attested = await attestFailure(
+        contract,
+        ctx,
+        respond(MPC_RESPONSE_SECRET, requestId, OutputKind.failed, OUTPUT_EMPTY, ATTESTED_HEIGHT),
+      );
+      const broken = await withLedgerField(name, attested, eventMap, EMPTY_MAP);
+      await expect(complete(contract, broken, requestId)).rejects.toThrow(/Request event missing/);
+    },
+  );
 });
