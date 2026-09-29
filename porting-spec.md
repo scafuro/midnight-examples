@@ -20,7 +20,8 @@ task is the first unticked one whose dependencies are ticked.
       (`fa0fcef`)
 - [x] Deposit e2e green on the settled pattern (all 20 e2e tests, fresh vault
       `7ec6c4b6…0a436f`)
-- [ ] **P0** Vault nonces and withdraw
+- [x] **P0** Vault nonces and withdraw (`7091e42`, all 46 e2e tests on a
+      fresh vault, full-width flushes accepted: see 1.5)
 - [ ] **P1a** Approvals (router and stata)
 - [ ] **P1b** Nonce replacement
 - [ ] **P2a** Swap
@@ -125,9 +126,12 @@ These were learned the hard way while building deposit. Treat them as facts.
   `vault-queue.ts` `submitFlush`: it builds the call by hand with the whole
   transcript in the fallible section. A flush that loses a race then lands as
   `FailFallible`, pays its fee, and `flushUntil` retries it.
-- **The flush's time budget.** With 10 slots and deposit-only entries the flush
-  uses about 12.3 ms of the 15 ms. At 20 slots it used 14.3 ms. Anything that
-  makes a flush slot heavier (the vault-nonce branch in Phase 0) must be
+- **The flush's time budget.** The flush's work runs in the fallible section,
+  so the node's limit counts only the proof check and the fee payment: the
+  cost of an empty flush of the same circuit. After P0 that is 12.56 ms of the
+  15.02 ms allowed (it was about 12.3 ms before the vault-nonce branch). Full
+  10-slot flushes of withdraw requests, deposit requests or attestations are
+  all accepted. Anything that makes the flush circuit bigger must be
   re-measured. To measure: prove and balance a flush transaction, call
   `tx.cost(LedgerParameters.initialParameters(), true)` (it throws, naming the
   exact dismiss time and the limit), then `facade.revertTransaction(tx)` to
