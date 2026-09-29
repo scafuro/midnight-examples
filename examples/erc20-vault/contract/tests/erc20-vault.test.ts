@@ -699,18 +699,18 @@ describe("deposit validation", () => {
     );
   });
 
-  it("an identical repeat names the same transaction and stays queued while the first is open", async () => {
+  it("an identical repeat names the same transaction and cannot be flushed while the first is open", async () => {
     const { contract, ctx } = await deployInitialised();
     const { context: afterFirst, outKey } = await deposit(contract, ctx, VALID_DEPOSIT);
     const repeat = { ...VALID_DEPOSIT, inIndex: 2n };
 
     const queued = (await queueDeposit(contract, afterFirst, repeat)).context;
     expect(queuedRequestKey(ledgerOf(queued), repeat.inIndex)).toEqual(outKey);
-    const flushed = await flush(contract, queued, [repeat.inIndex], []);
 
-    expect(ledgerOf(flushed).inputRequestBuffer.member(repeat.inIndex)).toBe(true);
-    expect(ledgerOf(flushed).outputRequestBuffer.size()).toBe(1n);
-    await expect(contract.circuits.sendDeposit(flushed, outKey)).rejects.toThrow(
+    await expect(flush(contract, queued, [repeat.inIndex], [])).rejects.toThrow(
+      /Identical request open/,
+    );
+    await expect(contract.circuits.sendDeposit(queued, outKey)).rejects.toThrow(
       /Request already sent/,
     );
   });
@@ -1351,16 +1351,16 @@ describe("vault nonces", () => {
     expect(ledgerOf(flushed).globalEvmNonce).toBe(0n);
   });
 
-  it("a skipped slot burns no nonce: the withdrawal behind a missing index still gets nonce 0", async () => {
+  it("a slot naming a missing index fails the flush, so the withdrawal ahead of it takes no nonce", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
     const missingIndex = 999n;
 
-    const skippedOnly = await flush(contract, queued, [missingIndex], []);
-    expect(ledgerOf(skippedOnly).globalEvmNonce).toBe(0n);
-    expect(ledgerOf(skippedOnly).inputRequestBuffer.member(VALID_WITHDRAW.inIndex)).toBe(true);
+    await expect(
+      flush(contract, queued, [VALID_WITHDRAW.inIndex, missingIndex], []),
+    ).rejects.toThrow(/Request not queued/);
 
-    const flushed = await flush(contract, queued, [missingIndex, VALID_WITHDRAW.inIndex], []);
+    const flushed = await flush(contract, queued, [VALID_WITHDRAW.inIndex], []);
     const state = ledgerOf(flushed);
     const outKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
     expect(state.outputRequestBuffer.lookup(outKey).entry.evmNonce).toBe(0n);
@@ -2459,17 +2459,16 @@ describe("replace nonce round-trip", () => {
     expect(state.globalEvmNonce).toBe(1n);
   });
 
-  it("a second replacement of the same nonce waits as a twin while the first is open", async () => {
+  it("a second replacement of the same nonce cannot be flushed while the first is open", async () => {
     const { contract, ctx } = await deployInitialised();
     const { context: sent, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
     const repeat = { ...VALID_REPLACE_NONCE, inIndex: VALID_REPLACE_NONCE.inIndex + 1n };
     const queuedRepeat = (await queueReplaceNonce(contract, sent, repeat)).context;
     expect(queuedRequestKey(ledgerOf(queuedRepeat), repeat.inIndex)).toEqual(outKey);
 
-    const flushed = await flush(contract, queuedRepeat, [repeat.inIndex], []);
-
-    expect(ledgerOf(flushed).inputRequestBuffer.member(repeat.inIndex)).toBe(true);
-    expect(ledgerOf(flushed).outputRequestBuffer.size()).toBe(1n);
+    await expect(flush(contract, queuedRepeat, [repeat.inIndex], [])).rejects.toThrow(
+      /Identical request open/,
+    );
   });
 });
 
@@ -5690,34 +5689,6 @@ describe("contention: user circuits never conflict, only flushes do", () => {
       expect(replay(stateOf(nonceFlush.context), actionFlush, true)).toMatch(outcome);
     },
   );
-
-  it("a flush that skipped a twin conflicts after the open request completes, and the complete applies", async () => {
-    const { contract, ctx, requestId } = await depositRequested();
-    const attested = await attest(
-      contract,
-      ctx,
-      respond(MPC_RESPONSE_SECRET, requestId, OutputKind.executed, OUTPUT_SUCCESS, ATTESTED_HEIGHT),
-      OUTPUT_SUCCESS,
-    );
-    const twin = { ...VALID_DEPOSIT, inIndex: VALID_DEPOSIT.inIndex + 1n };
-    const shared = (await queueDeposit(contract, attested, twin)).context;
-    const twinSkippingFlush = await contract.circuits.flushQueue(
-      shared,
-      flushSlots([twin.inIndex], []),
-    );
-    const complete = await contract.circuits.completeDeposit(
-      shared,
-      requestId,
-      OUTPUT_SUCCESS,
-      MINT_NONCE,
-      CALLER_RECIPIENT,
-    );
-    expect(ledgerOf(twinSkippingFlush.context).inputRequestBuffer.member(twin.inIndex)).toBe(true);
-
-    expect(replay(stateOf(shared), twinSkippingFlush)).toBe("applied");
-    expect(replay(stateOf(complete.context), twinSkippingFlush, true)).toMatch(READ_CONFLICT);
-    expect(replay(stateOf(twinSkippingFlush.context), complete, true)).toBe("applied");
-  });
 });
 
 describe("flushQueue", () => {
@@ -5725,39 +5696,28 @@ describe("flushQueue", () => {
     {
       name: "a request slot naming an index nothing is queued under",
       slots: flushSlots([999n], []),
+      error: /Request not queued/,
     },
     {
       name: "an attestation slot naming a request id with no queued attestation",
       slots: flushSlots([], [bytes(32, 0x5a)]),
+      error: /Attestation not queued/,
     },
-  ])("$name leaves the ledger as it was", async ({ slots }) => {
+  ])("$name fails the flush", async ({ slots, error }) => {
     const { contract, ctx } = await busyVault();
-    const flushed = (await contract.circuits.flushQueue(ctx, slots)).context;
-    expect(flushed.callContext.currentQueryContext.state.toString()).toBe(
-      ctx.callContext.currentQueryContext.state.toString(),
-    );
+    await expect(contract.circuits.flushQueue(ctx, slots)).rejects.toThrow(error);
   });
 
-  it("a request slot repeated in one flush moves the entry once, taking one vault nonce", async () => {
+  it("a request slot repeated in one flush fails it: the entry has moved by the second slot", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
 
-    const flushed = await flush(
-      contract,
-      queued,
-      [VALID_WITHDRAW.inIndex, VALID_WITHDRAW.inIndex],
-      [],
-    );
-
-    const state = ledgerOf(flushed);
-    const outKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
-    expect(state.inputRequestBuffer.isEmpty()).toBe(true);
-    expect(state.outputRequestBuffer.size()).toBe(1n);
-    expect(state.outputRequestBuffer.lookup(outKey).entry.evmNonce).toBe(0n);
-    expect(state.globalEvmNonce).toBe(1n);
+    await expect(
+      flush(contract, queued, [VALID_WITHDRAW.inIndex, VALID_WITHDRAW.inIndex], []),
+    ).rejects.toThrow(/Request not queued/);
   });
 
-  it("an attestation slot repeated in one flush moves the record once", async () => {
+  it("an attestation slot repeated in one flush fails it: the record has moved by the second slot", async () => {
     const { contract, ctx, requestId } = await depositRequested();
     const queued = (
       await contract.circuits.queueAttestation1(
@@ -5767,16 +5727,12 @@ describe("flushQueue", () => {
       )
     ).context;
 
-    const flushed = await flush(contract, queued, [], [requestId, requestId]);
-
-    const state = ledgerOf(flushed);
-    expect(state.inputAttestationBuffer.isEmpty()).toBe(true);
-    expect(state.outputAttestationBuffer.size()).toBe(1n);
-    expect(state.outputAttestationBuffer.lookup(requestId).blockHeight).toBe(BUSY_HEIGHT);
-    expect(state.globalLastSeen).toBe(BUSY_HEIGHT);
+    await expect(flush(contract, queued, [], [requestId, requestId])).rejects.toThrow(
+      /Attestation not queued/,
+    );
   });
 
-  it("of two twins in one flush, the first moves and the second waits queued", async () => {
+  it("two twins in one flush fail it, and the first flushed alone moves while the second waits queued", async () => {
     const { contract, ctx } = await deployInitialised();
     const twin = { ...VALID_DEPOSIT, inIndex: VALID_DEPOSIT.inIndex + 1n };
     const queuedFirst = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
@@ -5784,7 +5740,10 @@ describe("flushQueue", () => {
     const outKey = queuedRequestKey(ledgerOf(queuedBoth), VALID_DEPOSIT.inIndex);
     expect(queuedRequestKey(ledgerOf(queuedBoth), twin.inIndex)).toEqual(outKey);
 
-    const flushed = await flush(contract, queuedBoth, [VALID_DEPOSIT.inIndex, twin.inIndex], []);
+    await expect(
+      flush(contract, queuedBoth, [VALID_DEPOSIT.inIndex, twin.inIndex], []),
+    ).rejects.toThrow(/Identical request open/);
+    const flushed = await flush(contract, queuedBoth, [VALID_DEPOSIT.inIndex], []);
 
     const state = ledgerOf(flushed);
     expect(state.outputRequestBuffer.size()).toBe(1n);
@@ -5793,20 +5752,17 @@ describe("flushQueue", () => {
     expect(state.inputRequestBuffer.member(twin.inIndex)).toBe(true);
   });
 
-  it("skips an identical repeat of an open request and still moves the rest of its batch", async () => {
+  it("an identical repeat of an open request fails its whole batch, even when it comes last", async () => {
     const { contract, ctx } = await deployInitialised();
     const afterFirst = (await deposit(contract, ctx, VALID_DEPOSIT)).context;
     const repeat = { ...VALID_DEPOSIT, inIndex: 2n };
     const other = { ...VALID_DEPOSIT, inIndex: 3n, evmNonce: VALID_DEPOSIT.evmNonce + 1n };
     const queuedRepeat = (await queueDeposit(contract, afterFirst, repeat)).context;
     const queuedBoth = (await queueDeposit(contract, queuedRepeat, other)).context;
-    const otherKey = queuedRequestKey(ledgerOf(queuedBoth), other.inIndex);
 
-    const flushed = await flush(contract, queuedBoth, [repeat.inIndex, other.inIndex], []);
-
-    expect(ledgerOf(flushed).inputRequestBuffer.member(repeat.inIndex)).toBe(true);
-    expect(ledgerOf(flushed).inputRequestBuffer.member(other.inIndex)).toBe(false);
-    expect(ledgerOf(flushed).outputRequestBuffer.member(otherKey)).toBe(true);
+    await expect(flush(contract, queuedBoth, [other.inIndex, repeat.inIndex], [])).rejects.toThrow(
+      /Identical request open/,
+    );
   });
 
   it("an attestation below globalLastSeen leaves it unchanged", async () => {
@@ -6301,7 +6257,7 @@ describe("attested block heights", () => {
     { name: "attestation slot first", order: [FlushChannel.attestation, FlushChannel.request] },
     { name: "repeat slot first", order: [FlushChannel.request, FlushChannel.attestation] },
   ])(
-    "a repeat queued while the first is open waits for it to settle ($name) and cannot reuse its attestation",
+    "a repeat queued while the first is open fails a flush beside its attestation ($name), and once settled cannot reuse it",
     async ({ order }) => {
       const { contract, ctx, requestId } = await depositRequested();
       const repeat = { ...VALID_DEPOSIT, inIndex: 2n };
@@ -6318,13 +6274,16 @@ describe("attested block heights", () => {
         await contract.circuits.queueAttestation1(queuedRepeat, attestation, OUTPUT_SUCCESS)
       ).context;
       // Whatever the slot order, the first request is still open, so the
-      // repeat's slot is skipped and the repeat stays queued.
+      // repeat's slot fails the flush.
       const slotFor = (channel: FlushChannel) =>
         channel === FlushChannel.request
           ? { channel, inIndex: repeat.inIndex, requestId: new Uint8Array(32) }
           : { channel, inIndex: 0n, requestId };
       const slots = [...order.map(slotFor), ...flushSlots([], []).slice(order.length)];
-      const oneFlush = (await contract.circuits.flushQueue(queuedBoth, slots)).context;
+      await expect(contract.circuits.flushQueue(queuedBoth, slots)).rejects.toThrow(
+        /Identical request open/,
+      );
+      const oneFlush = await flush(contract, queuedBoth, [], [requestId]);
       expect(ledgerOf(oneFlush).inputRequestBuffer.member(repeat.inIndex)).toBe(true);
       expect(ledgerOf(oneFlush).globalLastSeen).toBe(settledAt);
 

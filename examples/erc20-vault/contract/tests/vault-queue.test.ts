@@ -3,7 +3,9 @@
 // the chain serves, and the helpers assemble the transaction as they do live. The
 // chain lands a flush by running its transcript against the state it holds at that
 // moment, so a flush built on a state another flush has since changed fails its
-// fallible section, as it does on a node. Proving, balancing and fees are stand-ins.
+// fallible section, as it does on a node. A flush can also land between a helper's
+// ledger read and its build, which the build then runs on. Proving, balancing and fees
+// are stand-ins.
 
 import { readFileSync } from "node:fs";
 
@@ -336,20 +338,34 @@ const runFlush = (
 
 /**
  * A chain serving `initial`, landing the n-th submitted flush as `landings[n]` says, and
- * every flush past the script as {@link LandingKind.Runs}.
+ * every flush past the script as {@link LandingKind.Runs}. The n-th flush built reads
+ * `landedBeforeBuild[n]` when one is given: the state another flush left after the
+ * helper read the ledger.
  */
-const fakeChain = (initial: ContractState, landings: Landing[] = []): FakeChain => {
+const fakeChain = (
+  initial: ContractState,
+  landings: Landing[] = [],
+  landedBeforeBuild: ContractState[] = [],
+): FakeChain => {
   let state = initial;
   const statuses: TxStatus[] = [];
   const landed = new Map<string, { tx: FinalizedTransaction; status: TxStatus }>();
   let pendingStatus: TxStatus = SucceedEntirely;
   let submitted = 0;
+  let built = 0;
 
   const providers: VaultProviders = {
     publicDataProvider: {
       queryContractState: () => Promise.resolve(state),
-      queryZSwapAndContractState: () =>
-        Promise.resolve([new ZswapChainState(), state, LedgerParameters.initialParameters()]),
+      queryZSwapAndContractState: () => {
+        state = landedBeforeBuild[built] ?? state;
+        built += 1;
+        return Promise.resolve([
+          new ZswapChainState(),
+          state,
+          LedgerParameters.initialParameters(),
+        ]);
+      },
       queryBlock: () => Promise.resolve({ hash: "00".repeat(32), height: 1 }),
       watchForTxData: (txId): Promise<FinalizedTxData> => {
         const entry = landed.get(txId);
@@ -632,6 +648,21 @@ describe("flushPending: a flush that loses its race", () => {
   });
 });
 
+describe("flushPending: a flush that lands between the ledger read and the build", () => {
+  it("fails the build on flushQueue's assert and submits nothing", async () => {
+    const { contract, ctx, serve } = await arrangeVault(AWAITED_VAULT);
+    const competitor = serve(
+      (await contract.circuits.flushQueue(ctx, flushSlots([AWAITED.inIndex], []))).context,
+    );
+    const chain = fakeChain(serve(ctx), [], [competitor]);
+
+    await expect(
+      flushPending(chain.providers, VAULT_COMPILED_CONTRACT, VAULT_ADDRESS, AWAITED_FIRST),
+    ).rejects.toThrow("failed assert: Request not queued");
+    expect(chain.statuses).toEqual([]);
+  });
+});
+
 describe("flushPending: nothing to move", () => {
   it.each([
     { name: "an empty vault", vault: EMPTY_VAULT, firstIndexes: [] },
@@ -719,6 +750,28 @@ describe("flushUntil", () => {
     );
 
     expect(chain.statuses).toEqual([FailFallible, SucceedEntirely]);
+    expect(awaitedMoved(state)).toBe(true);
+    expect(state.globalLastSeen).toBe(ATTESTED_HEIGHT);
+  });
+
+  it("retries a flush whose build found an item another flush moved, and the retry moves the awaited item", async () => {
+    const { contract, ctx, attestedIds, serve } = await arrangeVault(AWAITED_VAULT);
+    // Another flusher folds the attestation after flushPending chose it with the awaited
+    // request: the build's attestation slot then names a record that is gone.
+    const competitor = serve(
+      (await contract.circuits.flushQueue(ctx, flushSlots([], attestedIds))).context,
+    );
+    const chain = fakeChain(serve(ctx), [], [competitor]);
+
+    const state = await flushUntil(
+      chain.providers,
+      VAULT_COMPILED_CONTRACT,
+      VAULT_ADDRESS,
+      awaitedMoved,
+      AWAITED_FIRST,
+    );
+
+    expect(chain.statuses).toEqual([SucceedEntirely]);
     expect(awaitedMoved(state)).toBe(true);
     expect(state.globalLastSeen).toBe(ATTESTED_HEIGHT);
   });

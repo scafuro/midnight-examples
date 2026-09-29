@@ -1,9 +1,10 @@
 // The concurrent-flush e2e flow: two wallets flush the same queued item at once, and the
 // user's own transactions still never fail. The user wallet runs a deposit round trip while
 // a second funded wallet (the `bearer` role wallet) flushes every item the user queues. Both
-// flushes carry the same item and are built against the same ledger state, so one lands and
-// the other lands as `FailFallible`, which the SDK's `flushUntil` catches before going round
-// again. The race runs twice: on the deposit request's flush and on its attestation's flush.
+// flushes carry the same item, so one lands and the other loses: it lands as `FailFallible`
+// when it was built before the winner landed, and fails to build on a `flushQueue` assert
+// when it was built after. The SDK's `flushUntil` catches either before going round again.
+// The race runs twice: on the deposit request's flush and on its attestation's flush.
 //
 // Load limits: two submitting wallets, each with at most one transaction unconfirmed at a
 // time. Node error 170 (InvalidDustSpendProof) has left a loaded local stack rejecting every
@@ -121,8 +122,9 @@ async function flushAlongside(context: VaultContext, stop: AbortSignal): Promise
   }
 }
 
-// The SDK's flushUntil logs this line each time a flush it submitted lands as FailFallible,
-// then goes round again: counting it is how this file observes a lost race.
+// The SDK's flushUntil logs this line each time one of its flushes loses a race (lands as
+// FailFallible or fails to build on a flushQueue assert), then goes round again: counting it
+// is how this file observes a lost race.
 const LOST_RACE_LOG = "lost a race to another flush";
 
 /** What {@link withSecondFlusher} hands back. */
@@ -339,7 +341,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
     it("race outcome: a flush lost a race to the other wallet's flush and flushUntil went round again", () => {
       expect(
         lostRaces,
-        "both wallets flushed the same items from the same state, so a flush must have landed as FailFallible and been retried",
+        "both wallets flushed the same items, so a flush must have lost the race and been retried",
       ).toBeGreaterThanOrEqual(1);
     });
 

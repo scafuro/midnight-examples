@@ -156,15 +156,13 @@ flushes touch shared state.
 - **Empty slot.** Does nothing, so a flush with fewer than 10 waiting items is
   still a valid call.
 
-A slot whose key is not in its input buffer does nothing. So does a request
-slot whose twin (an entry with the same request key) is still open: the twin
-stays in `inputRequestBuffer`, and a later flush moves it once the open request
-settles. The twin check comes before the entry is removed from the input
-buffer, as a skipped slot is part of a transaction that succeeds and commits
-whatever the slot already did. Nothing a user queues can therefore make a flush
-fail. A complete can still make a flush built before it fail: a flush that
-skipped a twin read the open entry the complete removes, so that flush is
-rebuilt, like any flush that loses a race.
+A slot whose key is not in its input buffer fails the whole flush, with
+`Request not queued` or `Attestation not queued`. So does a request slot whose
+twin (an entry with the same request key) is still open, with `Identical
+request open`: the twin stays in `inputRequestBuffer`, and a later flush moves
+it once the open request settles. The flush fails when it is built, so it
+commits nothing and takes no vault nonce. A flush fails only on the items its
+caller names, so what a user queues can never fail someone else's flush.
 
 Slots run in order, so within one flush a request slot placed after an
 attestation slot sees that attestation's height in its `lastSeen`.
@@ -187,8 +185,8 @@ because of a flush.
 The SDK's `flushPending` fills the slots from the ledger, up to 10 items: the
 items its caller names first, then queued attestations, then queued requests,
 each in ledger order. It leaves out a caller-signed request whose twin is open,
-or whose request key an earlier request in the batch already takes, as the
-flush would skip it, and it submits nothing when no item would move. A
+or whose request key an earlier request in the batch already takes, as it would
+fail the flush, and it submits nothing when no item would move. A
 vault-signed request is never left out: its key covers the nonce the flush
 assigns, so it has no twin, and for the same reason its key is known only after
 its flush (`flushedRequestKey` reads it). So another user's waiting repeats
@@ -307,7 +305,8 @@ only reader and writer.
   advances only once the entry moves. Assigning before advancing gives the
   first vault request nonce 0, the account's next unused nonce: any other start
   would leave every later vault transaction waiting behind a nonce no request
-  uses. A skipped slot advances nothing, so it never burns a nonce.
+  uses. A flush that fails on any slot commits nothing, so it never burns a
+  nonce.
 - **Such requests never collide.** Each carries a nonce the flush assigned
   once, so their request keys are unique and they never wait as twins, even
   when two withdrawals are otherwise identical.

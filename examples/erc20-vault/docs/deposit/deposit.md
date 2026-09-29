@@ -96,8 +96,9 @@ As illustrated, the flow comprises 10 steps:
     its request key, a hash of every field that determines the EVM
     transaction, and records the current `globalLastSeen` as the entry's
     `lastSeen`, the bound its attestation must beat in step 8.
-  - An identical deposit already open holds the same request key, so the
-    slot skips this one until the first settles (see
+  - An identical deposit already open holds the same request key, so a flush
+    carrying this one fails until the first settles, and the SDK leaves it out
+    until then (see
     [The last seen height](../contention-handling.md#the-last-seen-height)).
   - The flush is permissionless and carries whichever waiting items its caller
     chooses. The flow submits it through the SDK's

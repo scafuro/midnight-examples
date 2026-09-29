@@ -307,24 +307,19 @@ export circuit flushQueue(slots: Vector<10, FlushSlot>): [] {
   }
 }
 
-// A slot naming an index that is not queued is a no-op. So is one whose twin (same
-// requestKey) is still open: the twin stays queued until the open request settles.
-// The twin check must precede the remove, as a skipped slot commits whatever ran.
-// A vault-signed entry takes globalEvmNonce BEFORE its key is computed, so its key is
-// unique, and the nonce advances only once the entry moves: the first vault request
-// gets nonce 0, and a skipped slot never burns one.
+// A slot naming an index that is not queued fails the flush, and so does one whose
+// twin (same requestKey) is still open: the twin stays queued until the open request
+// settles. A vault-signed entry takes globalEvmNonce BEFORE its key is computed, so its
+// key is unique, and the nonce advances only once the entry moves: the first vault
+// request gets nonce 0.
 circuit flushRequest(inIndex: Uint<64>): [] {
-  if (!inputRequestBuffer.member(inIndex)) {
-    return;
-  }
+  assert(inputRequestBuffer.member(inIndex), "Request not queued");
   const queued = inputRequestBuffer.lookup(inIndex);
   const entry = queued.nonceIsVault
     ? RequestBufferEntry { ...queued, evmNonce: globalEvmNonce }
     : queued;
   const outKey = requestKey(entry);
-  if (outputRequestBuffer.member(outKey)) {
-    return;
-  }
+  assert(!outputRequestBuffer.member(outKey), "Identical request open");
   inputRequestBuffer.remove(inIndex);
   outputRequestBuffer.insert(outKey, OutputRequestEntry {
     entry: entry,
@@ -335,11 +330,9 @@ circuit flushRequest(inIndex: Uint<64>): [] {
   }
 }
 
-// A slot naming a request id with no queued attestation is a no-op.
+// A slot naming a request id with no queued attestation fails the flush.
 circuit flushAttestation(requestId: RequestId): [] {
-  if (!inputAttestationBuffer.member(requestId)) {
-    return;
-  }
+  assert(inputAttestationBuffer.member(requestId), "Attestation not queued");
   const record = inputAttestationBuffer.lookup(requestId);
   inputAttestationBuffer.remove(requestId);
   if (record.blockHeight > globalLastSeen) {

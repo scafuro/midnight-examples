@@ -198,8 +198,8 @@ export interface FlushItems {
 
 // Up to FLUSH_WIDTH items that would move: `first` ahead of the rest, attestations ahead
 // of requests. A caller-signed request whose request key is open, or taken by an
-// earlier request in the batch, would be skipped by the flush, so it is left out. A
-// vault-signed request never is: the flush gives it a nonce no other request holds.
+// earlier request in the batch, would fail the flush, so it is left out. A vault-signed
+// request never is: the flush gives it a nonce no other request holds.
 function movableItems(state: VaultLedgerState, first: FlushItems): FlushItems {
   const requestIds: Uint8Array[] = [];
   const inIndexes: bigint[] = [];
@@ -235,11 +235,14 @@ function movableItems(state: VaultLedgerState, first: FlushItems): FlushItems {
 
 /**
  * Flushes up to FLUSH_WIDTH waiting items, whoever queued them: `first` ahead of the
- * rest, then queued attestations, then queued requests, in ledger order. Requests the
- * flush would skip (an identical caller-signed request is open) are left out, and nothing is
- * submitted when no item would move. The flush's ledger work runs in the transaction's
- * fallible section, so a flush that loses a race to another flush lands as a
- * {@link CallTxFailedError} with status `FailFallible` and still pays its fee.
+ * rest, then queued attestations, then queued requests, in ledger order. Requests that
+ * would fail the flush (an identical caller-signed request is open) are left out, and
+ * nothing is submitted when no item would move. The items are chosen from one ledger
+ * read and the flush is built on a second, so another flush landing between them fails
+ * the build with one of `flushQueue`'s own asserts. The
+ * flush's ledger work runs in the transaction's fallible section, so a flush that loses
+ * a race to another flush after it is built lands as a {@link CallTxFailedError} with
+ * status `FailFallible` and still pays its fee.
  *
  * @param providers - The vault's provider set, whose wallet pays for the flush.
  * @param compiledContract - The vault's compiled contract.
@@ -247,6 +250,8 @@ function movableItems(state: VaultLedgerState, first: FlushItems): FlushItems {
  * @param first - Items to carry ahead of every other waiting item.
  * @returns How many slots the flush filled, 0 when it submitted nothing.
  * @throws {CallTxFailedError} When the flush lands but does not succeed entirely.
+ * @throws {Error} With `flushQueue`'s assert message when another flush moved an
+ *   item after it was chosen.
  */
 export async function flushPending(
   providers: VaultProviders,
@@ -266,9 +271,15 @@ export async function flushPending(
   return requestIds.length + inIndexes.length;
 }
 
+// The asserts flushQueue trips on a slot whose item another flush has moved, or whose
+// twin another flush has opened. The text must match the contract's assert messages.
+const FLUSH_RACE_ASSERT =
+  /^failed assert: (?:Request not queued|Identical request open|Attestation not queued)$/;
+
 /**
  * Flushes, carrying `first` ahead of every other waiting item, until `flushed` holds for
- * the ledger. A flush that loses its block to another flush is retried.
+ * the ledger. A flush that loses a race to another flush is retried, whether it landed
+ * as `FailFallible` or failed to build on one of `flushQueue`'s own asserts.
  *
  * @param providers - The vault's provider set, whose wallet pays for the flushes.
  * @param compiledContract - The vault's compiled contract.
@@ -295,9 +306,11 @@ export async function flushUntil(
     try {
       carried = await flushPending(providers, compiledContract, vaultContractAddress, first);
     } catch (error) {
-      if (!(error instanceof CallTxFailedError && error.finalizedTxData.status === FailFallible)) {
-        throw error;
-      }
+      const lostRace =
+        error instanceof CallTxFailedError
+          ? error.finalizedTxData.status === FailFallible
+          : error instanceof Error && FLUSH_RACE_ASSERT.test(error.message);
+      if (!lostRace) throw error;
       console.log(`flush attempt ${String(attempt + 1)} lost a race to another flush`);
       continue;
     }
