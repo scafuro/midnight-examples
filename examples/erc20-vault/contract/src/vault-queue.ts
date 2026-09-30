@@ -101,7 +101,7 @@ export function queuedRequestIndex(state: VaultLedgerState, inIndex: bigint): Ui
     throw new Error(`no request is queued under input index ${String(inIndex)}`);
   }
   const entry = state.inputRequestBuffer.lookup(inIndex);
-  if (entry.nonceIsVault) {
+  if (entry.useNextVaultAccountNonce) {
     throw new Error(
       `the request under input index ${String(inIndex)} is vault-signed: its index covers the nonce the flush assigns, read it with flushedRequestIndex once flushed`,
     );
@@ -217,7 +217,7 @@ function movableItems(state: VaultLedgerState, first: FlushItems): FlushItems {
     if (requestIds.length + inIndexes.length === FLUSH_WIDTH || takenInIndexes.has(inIndex)) return;
     if (!state.inputRequestBuffer.member(inIndex)) return;
     const entry = state.inputRequestBuffer.lookup(inIndex);
-    if (!entry.nonceIsVault) {
+    if (!entry.useNextVaultAccountNonce) {
       const index = pureCircuits.requestIndex(entry);
       const hex = bytesToHex(index);
       if (takenRequestIndexes.has(hex) || state.outputRequestBuffer.member(index)) return;

@@ -370,7 +370,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
           context.vaultContractAddress,
         );
         expect(await minedNonce(context.evmRpcUrl, context.evmVaultAddress)).toBe(
-          state.globalEvmNonce,
+          state.vaultAccountNonce,
         );
 
         banner([

@@ -526,7 +526,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault happy-day e2e",
       // suite's funds cycle.
       const vaultNonceBefore = (
         await readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress)
-      ).globalEvmNonce;
+      ).vaultAccountNonce;
 
       withdrawTransactionSignatureRequestId = await startWithdraw(context, {
         amount: WITHDRAW_AMOUNT,

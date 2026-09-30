@@ -271,7 +271,7 @@ export ledger mpcResponseKey: Secp256k1Point;
 // The two cells every request shares, read and written only by flushQueue
 // (initialise sets globalLastSeen once).
 export ledger globalLastSeen: Uint<64>;
-export ledger globalEvmNonce: Uint<64>;
+export ledger vaultAccountNonce: Uint<64>;
 
 export ledger inputRequestBuffer: Map<Uint<64>, RequestBufferEntry>;
 export ledger outputRequestBuffer: Map<Bytes<32>, OutputRequestEntry>;

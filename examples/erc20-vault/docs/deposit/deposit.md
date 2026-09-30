@@ -79,7 +79,7 @@ As illustrated, the flow comprises 10 steps:
   - It then queues a
     [`RequestBufferEntry`](../../contract/src/erc20-vault.compact) in
     `inputRequestBuffer` under the same index: the action, the named nonce
-    (`nonceIsVault` unset, so it is taken verbatim), the index, an
+    (`useNextVaultAccountNonce` unset, so it is taken verbatim), the index, an
     [`ownershipCommitment`](../../contract/src/erc20-vault.compact) of the
     index and the caller's secret, and a hash of the arguments. The ownership
     commitment is deliberately not the `userCommitment`, so the request's

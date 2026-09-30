@@ -55,7 +55,7 @@ Ledger rows:
   `approveArgsMap` (`ApproveArgs`), `replaceNonceArgsMap` (`ReplaceNonceArgs`),
   `swapArgsMap` (`SwapArgs`), `supplyArgsMap` (`SupplyArgs`) and
   `redeemArgsMap` (`RedeemArgs`).
-- Add the request queue: `ledger globalLastSeen`, `ledger globalEvmNonce`,
+- Add the request queue: `ledger globalLastSeen`, `ledger vaultAccountNonce`,
   `ledger inputRequestBuffer { Uint<64>: RequestBufferEntry }`,
   `ledger outputRequestBuffer { Bytes<32>: OutputRequestEntry }`,
   `ledger inputAttestationBuffer { RequestId: AttestationRecord }`,
@@ -120,7 +120,7 @@ Contract box:
 - Add `ledger globalLastSeen`, `ledger mpcKeyVersion`, the four buffers
   (`inputRequestBuffer`, `outputRequestBuffer`, `inputAttestationBuffer`,
   `outputAttestationBuffer`) and `ledger evictionMap`. `flushQueue` also names
-  `globalEvmNonce`, but reads it only for a vault-signed entry, never for a
+  `vaultAccountNonce`, but reads it only for a vault-signed entry, never for a
   deposit: leave it off unless the membership rule is read to include it.
 - Keep `ledger initialised`, `ledger evmChainId`, `ledger mpcResponseKey` and
   `ledger vaultEvmAddress`.
@@ -162,7 +162,7 @@ Contract box:
 - Delete `ledger signetRequestNonce` and
   `ledger withdrawSettleViews { RequestId: WithdrawSettleView }`.
 - Add `ledger withdrawArgsMap { Uint<64>: WithdrawArgs }`,
-  `ledger globalLastSeen`, `ledger globalEvmNonce`, `ledger mpcKeyVersion`,
+  `ledger globalLastSeen`, `ledger vaultAccountNonce`, `ledger mpcKeyVersion`,
   `ledger vaultGasLimits`, `ledger vaultMaxFeePerGas`,
   `ledger vaultMaxPriorityFeePerGas`, the four buffers and
   `ledger evictionMap`.
@@ -207,7 +207,7 @@ Contract box:
   `ledger bidirectionalSwapMap { RequestId: SignBidirectionalEvent }`.
 - Replace `ledger swapSettleViews { RequestId: SwapSettleView }` with
   `ledger swapArgsMap { Uint<64>: SwapArgs }`.
-- Add `ledger globalLastSeen`, `ledger globalEvmNonce`,
+- Add `ledger globalLastSeen`, `ledger vaultAccountNonce`,
   `ledger mpcKeyVersion`, `ledger vaultGasLimits`,
   `ledger vaultMaxFeePerGas`, `ledger vaultMaxPriorityFeePerGas`, the four
   buffers and `ledger evictionMap`. Keep `ledger uniswapRouter`,
@@ -253,7 +253,7 @@ Contract box:
   `ledger bidirectionalSupplyMap { RequestId: SignBidirectionalEvent }`.
 - Replace `ledger supplySettleViews { RequestId: SupplySettleView }` with
   `ledger supplyArgsMap { Uint<64>: SupplyArgs }`.
-- Add `ledger globalLastSeen`, `ledger globalEvmNonce`,
+- Add `ledger globalLastSeen`, `ledger vaultAccountNonce`,
   `ledger mpcKeyVersion`, `ledger vaultGasLimits`,
   `ledger vaultMaxFeePerGas`, `ledger vaultMaxPriorityFeePerGas`, the four
   buffers and `ledger evictionMap`. Keep `ledger stataUnderlying`,
@@ -300,7 +300,7 @@ Contract box:
   `ledger bidirectionalRedeemMap { RequestId: SignBidirectionalEvent }`.
 - Replace `ledger redeemSettleViews { RequestId: RedeemSettleView }` with
   `ledger redeemArgsMap { Uint<64>: RedeemArgs }`.
-- Add `ledger globalLastSeen`, `ledger globalEvmNonce`,
+- Add `ledger globalLastSeen`, `ledger vaultAccountNonce`,
   `ledger mpcKeyVersion`, `ledger vaultGasLimits`,
   `ledger vaultMaxFeePerGas`, `ledger vaultMaxPriorityFeePerGas`, the four
   buffers and `ledger evictionMap`. Keep `ledger stataUnderlying`,

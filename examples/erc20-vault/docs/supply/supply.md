@@ -61,7 +61,7 @@ As illustrated, the flow comprises 9 steps:
     re-mint it.
   - The circuit copies the vault's gas settings for a supply into
     [`supplyArgsMap`](../../contract/src/erc20-vault.compact) beside the
-    request, and queues the entry with `nonceIsVault` set and the supplier's
+    request, and queues the entry with `useNextVaultAccountNonce` set and the supplier's
     [`ownershipCommitment`](../../contract/src/erc20-vault.compact).
   - Off chain, [`start-supply.ts`](../../integration-tests/src/flows/start-supply.ts)
     funds the coin of the underlying's colour from the caller's shielded
@@ -69,7 +69,7 @@ As illustrated, the flow comprises 9 steps:
     the underlying vault token, so a deposit of the underlying comes first.
 - **2.** flushQueue(...) assigns the vault nonce and moves the request into the output buffer
   - The flush gives the entry the vault account's next EVM nonce
-    ([`globalEvmNonce`](../../contract/src/erc20-vault.compact)) and moves it
+    ([`vaultAccountNonce`](../../contract/src/erc20-vault.compact)) and moves it
     into `outputRequestBuffer`, exactly as it does for a
     [withdrawal](../withdraw/withdraw.md). `start-supply.ts` then reads the
     entry's index with [`flushedRequestIndex`](../../contract/src/vault-queue.ts).

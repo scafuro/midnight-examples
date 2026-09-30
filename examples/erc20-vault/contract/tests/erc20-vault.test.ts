@@ -667,7 +667,7 @@ describe("deposit round-trip", () => {
     const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.deposit,
-      nonceIsVault: false,
+      useNextVaultAccountNonce: false,
       evmNonce: VALID_DEPOSIT.evmNonce,
       inIndex: VALID_DEPOSIT.inIndex,
       commitment: pureCircuits.ownershipCommitment(VALID_DEPOSIT.inIndex, SECRET_KEY),
@@ -1310,7 +1310,7 @@ describe("withdraw round-trip", () => {
     const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.withdraw,
-      nonceIsVault: true,
+      useNextVaultAccountNonce: true,
       evmNonce: 0n,
       inIndex: VALID_WITHDRAW.inIndex,
       commitment: pureCircuits.ownershipCommitment(VALID_WITHDRAW.inIndex, SECRET_KEY),
@@ -1323,7 +1323,7 @@ describe("withdraw round-trip", () => {
     });
     expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
-    expect(ledger(state).globalEvmNonce).toBe(1n);
+    expect(ledger(state).vaultAccountNonce).toBe(1n);
   });
 
   it("start burns the surrendered coin: received by the vault, then paid in full to the burn address", async () => {
@@ -1390,7 +1390,7 @@ describe("withdraw round-trip", () => {
 describe("vault nonces", () => {
   it("initialise leaves the vault nonce at 0", async () => {
     const { ctx } = await deployInitialised();
-    expect(ledgerOf(ctx).globalEvmNonce).toBe(0n);
+    expect(ledgerOf(ctx).vaultAccountNonce).toBe(0n);
   });
 
   it("one flush assigns two identical withdrawals nonces 0 and 1 in slot order, and both move", async () => {
@@ -1409,7 +1409,7 @@ describe("vault nonces", () => {
     expect(nonceOf(VALID_WITHDRAW.inIndex)).toBe(1n);
     expect(state.inputRequestBuffer.isEmpty()).toBe(true);
     expect(state.outputRequestBuffer.size()).toBe(2n);
-    expect(state.globalEvmNonce).toBe(2n);
+    expect(state.vaultAccountNonce).toBe(2n);
   });
 
   it("a deposit slot leaves the vault nonce unchanged and keeps the depositor's own nonce", async () => {
@@ -1421,7 +1421,7 @@ describe("vault nonces", () => {
     const flushed = await flush(contract, queued, [ownNonce.inIndex], []);
 
     expect(ledgerOf(flushed).outputRequestBuffer.lookup(outIndex).entry.evmNonce).toBe(5n);
-    expect(ledgerOf(flushed).globalEvmNonce).toBe(0n);
+    expect(ledgerOf(flushed).vaultAccountNonce).toBe(0n);
   });
 
   it("a slot naming a missing index fails the flush, so the withdrawal ahead of it takes no nonce", async () => {
@@ -1437,7 +1437,7 @@ describe("vault nonces", () => {
     const state = ledgerOf(flushed);
     const outIndex = flushedRequestIndex(state, Action.withdraw, VALID_WITHDRAW.inIndex);
     expect(state.outputRequestBuffer.lookup(outIndex).entry.evmNonce).toBe(0n);
-    expect(state.globalEvmNonce).toBe(1n);
+    expect(state.vaultAccountNonce).toBe(1n);
   });
 
   it("queuedRequestIndex refuses a vault-signed request, whose key waits on its flush", async () => {
@@ -2002,7 +2002,7 @@ describe("approve round-trip", () => {
       const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
       expect(entry).toEqual({
         action: Action.approve,
-        nonceIsVault: true,
+        useNextVaultAccountNonce: true,
         evmNonce: 0n,
         inIndex: APPROVE_INDEX,
         commitment: pureCircuits.ownershipCommitment(APPROVE_INDEX, SECRET_KEY),
@@ -2015,7 +2015,7 @@ describe("approve round-trip", () => {
       });
       expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
       expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
-      expect(ledger(state).globalEvmNonce).toBe(1n);
+      expect(ledger(state).vaultAccountNonce).toBe(1n);
     },
   );
 
@@ -2062,7 +2062,7 @@ describe("approve round-trip", () => {
     const withdrawIndex = flushedRequestIndex(state, Action.withdraw, VALID_WITHDRAW.inIndex);
     expect(state.outputRequestBuffer.lookup(approveIndex).entry.evmNonce).toBe(0n);
     expect(state.outputRequestBuffer.lookup(withdrawIndex).entry.evmNonce).toBe(1n);
-    expect(state.globalEvmNonce).toBe(2n);
+    expect(state.vaultAccountNonce).toBe(2n);
   });
 });
 
@@ -2488,7 +2488,7 @@ describe("replace nonce round-trip", () => {
     const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.replaceNonce,
-      nonceIsVault: false,
+      useNextVaultAccountNonce: false,
       evmNonce: 0n,
       inIndex: VALID_REPLACE_NONCE.inIndex,
       commitment: pureCircuits.ownershipCommitment(VALID_REPLACE_NONCE.inIndex, SECRET_KEY),
@@ -2514,7 +2514,7 @@ describe("replace nonce round-trip", () => {
       first(toSignBidirectionalEventIndex(map).values(), "recorded request").txParams.nonce;
     expect(nonceOf(state.bidirectionalWithdrawMap)).toBe(0n);
     expect(nonceOf(state.bidirectionalReplaceNonceMap)).toBe(0n);
-    expect(state.globalEvmNonce).toBe(1n);
+    expect(state.vaultAccountNonce).toBe(1n);
   });
 
   it("a withdrawal flushed beside a replacement still takes the next vault nonce", async () => {
@@ -2540,7 +2540,7 @@ describe("replace nonce round-trip", () => {
     const withdrawIndex = flushedRequestIndex(state, Action.withdraw, second.inIndex);
     expect(state.outputRequestBuffer.lookup(replacementIndex).entry.evmNonce).toBe(0n);
     expect(state.outputRequestBuffer.lookup(withdrawIndex).entry.evmNonce).toBe(1n);
-    expect(state.globalEvmNonce).toBe(2n);
+    expect(state.vaultAccountNonce).toBe(2n);
   });
 
   it("a second replacement of the same nonce cannot be flushed while the first is open", async () => {
@@ -3158,7 +3158,7 @@ describe("swap round-trip", () => {
     const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.swap,
-      nonceIsVault: true,
+      useNextVaultAccountNonce: true,
       evmNonce: 0n,
       inIndex: VALID_SWAP.inIndex,
       commitment: pureCircuits.ownershipCommitment(VALID_SWAP.inIndex, SECRET_KEY),
@@ -3171,7 +3171,7 @@ describe("swap round-trip", () => {
     });
     expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
-    expect(ledger(state).globalEvmNonce).toBe(1n);
+    expect(ledger(state).vaultAccountNonce).toBe(1n);
   });
 
   it("start burns the surrendered coin: received by the vault, then paid in full to the burn address", async () => {
@@ -3222,7 +3222,7 @@ describe("swap round-trip", () => {
       state.outputRequestBuffer.lookup(flushedRequestIndex(state, action, inIndex)).entry.evmNonce;
     expect(nonceOf(Action.withdraw, VALID_WITHDRAW.inIndex)).toBe(0n);
     expect(nonceOf(Action.swap, VALID_SWAP.inIndex)).toBe(1n);
-    expect(state.globalEvmNonce).toBe(2n);
+    expect(state.vaultAccountNonce).toBe(2n);
   });
 });
 
@@ -3948,7 +3948,7 @@ describe("supply round-trip", () => {
     const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.supply,
-      nonceIsVault: true,
+      useNextVaultAccountNonce: true,
       evmNonce: 0n,
       inIndex: VALID_SUPPLY.inIndex,
       commitment: pureCircuits.ownershipCommitment(VALID_SUPPLY.inIndex, SECRET_KEY),
@@ -3961,7 +3961,7 @@ describe("supply round-trip", () => {
     });
     expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
-    expect(ledger(state).globalEvmNonce).toBe(1n);
+    expect(ledger(state).vaultAccountNonce).toBe(1n);
   });
 
   it("start burns the surrendered underlying coin: received by the vault, then paid in full to the burn address", async () => {
@@ -4012,7 +4012,7 @@ describe("supply round-trip", () => {
     const supplyIndex = flushedRequestIndex(state, Action.supply, VALID_SUPPLY.inIndex);
     expect(state.outputRequestBuffer.lookup(withdrawIndex).entry.evmNonce).toBe(0n);
     expect(state.outputRequestBuffer.lookup(supplyIndex).entry.evmNonce).toBe(1n);
-    expect(state.globalEvmNonce).toBe(2n);
+    expect(state.vaultAccountNonce).toBe(2n);
   });
 });
 
@@ -4611,7 +4611,7 @@ describe("redeem round-trip", () => {
     const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.redeem,
-      nonceIsVault: true,
+      useNextVaultAccountNonce: true,
       evmNonce: 0n,
       inIndex: VALID_REDEEM.inIndex,
       commitment: pureCircuits.ownershipCommitment(VALID_REDEEM.inIndex, SECRET_KEY),
@@ -4624,7 +4624,7 @@ describe("redeem round-trip", () => {
     });
     expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
-    expect(ledger(state).globalEvmNonce).toBe(1n);
+    expect(ledger(state).vaultAccountNonce).toBe(1n);
   });
 
   it("start burns the surrendered wrapper coin: received by the vault, then paid in full to the burn address", async () => {
@@ -4675,7 +4675,7 @@ describe("redeem round-trip", () => {
     const redeemIndex = flushedRequestIndex(state, Action.redeem, VALID_REDEEM.inIndex);
     expect(state.outputRequestBuffer.lookup(supplyIndex).entry.evmNonce).toBe(0n);
     expect(state.outputRequestBuffer.lookup(redeemIndex).entry.evmNonce).toBe(1n);
-    expect(state.globalEvmNonce).toBe(2n);
+    expect(state.vaultAccountNonce).toBe(2n);
 
     const sent = (await contract.circuits.sendRedeem(flushed, redeemIndex)).context;
     const record = first(
@@ -5199,7 +5199,7 @@ describe("replace nonce: the requests it can replace", () => {
 
       const entry = ledgerOf(queued).inputRequestBuffer.lookup(inIndex);
       expect(entry.action).toBe(Action.replaceNonce);
-      expect(entry.nonceIsVault).toBe(false);
+      expect(entry.useNextVaultAccountNonce).toBe(false);
       expect(entry.evmNonce).toBe(sentNonce);
     },
   );
@@ -5260,7 +5260,7 @@ const busyVault = async () => {
 
 /**
  * The flush that moves all of the busy vault's traffic, so it raises globalLastSeen,
- * advances globalEvmNonce and moves a caller-signed request.
+ * advances vaultAccountNonce and moves a caller-signed request.
  */
 const busyFlushSlots = (attestedId: Uint8Array): FlushSlot[] =>
   flushSlots([BUSY_QUEUED_DEPOSIT.inIndex, BUSY_QUEUED_WITHDRAW.inIndex], [attestedId]);
@@ -5978,8 +5978,8 @@ describe("contention: user circuits never conflict, only flushes do", () => {
         busyFlushSlots(attestedId),
       );
       expect(ledgerOf(concurrentFlush.context).globalLastSeen).toBe(BUSY_HEIGHT);
-      expect(ledgerOf(concurrentFlush.context).globalEvmNonce).toBe(
-        ledgerOf(shared).globalEvmNonce + 1n,
+      expect(ledgerOf(concurrentFlush.context).vaultAccountNonce).toBe(
+        ledgerOf(shared).vaultAccountNonce + 1n,
       );
 
       expect(replay(stateOf(concurrentFlush.context), user, true)).toBe("applied");
@@ -6020,8 +6020,8 @@ describe("contention: user circuits never conflict, only flushes do", () => {
         flushSlots([BUSY_QUEUED_WITHDRAW.inIndex], []),
       );
       const actionFlush = await contract.circuits.flushQueue(shared, flushSlots([inIndex], []));
-      expect(ledgerOf(nonceFlush.context).globalEvmNonce).toBe(
-        ledgerOf(shared).globalEvmNonce + 1n,
+      expect(ledgerOf(nonceFlush.context).vaultAccountNonce).toBe(
+        ledgerOf(shared).vaultAccountNonce + 1n,
       );
       expect(replay(stateOf(shared), actionFlush)).toBe("applied");
       expect(replay(stateOf(nonceFlush.context), actionFlush, true)).toMatch(outcome);

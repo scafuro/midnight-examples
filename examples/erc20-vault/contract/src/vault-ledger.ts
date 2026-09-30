@@ -54,7 +54,7 @@ export async function printVaultState(
   console.log(`initialised:       ${String(state.initialised)}`);
   console.log(`vault EVM address: 0x${bytesToHex(state.vaultEvmAddress)}`);
   console.log(`EVM chain id:      ${String(state.evmChainId)}`);
-  console.log(`vault EVM nonce:   ${String(state.globalEvmNonce)}`);
+  console.log(`vault EVM nonce:   ${String(state.vaultAccountNonce)}`);
   console.log(`allowed ERC20s:    ${String(state.allowedTokens.size())}`);
   for (const token of state.allowedTokens) {
     console.log(`- 0x${bytesToHex(token)}`);

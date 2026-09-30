@@ -64,7 +64,7 @@ As illustrated, the flow comprises 9 steps:
     and bounded at start.
   - The circuit copies the vault's gas settings for a swap into
     [`swapArgsMap`](../../contract/src/erc20-vault.compact) beside the request,
-    and queues the entry with `nonceIsVault` set and the swapper's
+    and queues the entry with `useNextVaultAccountNonce` set and the swapper's
     [`ownershipCommitment`](../../contract/src/erc20-vault.compact).
   - Off chain, [`start-swap.ts`](../../integration-tests/src/flows/start-swap.ts)
     funds the coin from the caller's shielded balance and calls the circuit.
@@ -72,7 +72,7 @@ As illustrated, the flow comprises 9 steps:
     ([`quoteExactOutputSingle`](../../integration-tests/src/evm-swap.ts)).
 - **2.** flushQueue(...) assigns the vault nonce and moves the request into the output buffer
   - The flush gives the entry the vault account's next EVM nonce
-    ([`globalEvmNonce`](../../contract/src/erc20-vault.compact)) and moves it
+    ([`vaultAccountNonce`](../../contract/src/erc20-vault.compact)) and moves it
     into `outputRequestBuffer`, exactly as it does for a
     [withdrawal](../withdraw/withdraw.md). `start-swap.ts` then reads the
     entry's index with [`flushedRequestIndex`](../../contract/src/vault-queue.ts).

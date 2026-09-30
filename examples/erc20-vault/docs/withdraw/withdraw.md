@@ -59,7 +59,7 @@ As illustrated, the flow comprises 9 steps:
     [`withdrawArgsMap`](../../contract/src/erc20-vault.compact) beside the
     [`WithdrawRequest`](../../contract/src/erc20-vault.compact), under a fresh
     random input index.
-  - It queues the entry in `inputRequestBuffer` with `nonceIsVault` set and a
+  - It queues the entry in `inputRequestBuffer` with `useNextVaultAccountNonce` set and a
     placeholder nonce of 0, plus the
     [`ownershipCommitment`](../../contract/src/erc20-vault.compact) that makes
     completing the withdrawal, and taking any re-mint, withdrawer-only.
@@ -68,7 +68,7 @@ As illustrated, the flow comprises 9 steps:
 - **2.** flushQueue(...) assigns the vault nonce and moves the request into the output buffer
   - A request slot of [`flushQueue`](../../contract/src/erc20-vault.compact)
     gives a vault-signed entry the current
-    [`globalEvmNonce`](../../contract/src/erc20-vault.compact) before it
+    [`vaultAccountNonce`](../../contract/src/erc20-vault.compact) before it
     computes the request index, then moves the entry into `outputRequestBuffer`
     with `globalLastSeen` as its `lastSeen` and advances the nonce by one.
     Each vault-signed request therefore carries a nonce no other request holds,

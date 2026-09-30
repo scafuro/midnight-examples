@@ -23,7 +23,7 @@ The price of a lost race is the losing flush's fee.
 | Cell             | Read and written by              | Holds                                                            |
 | ---------------- | -------------------------------- | ---------------------------------------------------------------- |
 | `globalLastSeen` | `flushQueue` (and `initialise`)  | the highest block height of any attestation the flush has folded |
-| `globalEvmNonce` | `flushQueue`                     | the vault EVM account's next nonce                               |
+| `vaultAccountNonce` | `flushQueue`                     | the vault EVM account's next nonce                               |
 
 `globalLastSeen` is the safety bound every settlement checks: an attestation
 settles a request only if it comes from a block strictly above every height the
@@ -31,7 +31,7 @@ vault had seen when it accepted that request (see
 [The last seen height](#the-last-seen-height)). `initialise` sets it to the
 current EVM height.
 
-`globalEvmNonce` hands each request the vault's own account signs a nonce no
+`vaultAccountNonce` hands each request the vault's own account signs a nonce no
 other request holds (see [Vault-signed requests](#vault-signed-requests)). It
 starts at 0, as every deployment derives a fresh vault account from its own
 contract address.
@@ -55,7 +55,7 @@ A request entry (`RequestBufferEntry`) has one size for every action. It
 carries:
 
 - **The action.**
-- **The nonce.** `nonceIsVault` is `false` when the caller names the nonce,
+- **The nonce.** `useNextVaultAccountNonce` is `false` when the caller names the nonce,
   which is taken verbatim: a deposit names the depositor's own account nonce,
   and a nonce replacement carries the vault account nonce of the sent request
   it replaces. It is
@@ -152,7 +152,7 @@ flushes touch shared state.
 
 - **Request slot.** Moves one entry from `inputRequestBuffer` to
   `outputRequestBuffer`, recording `globalLastSeen` as its `lastSeen`. A
-  vault-signed entry also takes `globalEvmNonce` as its nonce, which then
+  vault-signed entry also takes `vaultAccountNonce` as its nonce, which then
   advances by one.
 - **Attestation slot.** Moves one record from `inputAttestationBuffer` to
   `outputAttestationBuffer` and folds its block height into `globalLastSeen`.
@@ -180,8 +180,8 @@ then conflict with every flush.
 Two flushes built against the same state conflict when they carry a common
 item, when one raises `globalLastSeen` and the other read it (every slot that
 moves an item reads it), or when both move a vault-signed request (each reads
-and advances `globalEvmNonce`). A slot that moves a caller-signed request never
-reads `globalEvmNonce`. One of them lands, and the other is rebuilt and
+and advances `vaultAccountNonce`). A slot that moves a caller-signed request never
+reads `vaultAccountNonce`. One of them lands, and the other is rebuilt and
 resubmitted. Only the flusher ever retries. Users' own transactions never fail
 because of a flush.
 
@@ -273,7 +273,7 @@ the record's storage is width-independent.
 
 - **Only the flush writes shared state.** No circuit other than `flushQueue`
   and `initialise` reads or writes `globalLastSeen`, and none other than
-  `flushQueue` reads or writes `globalEvmNonce`.
+  `flushQueue` reads or writes `vaultAccountNonce`.
 - **Only the flush inserts into an output buffer.** Send writes the event map
   and `evictionMap`, and the complete circuit only removes.
 - **The flush never touches arguments.** An action's arguments go into its
@@ -303,8 +303,8 @@ requests may get the same one. That
 nonce is the second shared cell, and it follows the same rule: the flush is its
 only reader and writer.
 
-- **A request slot assigns it.** An entry with `nonceIsVault` set takes the
-  current `globalEvmNonce` before its request index is computed, and the cell
+- **A request slot assigns it.** An entry with `useNextVaultAccountNonce` set takes the
+  current `vaultAccountNonce` before its request index is computed, and the cell
   advances only once the entry moves. Assigning before advancing gives the
   first vault request nonce 0, the account's next unused nonce: any other start
   would leave every later vault transaction waiting behind a nonce no request
@@ -321,7 +321,7 @@ The withdraw lifecycle is the deposit's six steps with three differences:
 1. **Start.** `startWithdraw` takes the input index, the `WithdrawRequest` and
    the vault coin of the ERC20, whose value must equal the amount. It burns the
    coin, copies the vault's gas settings into `withdrawArgsMap`, and queues the
-   entry with `nonceIsVault` set.
+   entry with `useNextVaultAccountNonce` set.
 2. **Send.** `sendWithdraw` builds `transfer(destEvmAddress, amount)` on the
    ERC20 with the derivation path `"vault"` and the nonce the flush assigned,
    and records it in `bidirectionalWithdrawMap`.
@@ -341,7 +341,7 @@ transaction:
    pinned `uniswapRouter` as the spender. `startApproveStata` takes only the
    input index, and names the pinned `stataToken` as the spender on
    `stataUnderlying`. Either copies the vault's gas settings into
-   `approveArgsMap` and queues the entry with `nonceIsVault` set. Nothing is
+   `approveArgsMap` and queues the entry with `useNextVaultAccountNonce` set. Nothing is
    surrendered.
 2. **Send.** `sendApprove` builds `approve(spender, unlimitedAllowance())` on
    the ERC20 with the derivation path `"vault"` and the nonce the flush
@@ -356,7 +356,7 @@ the allowance a router approval granted:
 1. **Start.** `startSwap` takes the input index, the `SwapRequest` and the
    vault coin of `erc20AddressIn`, whose value must equal `amountInMaximum`.
    It burns the coin, copies the vault's gas settings into `swapArgsMap`, and
-   queues the entry with `nonceIsVault` set.
+   queues the entry with `useNextVaultAccountNonce` set.
 2. **Send.** `sendSwap` builds `exactOutputSingle` on `uniswapRouter`, buying
    exactly `amountOut` of `erc20AddressOut` for at most `amountInMaximum` of
    `erc20AddressIn` and delivering it to `vaultEvmAddress`, with the
@@ -379,7 +379,7 @@ tokenised vault) for shares, drawing on the allowance the stata approval grants:
 1. **Start.** `startSupply` takes the input index, the `SupplyRequest` and the
    vault coin of `stataUnderlying`, whose value must equal the amount. It burns
    the coin, copies the vault's gas settings into `supplyArgsMap`, and queues
-   the entry with `nonceIsVault` set. Both tokens are contract-fixed, so the
+   the entry with `useNextVaultAccountNonce` set. Both tokens are contract-fixed, so the
    request names only the amount.
 2. **Send.** `sendSupply` builds `deposit(amount, vaultEvmAddress)` on
    `stataToken` with the derivation path `"vault"` and the nonce the flush
@@ -400,7 +400,7 @@ burns, so no approval is involved:
 1. **Start.** `startRedeem` takes the input index, the `RedeemRequest` and the
    vault coin of `stataToken`, whose value must equal the shares. It burns the
    coin, copies the vault's gas settings into `redeemArgsMap`, and queues the
-   entry with `nonceIsVault` set. Both tokens are contract-fixed, so the
+   entry with `useNextVaultAccountNonce` set. Both tokens are contract-fixed, so the
    request names only the shares.
 2. **Send.** `sendRedeem` builds `redeem(shares, vaultEvmAddress,
    vaultEvmAddress)` on `stataToken` with the derivation path `"vault"` and the
@@ -428,8 +428,8 @@ section of the contract. It runs the same six steps with these differences:
    is refused, as the caller's account signs it, and so is a request that is
    not sent under the named action or has already settled. It copies the
    vault's fee settings at a 21000 gas limit into `replaceNonceArgsMap`, and
-   queues the entry with `nonceIsVault` unset, so the flush takes that nonce
-   verbatim and leaves `globalEvmNonce` alone.
+   queues the entry with `useNextVaultAccountNonce` unset, so the flush takes that nonce
+   verbatim and leaves `vaultAccountNonce` alone.
 2. **Send.** `sendReplaceNonce` builds the transfer of zero to
    `vaultEvmAddress`, with no calldata, under the derivation path `"vault"`,
    and records it in `bidirectionalReplaceNonceMap`.

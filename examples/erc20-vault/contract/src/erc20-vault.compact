@@ -7,9 +7,9 @@
 // executing the EVM side. See ../../README.md for the full integration walkthrough.
 //
 // Contention: apart from initialise setting globalLastSeen once, flushQueue is the ONLY
-// circuit that reads or writes globalLastSeen and globalEvmNonce. Every other circuit
-// touches only entries keyed by its own request, so user calls never conflict with each
-// other or with a flush.
+// circuit that reads or writes globalLastSeen and vaultAccountNonce. Every other
+// circuit touches only entries keyed by its own request, so user calls never conflict
+// with each other or with a flush.
 // See ../docs/contention-handling.md.
 //
 // Layout: configuration, the admin circuits that send no EVM transaction (initialisation,
@@ -237,7 +237,7 @@ export struct RequestBufferEntry {
   action: Action;
   // false: evmNonce is the nonce the caller names, taken verbatim. true: the vault's
   // account signs, and the flush overwrites evmNonce with the vault's next nonce.
-  nonceIsVault: Boolean;
+  useNextVaultAccountNonce: Boolean;
   evmNonce: Uint<64>;
   // The index of the entry in inputRequestBuffer and of its args in the action's args
   // map, public already.
@@ -276,7 +276,7 @@ export ledger globalLastSeen: Uint<64>;
 
 // The vault EVM account's next nonce. Starts at 0: each deployment derives a fresh
 // account from its own contract address.
-export ledger globalEvmNonce: Uint<64>;
+export ledger vaultAccountNonce: Uint<64>;
 
 export ledger inputRequestBuffer: Map<Uint<64>, RequestBufferEntry>;
 export ledger outputRequestBuffer: Map<Bytes<32>, OutputRequestEntry>;
@@ -300,11 +300,11 @@ export pure circuit ownershipCommitment(inIndex: Uint<64>, sk: Bytes<32>): Bytes
 
 // The outputRequestBuffer index: the nonce and the args hash, which together fix the EVM
 // transaction, and NOT the commitment. The args hash's domain tag stands in for the
-// action, which fixes nonceIsVault, so every args hash circuit must keep a tag no other
-// action uses. Identical requests therefore share an index, so the second cannot be flushed
-// until the first is settled, by which point the first one's attestation height is
-// folded into globalLastSeen and bounds the second one's lastSeen. A fork that changes
-// transientHash re-indexes twins across it: drain open requests first.
+// action, which fixes useNextVaultAccountNonce, so every args hash circuit must keep a
+// tag no other action uses. Identical requests therefore share an index, so the second
+// cannot be flushed until the first is settled, by which point the first one's
+// attestation height is folded into globalLastSeen and bounds the second one's lastSeen.
+// A fork that changes transientHash re-indexes twins across it: drain open requests first.
 export pure circuit requestIndex(entry: RequestBufferEntry): Bytes<32> {
   return upgradeFromTransient(transientHash<[Bytes<32>, Uint<64>, Bytes<32>]>([
     pad(32, "vault:request:index"),
@@ -319,7 +319,6 @@ export circuit flushQueue(slots: Vector<10, FlushSlot>): [] {
   requireInitialised();
   for (const slot of slots) {
     const disclosedSlot = disclose(slot);
-    // TODO check if there's a switch
     if (disclosedSlot.channel == FlushChannel.request) {
       flushRequest(disclosedSlot.inIndex);
     } else if (disclosedSlot.channel == FlushChannel.attestation) {
@@ -330,16 +329,18 @@ export circuit flushQueue(slots: Vector<10, FlushSlot>): [] {
 
 // A slot naming an index that is not queued fails the flush, and so does one whose
 // twin (same requestIndex) is still open: the twin stays queued until the open request
-// settles. A vault-signed entry takes globalEvmNonce BEFORE its index is computed, so its
-// index is unique, and the nonce advances only once the entry moves: the first vault
-// request gets nonce 0.
+// settles. A vault-signed entry takes vaultAccountNonce as its nonce and advances it, so
+// its index is unique and the first vault request gets nonce 0. A failed flush commits
+// nothing, so no nonce is lost.
 circuit flushRequest(inIndex: Uint<64>): [] {
   assert(inputRequestBuffer.member(inIndex), "Request not queued");
   const queued = inputRequestBuffer.lookup(inIndex);
-  const entry = queued.nonceIsVault
-  // FIXME increment the globalEvmNonce here
-       ? RequestBufferEntry { ...queued, evmNonce: globalEvmNonce }
+  const entry = queued.useNextVaultAccountNonce
+    ? RequestBufferEntry { ...queued, evmNonce: vaultAccountNonce }
     : queued;
+  if (queued.useNextVaultAccountNonce) {
+    vaultAccountNonce = (vaultAccountNonce + 1) as Uint<64>;
+  }
   const outIndex = requestIndex(entry);
   assert(!outputRequestBuffer.member(outIndex), "Identical request open");
   inputRequestBuffer.remove(inIndex);
@@ -347,10 +348,6 @@ circuit flushRequest(inIndex: Uint<64>): [] {
     entry: entry,
     lastSeen: globalLastSeen,
   });
-  // FIXME remove this when increment is done elsewhere
-  if (entry.nonceIsVault) {
-    globalEvmNonce = (globalEvmNonce + 1) as Uint<64>;
-  }
 }
 
 // A slot naming a request id with no queued attestation fails the flush.
@@ -358,10 +355,9 @@ circuit flushAttestation(requestId: RequestId): [] {
   assert(inputAttestationBuffer.member(requestId), "Attestation not queued");
   const record = inputAttestationBuffer.lookup(requestId);
   inputAttestationBuffer.remove(requestId);
-  // TODO check if there's a max function
-  if (record.blockHeight > globalLastSeen) {
-    globalLastSeen = record.blockHeight;
-  }
+  globalLastSeen = record.blockHeight > globalLastSeen
+    ? record.blockHeight
+    : globalLastSeen;
   outputAttestationBuffer.insert(requestId, record);
 }
 
@@ -557,7 +553,7 @@ export circuit startReplaceNonce(inIndex: Uint<64>, requestId: RequestId, action
   replaceNonceArgsMap.insert(disclosedIndex, args);
   inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
     action: Action.replaceNonce,
-    nonceIsVault: false,
+    useNextVaultAccountNonce: false,
     evmNonce: evmNonce,
     inIndex: inIndex,
     commitment: ownershipCommitment(inIndex, callerSecretKey()),
@@ -690,7 +686,7 @@ circuit queueApprove(inIndex: Uint<64>, approveRequest: ApproveRequest): [] {
   approveArgsMap.insert(disclosedIndex, args);
   inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
     action: Action.approve,
-    nonceIsVault: true,
+    useNextVaultAccountNonce: true,
     evmNonce: 0 as Uint<64>,
     inIndex: inIndex,
     commitment: ownershipCommitment(inIndex, callerSecretKey()),
@@ -859,7 +855,7 @@ export circuit startDeposit(
   depositArgsMap.insert(disclosedIndex, args);
   inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
     action: Action.deposit,
-    nonceIsVault: false,
+    useNextVaultAccountNonce: false,
     evmNonce: evmNonce,
     inIndex: inIndex,
     commitment: ownershipCommitment(inIndex, callerSecretKey()),
@@ -1031,7 +1027,7 @@ export circuit startWithdraw(
   withdrawArgsMap.insert(disclosedIndex, args);
   inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
     action: Action.withdraw,
-    nonceIsVault: true,
+    useNextVaultAccountNonce: true,
     evmNonce: 0 as Uint<64>,
     inIndex: inIndex,
     commitment: ownershipCommitment(inIndex, callerSecretKey()),
@@ -1221,7 +1217,7 @@ export circuit startSwap(
   swapArgsMap.insert(disclosedIndex, args);
   inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
     action: Action.swap,
-    nonceIsVault: true,
+    useNextVaultAccountNonce: true,
     evmNonce: 0 as Uint<64>,
     inIndex: inIndex,
     commitment: ownershipCommitment(inIndex, callerSecretKey()),
@@ -1432,7 +1428,7 @@ export circuit startSupply(
   supplyArgsMap.insert(disclosedIndex, args);
   inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
     action: Action.supply,
-    nonceIsVault: true,
+    useNextVaultAccountNonce: true,
     evmNonce: 0 as Uint<64>,
     inIndex: inIndex,
     commitment: ownershipCommitment(inIndex, callerSecretKey()),
@@ -1623,7 +1619,7 @@ export circuit startRedeem(
   redeemArgsMap.insert(disclosedIndex, args);
   inputRequestBuffer.insert(disclosedIndex, disclose(RequestBufferEntry {
     action: Action.redeem,
-    nonceIsVault: true,
+    useNextVaultAccountNonce: true,
     evmNonce: 0 as Uint<64>,
     inIndex: inIndex,
     commitment: ownershipCommitment(inIndex, callerSecretKey()),
