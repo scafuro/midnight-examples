@@ -31,9 +31,10 @@ export async function readVaultLedger(
 
 /**
  * Read and print the vault's public ledger state: initialisation status, the
- * configured vault EVM address, the pinned EVM chain, and the pending signet
- * signature requests of the deposit and approve/withdraw maps. No proving keys
- * or transactions involved.
+ * configured vault EVM address, the pinned EVM chain, the vault EVM account's
+ * next nonce, the ERC20s the vault allows, and the pending signet signature
+ * requests of each action's map. No
+ * proving keys or transactions involved.
  *
  * @param publicDataProvider - The provider to query raw contract state through.
  * @param vaultContractAddress - The deployed vault contract address, as bare hex.
@@ -53,9 +54,19 @@ export async function printVaultState(
   console.log(`initialised:       ${String(state.initialised)}`);
   console.log(`vault EVM address: 0x${bytesToHex(state.vaultEvmAddress)}`);
   console.log(`EVM chain id:      ${String(state.evmChainId)}`);
+  console.log(`vault EVM nonce:   ${String(state.vaultAccountNonce)}`);
+  console.log(`allowed ERC20s:    ${String(state.allowedTokens.size())}`);
+  for (const token of state.allowedTokens) {
+    console.log(`- 0x${bytesToHex(token)}`);
+  }
 
-  printRequestMap("deposit", state.depositEventMap);
-  printRequestMap("approve/withdraw", state.signBidirectionalEventMap);
+  printRequestMap("deposit", state.bidirectionalDepositMap);
+  printRequestMap("withdraw", state.bidirectionalWithdrawMap);
+  printRequestMap("approve", state.bidirectionalApproveMap);
+  printRequestMap("nonce replacement", state.bidirectionalReplaceNonceMap);
+  printRequestMap("swap", state.bidirectionalSwapMap);
+  printRequestMap("supply", state.bidirectionalSupplyMap);
+  printRequestMap("redeem", state.bidirectionalRedeemMap);
 }
 
 /**
@@ -87,7 +98,8 @@ export interface VaultGasEnvelope {
 }
 
 /**
- * The gas envelope the circuits stamp on a `kind` transaction, read from the ledger.
+ * The gas envelope a `kind` request's start circuit copies into its arguments, read
+ * from the ledger.
  *
  * @param state - The decoded vault ledger state.
  * @param kind - The vault-signed operation.
