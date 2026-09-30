@@ -99,7 +99,7 @@ export pure circuit vaultTokenDomainSeparator(erc20Address: Bytes<20>): Bytes<32
 witness callerSecretKey(): Bytes<32>;
 
 // Identity commitment, doubling as the MPC key-derivation path of deposit requests. A
-// transientHash change at a fork re-keys derived accounts and orphans pinned commitments.
+// transientHash change at a fork re-indexes derived accounts and orphans pinned commitments.
 export pure circuit userCommitment(sk: Bytes<32>): Bytes<32> {
   return upgradeFromTransient(transientHash<Vector<2, Bytes<32>>>([
     sk,
@@ -239,7 +239,7 @@ export struct RequestBufferEntry {
   // account signs, and the flush overwrites evmNonce with the vault's next nonce.
   nonceIsVault: Boolean;
   evmNonce: Uint<64>;
-  // The key of the entry in inputRequestBuffer and of its args in the action's args
+  // The index of the entry in inputRequestBuffer and of its args in the action's args
   // map, public already.
   inIndex: Uint<64>;
   // ownershipCommitment(inIndex, callerSecretKey()), proven at complete.
@@ -283,7 +283,7 @@ export ledger outputRequestBuffer: Map<Bytes<32>, OutputRequestEntry>;
 export ledger inputAttestationBuffer: Map<RequestId, AttestationRecord>;
 export ledger outputAttestationBuffer: Map<RequestId, AttestationRecord>;
 
-// Request id -> the outputRequestBuffer key it was sent from. The send circuits write
+// Request id -> the outputRequestBuffer index it was sent from. The send circuits write
 // here, never to an output buffer.
 export ledger evictionMap: Map<RequestId, Bytes<32>>;
 
@@ -298,16 +298,16 @@ export pure circuit ownershipCommitment(inIndex: Uint<64>, sk: Bytes<32>): Bytes
   ]));
 }
 
-// The outputRequestBuffer key: the nonce and the args hash, which together fix the EVM
+// The outputRequestBuffer index: the nonce and the args hash, which together fix the EVM
 // transaction, and NOT the commitment. The args hash's domain tag stands in for the
 // action, which fixes nonceIsVault, so every args hash circuit must keep a tag no other
-// action uses. Identical requests therefore share a key, so the second cannot be flushed
+// action uses. Identical requests therefore share an index, so the second cannot be flushed
 // until the first is settled, by which point the first one's attestation height is
 // folded into globalLastSeen and bounds the second one's lastSeen. A fork that changes
-// transientHash re-keys twins across it: drain open requests first.
-export pure circuit requestKey(entry: RequestBufferEntry): Bytes<32> {
+// transientHash re-indexes twins across it: drain open requests first.
+export pure circuit requestIndex(entry: RequestBufferEntry): Bytes<32> {
   return upgradeFromTransient(transientHash<[Bytes<32>, Uint<64>, Bytes<32>]>([
-    pad(32, "vault:request:key"),
+    pad(32, "vault:request:index"),
     entry.evmNonce,
     entry.argsHash
   ]));
@@ -329,9 +329,9 @@ export circuit flushQueue(slots: Vector<10, FlushSlot>): [] {
 }
 
 // A slot naming an index that is not queued fails the flush, and so does one whose
-// twin (same requestKey) is still open: the twin stays queued until the open request
-// settles. A vault-signed entry takes globalEvmNonce BEFORE its key is computed, so its
-// key is unique, and the nonce advances only once the entry moves: the first vault
+// twin (same requestIndex) is still open: the twin stays queued until the open request
+// settles. A vault-signed entry takes globalEvmNonce BEFORE its index is computed, so its
+// index is unique, and the nonce advances only once the entry moves: the first vault
 // request gets nonce 0.
 circuit flushRequest(inIndex: Uint<64>): [] {
   assert(inputRequestBuffer.member(inIndex), "Request not queued");
@@ -340,10 +340,10 @@ circuit flushRequest(inIndex: Uint<64>): [] {
   // FIXME increment the globalEvmNonce here
        ? RequestBufferEntry { ...queued, evmNonce: globalEvmNonce }
     : queued;
-  const outKey = requestKey(entry);
-  assert(!outputRequestBuffer.member(outKey), "Identical request open");
+  const outIndex = requestIndex(entry);
+  assert(!outputRequestBuffer.member(outIndex), "Identical request open");
   inputRequestBuffer.remove(inIndex);
-  outputRequestBuffer.insert(outKey, OutputRequestEntry {
+  outputRequestBuffer.insert(outIndex, OutputRequestEntry {
     entry: entry,
     lastSeen: globalLastSeen,
   });
@@ -371,9 +371,9 @@ circuit recordAttestation(
 ): [] {
   const requestId = respondBidirectionalEvent.requestId;
   assert(evictionMap.member(requestId), "Request not sent");
-  const outKey = evictionMap.lookup(requestId);
-  assert(outputRequestBuffer.member(outKey), "Request not open");
-  const out = outputRequestBuffer.lookup(outKey);
+  const outIndex = evictionMap.lookup(requestId);
+  assert(outputRequestBuffer.member(outIndex), "Request not open");
+  const out = outputRequestBuffer.lookup(outIndex);
   // TODO for audit v2, make this trigger a refund arm, even though this should be unreachable
   assert(respondBidirectionalEvent.blockHeight > out.lastSeen, "Stale attestation");
   assert(!inputAttestationBuffer.member(requestId), "Attestation already queued");
@@ -454,9 +454,9 @@ circuit settleRequest(
   action: Action
 ): [RequestBufferEntry, AttestationRecord] {
   assert(evictionMap.member(requestId), "Request not sent");
-  const outKey = evictionMap.lookup(requestId);
-  assert(outputRequestBuffer.member(outKey), "Request not open");
-  const out = outputRequestBuffer.lookup(outKey);
+  const outIndex = evictionMap.lookup(requestId);
+  assert(outputRequestBuffer.member(outIndex), "Request not open");
+  const out = outputRequestBuffer.lookup(outIndex);
   assert(out.entry.action == action, "Wrong action");
 
   assert(outputAttestationBuffer.member(requestId), "Attestation not flushed");
@@ -470,7 +470,7 @@ circuit settleRequest(
 
   evictionMap.remove(requestId);
   outputAttestationBuffer.remove(requestId);
-  outputRequestBuffer.remove(outKey);
+  outputRequestBuffer.remove(outIndex);
   return [out.entry, record];
 }
 
@@ -540,11 +540,11 @@ export circuit startReplaceNonce(inIndex: Uint<64>, evmNonce: Uint<64>): [] {
 // Records the flushed replacement's SignBidirectionalEvent and notifies the MPC.
 // Permissionless: the entry and its args fix every byte of the EVM transaction, so a
 // second send of the same entry names the same request id and is refused.
-export circuit sendReplaceNonce(outKey: Bytes<32>): [] {
+export circuit sendReplaceNonce(outIndex: Bytes<32>): [] {
   requireInitialised();
-  const disclosedKey = disclose(outKey);
-  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
-  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  const disclosedIndex = disclose(outIndex);
+  assert(outputRequestBuffer.member(disclosedIndex), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedIndex).entry;
   assert(entry.action == Action.replaceNonce, "Wrong action");
   const args = replaceNonceArgsMap.lookup(entry.inIndex);
   const txParams = EvmType2TxParams<2, 0, 0> {
@@ -568,7 +568,7 @@ export circuit sendReplaceNonce(outKey: Bytes<32>): [] {
   const requestId = calculateEvmType2RequestIdV1<2, 0, 0, 34, 34>(request);
   assert(!bidirectionalReplaceNonceMap.member(requestId), "Request already sent");
   bidirectionalReplaceNonceMap.insert(requestId, request);
-  evictionMap.insert(requestId, disclosedKey);
+  evictionMap.insert(requestId, disclosedIndex);
 
   // Notify the MPC (bidirectionalReplaceNonceMap's compiled ledger path, [2, 1]).
   signetSigner.signBidirectional(
@@ -696,11 +696,11 @@ export circuit startApproveStata(inIndex: Uint<64>): [] {
 // Records the flushed approval's SignBidirectionalEvent and notifies the MPC.
 // Permissionless: the entry and its args fix every byte of the EVM transaction, so a
 // second send of the same entry names the same request id and is refused.
-export circuit sendApprove(outKey: Bytes<32>): [] {
+export circuit sendApprove(outIndex: Bytes<32>): [] {
   requireInitialised();
-  const disclosedKey = disclose(outKey);
-  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
-  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  const disclosedIndex = disclose(outIndex);
+  assert(outputRequestBuffer.member(disclosedIndex), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedIndex).entry;
   assert(entry.action == Action.approve, "Wrong action");
   const args = approveArgsMap.lookup(entry.inIndex);
   const calldata = EvmCalldata<2> {
@@ -732,7 +732,7 @@ export circuit sendApprove(outKey: Bytes<32>): [] {
   const requestId = calculateEvmType2RequestIdV1<2, 0, 0, 34, 34>(request);
   assert(!bidirectionalApproveMap.member(requestId), "Request already sent");
   bidirectionalApproveMap.insert(requestId, request);
-  evictionMap.insert(requestId, disclosedKey);
+  evictionMap.insert(requestId, disclosedIndex);
 
   // Notify the MPC (bidirectionalApproveMap's compiled ledger path, [2, 3]).
   signetSigner.signBidirectional(
@@ -842,11 +842,11 @@ export circuit startDeposit(
 // Records the flushed deposit's SignBidirectionalEvent and notifies the MPC.
 // Permissionless: the entry and its args fix every byte of the EVM transaction, so a
 // second send of the same entry names the same request id and is refused.
-export circuit sendDeposit(outKey: Bytes<32>): [] {
+export circuit sendDeposit(outIndex: Bytes<32>): [] {
   requireInitialised();
-  const disclosedKey = disclose(outKey);
-  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
-  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  const disclosedIndex = disclose(outIndex);
+  assert(outputRequestBuffer.member(disclosedIndex), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedIndex).entry;
   assert(entry.action == Action.deposit, "Wrong action");
   const args = depositArgsMap.lookup(entry.inIndex);
   // The pinned recipient stops a client having the MPC sign a transfer to themselves.
@@ -879,7 +879,7 @@ export circuit sendDeposit(outKey: Bytes<32>): [] {
   const requestId = calculateEvmType2RequestIdV1<2, 0, 0, 34, 34>(request);
   assert(!bidirectionalDepositMap.member(requestId), "Request already sent");
   bidirectionalDepositMap.insert(requestId, request);
-  evictionMap.insert(requestId, disclosedKey);
+  evictionMap.insert(requestId, disclosedIndex);
 
   // Notify the MPC (bidirectionalDepositMap's compiled ledger path, [2, 5]).
   signetSigner.signBidirectional(
@@ -1014,11 +1014,11 @@ export circuit startWithdraw(
 // Records the flushed withdrawal's SignBidirectionalEvent and notifies the MPC.
 // Permissionless: the entry and its args fix every byte of the EVM transaction, so a
 // second send of the same entry names the same request id and is refused.
-export circuit sendWithdraw(outKey: Bytes<32>): [] {
+export circuit sendWithdraw(outIndex: Bytes<32>): [] {
   requireInitialised();
-  const disclosedKey = disclose(outKey);
-  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
-  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  const disclosedIndex = disclose(outIndex);
+  assert(outputRequestBuffer.member(disclosedIndex), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedIndex).entry;
   assert(entry.action == Action.withdraw, "Wrong action");
   const args = withdrawArgsMap.lookup(entry.inIndex);
   const calldata = EvmCalldata<2> {
@@ -1050,7 +1050,7 @@ export circuit sendWithdraw(outKey: Bytes<32>): [] {
   const requestId = calculateEvmType2RequestIdV1<2, 0, 0, 34, 34>(request);
   assert(!bidirectionalWithdrawMap.member(requestId), "Request already sent");
   bidirectionalWithdrawMap.insert(requestId, request);
-  evictionMap.insert(requestId, disclosedKey);
+  evictionMap.insert(requestId, disclosedIndex);
 
   // Notify the MPC (bidirectionalWithdrawMap's compiled ledger path, [2, 7]).
   signetSigner.signBidirectional(
@@ -1204,11 +1204,11 @@ export circuit startSwap(
 // Records the flushed swap's SignBidirectionalEvent and notifies the MPC.
 // Permissionless: the entry and its args fix every byte of the EVM transaction, so a
 // second send of the same entry names the same request id and is refused.
-export circuit sendSwap(outKey: Bytes<32>): [] {
+export circuit sendSwap(outIndex: Bytes<32>): [] {
   requireInitialised();
-  const disclosedKey = disclose(outKey);
-  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
-  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  const disclosedIndex = disclose(outIndex);
+  assert(outputRequestBuffer.member(disclosedIndex), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedIndex).entry;
   assert(entry.action == Action.swap, "Wrong action");
   const args = swapArgsMap.lookup(entry.inIndex);
   // The pinned recipient stops a client having the MPC deliver the bought tokens
@@ -1247,7 +1247,7 @@ export circuit sendSwap(outKey: Bytes<32>): [] {
   const requestId = calculateEvmType2RequestIdV1<7, 0, 0, 38, 37>(request);
   assert(!bidirectionalSwapMap.member(requestId), "Request already sent");
   bidirectionalSwapMap.insert(requestId, request);
-  evictionMap.insert(requestId, disclosedKey);
+  evictionMap.insert(requestId, disclosedIndex);
 
   // Notify the MPC (bidirectionalSwapMap's compiled ledger path, [2, 9]).
   signetSigner.signBidirectional(
@@ -1415,11 +1415,11 @@ export circuit startSupply(
 // Records the flushed supply's SignBidirectionalEvent and notifies the MPC.
 // Permissionless: the entry and its args fix every byte of the EVM transaction, so a
 // second send of the same entry names the same request id and is refused.
-export circuit sendSupply(outKey: Bytes<32>): [] {
+export circuit sendSupply(outIndex: Bytes<32>): [] {
   requireInitialised();
-  const disclosedKey = disclose(outKey);
-  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
-  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  const disclosedIndex = disclose(outIndex);
+  assert(outputRequestBuffer.member(disclosedIndex), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedIndex).entry;
   assert(entry.action == Action.supply, "Wrong action");
   const args = supplyArgsMap.lookup(entry.inIndex);
   // The pinned receiver keeps the shares in the vault account, which backs the minted coins.
@@ -1451,7 +1451,7 @@ export circuit sendSupply(outKey: Bytes<32>): [] {
   const requestId = calculateEvmType2RequestIdV1<2, 0, 0, 36, 35>(request);
   assert(!bidirectionalSupplyMap.member(requestId), "Request already sent");
   bidirectionalSupplyMap.insert(requestId, request);
-  evictionMap.insert(requestId, disclosedKey);
+  evictionMap.insert(requestId, disclosedIndex);
 
   // Notify the MPC (bidirectionalSupplyMap's compiled ledger path, [2, 11]).
   signetSigner.signBidirectional(
@@ -1606,11 +1606,11 @@ export circuit startRedeem(
 // Records the flushed redeem's SignBidirectionalEvent and notifies the MPC.
 // Permissionless: the entry and its args fix every byte of the EVM transaction, so a
 // second send of the same entry names the same request id and is refused.
-export circuit sendRedeem(outKey: Bytes<32>): [] {
+export circuit sendRedeem(outIndex: Bytes<32>): [] {
   requireInitialised();
-  const disclosedKey = disclose(outKey);
-  assert(outputRequestBuffer.member(disclosedKey), "Request not flushed");
-  const entry = outputRequestBuffer.lookup(disclosedKey).entry;
+  const disclosedIndex = disclose(outIndex);
+  assert(outputRequestBuffer.member(disclosedIndex), "Request not flushed");
+  const entry = outputRequestBuffer.lookup(disclosedIndex).entry;
   assert(entry.action == Action.redeem, "Wrong action");
   const args = redeemArgsMap.lookup(entry.inIndex);
   // The pinned receiver and owner keep the assets in, and burn the shares from, the
@@ -1644,7 +1644,7 @@ export circuit sendRedeem(outKey: Bytes<32>): [] {
   const requestId = calculateEvmType2RequestIdV1<3, 0, 0, 36, 35>(request);
   assert(!bidirectionalRedeemMap.member(requestId), "Request already sent");
   bidirectionalRedeemMap.insert(requestId, request);
-  evictionMap.insert(requestId, disclosedKey);
+  evictionMap.insert(requestId, disclosedIndex);
 
   // Notify the MPC (bidirectionalRedeemMap's compiled ledger path, [2, 13]).
   signetSigner.signBidirectional(

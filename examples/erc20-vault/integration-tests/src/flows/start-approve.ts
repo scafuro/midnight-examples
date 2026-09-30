@@ -4,7 +4,7 @@
 // bidirectionalApproveMap. It asks the MPC to sign an EVM `approve(spender,
 // unlimitedAllowance())` on the ERC20, sent from the VAULT's derived address (path
 // "vault"). The request id is recomputed off-chain with the library's TS twin of the
-// request-id circuit and asserted against the ledger map key before it is returned.
+// request-id circuit and asserted against the ledger map index before it is returned.
 // The settle side lives in complete-approve.ts.
 import {
   bytesToHex,
@@ -24,7 +24,7 @@ import {
   Action,
   type ApproveRequest,
   evmAddressBytes,
-  flushedRequestKey,
+  flushedRequestIndex,
   newInputIndex,
   pureCircuits,
   readVaultLedger,
@@ -77,8 +77,8 @@ async function flushAndSendApprove(
     inIndexes: [inIndex],
     requestIds: [],
   });
-  const outKey = flushedRequestKey(flushed, Action.approve, inIndex);
-  const { evmNonce } = flushed.outputRequestBuffer.lookup(outKey).entry;
+  const outIndex = flushedRequestIndex(flushed, Action.approve, inIndex);
+  const { evmNonce } = flushed.outputRequestBuffer.lookup(outIndex).entry;
   const { gas } = flushed.approveArgsMap.lookup(inIndex);
   console.log(`vault EVM nonce: ${String(evmNonce)}`);
 
@@ -126,10 +126,10 @@ async function flushAndSendApprove(
     expectedRecord.txParams.maxPriorityFeePerGas,
   );
 
-  const result = await context.vault.callTx.sendApprove(outKey);
+  const result = await context.vault.callTx.sendApprove(outIndex);
   console.log(`approval sent in tx ${result.public.txId}`);
 
-  // The bidirectionalApproveMap key IS the record's transientHash digest:
+  // The bidirectionalApproveMap index IS the record's transientHash digest:
   // recomputing it off-chain and finding it on the ledger proves both sides agree
   // on every byte of the event.
   const after = await readVaultLedger(

@@ -4,7 +4,7 @@
 // vault's bidirectionalRedeemMap. It asks the MPC to sign an EVM `redeem(shares,
 // vault, vault)` on the wrapper, sent from the VAULT's derived address (path
 // "vault"). The request id is recomputed off-chain with the library's TS twin of the
-// request-id circuit and asserted against the ledger map key before it is returned.
+// request-id circuit and asserted against the ledger map index before it is returned.
 // The settle side lives in complete-redeem.ts.
 import {
   bytesToHex,
@@ -22,7 +22,7 @@ import {
 } from "@sig-net/midnight";
 import {
   Action,
-  flushedRequestKey,
+  flushedRequestIndex,
   newInputIndex,
   readVaultLedger,
   VAULT_PATH_BYTES,
@@ -56,7 +56,7 @@ export interface StartRedeemOptions {
  * signs, so the contract copies the vault's gas settings at start and the flush
  * assigns the nonce. The expected record is reconstructed off-chain from the
  * flushed entry and its stored arguments, its id computed with the library's
- * `calculateRequestId` TS twin, and asserted present as a ledger map key after
+ * `calculateRequestId` TS twin, and asserted present as a ledger map index after
  * the send.
  *
  * @param context - The flow context.
@@ -107,8 +107,8 @@ export async function startRedeem(
     inIndexes: [inIndex],
     requestIds: [],
   });
-  const outKey = flushedRequestKey(flushed, Action.redeem, inIndex);
-  const { evmNonce } = flushed.outputRequestBuffer.lookup(outKey).entry;
+  const outIndex = flushedRequestIndex(flushed, Action.redeem, inIndex);
+  const { evmNonce } = flushed.outputRequestBuffer.lookup(outIndex).entry;
   const { gas } = flushed.redeemArgsMap.lookup(inIndex);
   console.log(`vault EVM nonce: ${String(evmNonce)}`);
 
@@ -158,10 +158,10 @@ export async function startRedeem(
     expectedRecord.txParams.maxPriorityFeePerGas,
   );
 
-  const result = await context.vault.callTx.sendRedeem(outKey);
+  const result = await context.vault.callTx.sendRedeem(outIndex);
   console.log(`redeem sent in tx ${result.public.txId}`);
 
-  // The bidirectionalRedeemMap key IS the record's transientHash digest:
+  // The bidirectionalRedeemMap index IS the record's transientHash digest:
   // recomputing it off-chain and finding it on the ledger proves both sides agree
   // on every byte of the event.
   const after = await readVaultLedger(

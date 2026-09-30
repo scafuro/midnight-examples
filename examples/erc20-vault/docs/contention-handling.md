@@ -4,7 +4,7 @@ Many users drive the vault at once, and every Midnight transaction is proven
 against the ledger state its prover saw. When a transaction reaches the chain,
 each value it read must still hold. If another transaction changed one of those
 values in between, the later transaction fails and has to be re-proven against
-the new state. Two transactions that only touch different keys of the same map
+the new state. Two transactions that only touch different indexes of the same map
 never conflict. Two transactions that both read a single shared cell and one of
 them writes it always can.
 
@@ -41,12 +41,12 @@ contract address.
 Requests and attestations each pass through a pair of buffers: an input buffer
 that users write to and an output buffer that only the flush inserts into.
 Completion removes the entries it consumes from both output buffers. Each entry
-lives under its own key, so writes by different users never collide.
+lives under its own index, so writes by different users never collide.
 
-| Ledger field              | Key                                  | Written by          | Removed by          |
+| Ledger field              | Index                                | Written by          | Removed by          |
 | ------------------------- | ------------------------------------ | ------------------- | ------------------- |
 | `inputRequestBuffer`      | a caller-chosen random index         | the start circuit   | the flush           |
-| `outputRequestBuffer`     | the request key of the flushed entry | the flush           | the complete circuit |
+| `outputRequestBuffer`     | the request index of the flushed entry | the flush          | the complete circuit |
 | `inputAttestationBuffer`  | the request id                       | `queueAttestation*` | the flush           |
 | `outputAttestationBuffer` | the request id                       | the flush           | the complete circuit |
 | `evictionMap`             | the request id                       | the send circuit    | the complete circuit |
@@ -87,18 +87,18 @@ The start circuit refuses an index that either the input buffer or its args
 map already holds.
 
 The flush stores the entry in `outputRequestBuffer` together with the
-`lastSeen` height at that moment, under the entry's **request key**
-(`requestKey`): a hash of the nonce and the args hash, which together
+`lastSeen` height at that moment, under the entry's **request index**
+(`requestIndex`): a hash of the nonce and the args hash, which together
 determine the EVM transaction. Each action's args hash starts with a domain tag
 no other action uses, and each action fixes whether the nonce is the vault's,
-so the key needs neither the action nor the nonce flag. It deliberately leaves
+so the index needs neither the action nor the nonce flag. It deliberately leaves
 out the input index and the ownership commitment, so two identical requests
-share one request key.
+share one request index.
 
 The entry and its arguments fix every byte of the EVM transaction, gas
 included, so sending is permissionless and chooses nothing. The send never
 writes to an output buffer. It records the request in the action's event map
-and the request id in `evictionMap` (request id to request key), which is how
+and the request id in `evictionMap` (request id to request index), which is how
 the queue and complete circuits find the entry from an attestation. A second
 send of the same entry builds the same request id, which the event map already
 holds, so each entry is sent exactly once.
@@ -118,9 +118,9 @@ flushes touch shared state.
    their account's nonce, the gas envelope and the `DepositRequest`. It writes
    the arguments into `depositArgsMap` and the entry into `inputRequestBuffer`.
 2. **Flush the request.** A flush moves the entry to `outputRequestBuffer`
-   under its request key and records the current `globalLastSeen` as its
+   under its request index and records the current `globalLastSeen` as its
    `lastSeen`.
-3. **Send.** Anyone calls `sendDeposit` with the request key. It builds the
+3. **Send.** Anyone calls `sendDeposit` with the request index. It builds the
    sign bidirectional request from the entry and its arguments, records it in
    `bidirectionalDepositMap`, writes `evictionMap`, and notifies the MPC.
 4. **Queue the attestation.** Once the MPC has attested the EVM outcome,
@@ -147,7 +147,7 @@ flushes touch shared state.
 
 ## The flush
 
-`flushQueue` takes a vector of 10 slots. Each slot names a channel and a key:
+`flushQueue` takes a vector of 10 slots. Each slot names a channel and an index:
 
 - **Request slot.** Moves one entry from `inputRequestBuffer` to
   `outputRequestBuffer`, recording `globalLastSeen` as its `lastSeen`. A
@@ -158,9 +158,9 @@ flushes touch shared state.
 - **Empty slot.** Does nothing, so a flush with fewer than 10 waiting items is
   still a valid call.
 
-A slot whose key is not in its input buffer fails the whole flush, with
+A slot whose index is not in its input buffer fails the whole flush, with
 `Request not queued` or `Attestation not queued`. So does a request slot whose
-twin (an entry with the same request key) is still open, with `Identical
+twin (an entry with the same request index) is still open, with `Identical
 request open`: the twin stays in `inputRequestBuffer`, and a later flush moves
 it once the open request settles. The flush fails when it is built, so it
 commits nothing and takes no vault nonce. A flush fails only on the items its
@@ -187,11 +187,11 @@ because of a flush.
 The SDK's `flushPending` fills the slots from the ledger, up to 10 items: the
 items its caller names first, then queued attestations, then queued requests,
 each in ledger order. It leaves out a caller-signed request whose twin is open,
-or whose request key an earlier request in the batch already takes, as it would
+or whose request index an earlier request in the batch already takes, as it would
 fail the flush, and it submits nothing when no item would move. A
-vault-signed request is never left out: its key covers the nonce the flush
-assigns, so it has no twin, and for the same reason its key is known only after
-its flush (`flushedRequestKey` reads it). So another user's waiting repeats
+vault-signed request is never left out: its index covers the nonce the flush
+assigns, so it has no twin, and for the same reason its index is known only after
+its flush (`flushedRequestIndex` reads it). So another user's waiting repeats
 cannot fill a caller's flush, and `flushUntil` puts the items the caller waits
 for into every flush it submits.
 
@@ -225,7 +225,7 @@ The guarantee rests on three orderings the design enforces:
 - **An entry's bound is taken when it is flushed.** Its `lastSeen` is
   `globalLastSeen` at that moment, so it is at least the height of every
   attestation the vault had folded before accepting the request.
-- **An identical request waits for the first to close.** The request key
+- **An identical request waits for the first to close.** The request index
   keeps an identical second request in `inputRequestBuffer` until the first is
   settled, and settling needs the first request's attestation to be folded.
   So the second request's `lastSeen` is at least that attestation's height,
@@ -303,14 +303,14 @@ nonce is the second shared cell, and it follows the same rule: the flush is its
 only reader and writer.
 
 - **A request slot assigns it.** An entry with `nonceIsVault` set takes the
-  current `globalEvmNonce` before its request key is computed, and the cell
+  current `globalEvmNonce` before its request index is computed, and the cell
   advances only once the entry moves. Assigning before advancing gives the
   first vault request nonce 0, the account's next unused nonce: any other start
   would leave every later vault transaction waiting behind a nonce no request
   uses. A flush that fails on any slot commits nothing, so it never burns a
   nonce.
 - **Such requests never collide.** Each carries a nonce the flush assigned
-  once, so their request keys are unique and they never wait as twins, even
+  once, so their request indexes are unique and they never wait as twins, even
   when two withdrawals are otherwise identical.
 - **Every flushed vault request can be sent.** Sends are permissionless, so a
   nonce the flush assigned never waits on its requester to reach the MPC.

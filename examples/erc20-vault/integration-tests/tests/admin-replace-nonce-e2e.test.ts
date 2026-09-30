@@ -407,14 +407,14 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
         expect(replacementAttestation).toBeDefined();
 
         const context = await session.vaultContext();
-        const requestKey = requestIdBytes(replacementRequestId);
+        const requestIndex = requestIdBytes(replacementRequestId);
         const isRequestOnLedger = async () =>
           (
             await readVaultLedger(
               context.providers.publicDataProvider,
               context.vaultContractAddress,
             )
-          ).bidirectionalReplaceNonceMap.member(requestKey);
+          ).bidirectionalReplaceNonceMap.member(requestIndex);
 
         if (!(await isRequestOnLedger())) {
           logSkip(
@@ -464,14 +464,14 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
         expect(withdrawAttestation).toBeDefined();
 
         const context = await session.vaultContext();
-        const requestKey = requestIdBytes(withdrawRequestId);
+        const requestIndex = requestIdBytes(withdrawRequestId);
         const isRequestOnLedger = async () =>
           (
             await readVaultLedger(
               context.providers.publicDataProvider,
               context.vaultContractAddress,
             )
-          ).bidirectionalWithdrawMap.member(requestKey);
+          ).bidirectionalWithdrawMap.member(requestIndex);
 
         if (!(await isRequestOnLedger())) {
           logSkip(

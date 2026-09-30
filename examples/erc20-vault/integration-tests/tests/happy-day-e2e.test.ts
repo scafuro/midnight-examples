@@ -420,14 +420,14 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault happy-day e2e",
       expect(depositSweepTransactionRespondBidirectional).toBeDefined();
 
       const context = await session.vaultContext();
-      const requestKey = requestIdBytes(depositTransactionSignatureRequestId);
+      const requestIndex = requestIdBytes(depositTransactionSignatureRequestId);
 
       const isRequestOnLedger = async () => {
         const ledger = await readVaultLedger(
           context.providers.publicDataProvider,
           context.vaultContractAddress,
         );
-        return ledger.bidirectionalDepositMap.member(requestKey);
+        return ledger.bidirectionalDepositMap.member(requestIndex);
       };
 
       // Rerun against a kept contract address: if a prior run already claimed
@@ -709,11 +709,11 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault happy-day e2e",
       expect(withdrawRespondBidirectional).toBeDefined();
 
       const context = await session.vaultContext();
-      const requestKey = requestIdBytes(withdrawTransactionSignatureRequestId);
+      const requestIndex = requestIdBytes(withdrawTransactionSignatureRequestId);
       const isRequestOnLedger = async () =>
         (
           await readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress)
-        ).bidirectionalWithdrawMap.member(requestKey);
+        ).bidirectionalWithdrawMap.member(requestIndex);
 
       // Rerun against a kept contract address: if a prior run already settled
       // this request the entry is gone and completeWithdraw would reject with

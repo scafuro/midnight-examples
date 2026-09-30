@@ -413,8 +413,8 @@ package publishes the client side of the flush in
 [`contract/src/vault-queue.ts`](contract/src/vault-queue.ts): `flushPending`
 fills one flush from the ledger, the items its caller names first, and
 `flushUntil` flushes until a ledger predicate holds, retrying a flush that
-loses its race to another. `queuedRequestKey` and `flushedRequestKey` return
-the output buffer key a send circuit takes. See
+loses its race to another. `queuedRequestIndex` and `flushedRequestIndex` return
+the output buffer index a send circuit takes. See
 [The flush](docs/contention-handling.md#the-flush) for what a flush carries
 and when two flushes conflict.
 

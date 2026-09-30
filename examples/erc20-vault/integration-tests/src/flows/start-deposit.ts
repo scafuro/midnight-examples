@@ -1,7 +1,7 @@
 // `startDeposit` then `sendDeposit`: queue a deposit, flush it, and record its
 // SignBidirectionalEvent in the vault's bidirectionalDepositMap. It asks the MPC to sign an EVM `transfer(vault, amount)` on the ERC20, sent from the user's
 // derived address. The request id is recomputed off-chain with the library's TS twin of the
-// request-id circuit and asserted against the ledger map key before it is returned. The
+// request-id circuit and asserted against the ledger map index before it is returned. The
 // settle side lives in complete-deposit.ts.
 import {
   calculateRequestId,
@@ -19,7 +19,7 @@ import {
 import {
   evmAddressBytes,
   newInputIndex,
-  queuedRequestKey,
+  queuedRequestIndex,
   readVaultLedger,
 } from "@sig-net/midnight-examples-erc20-vault-contract";
 import { getErc20Balance } from "@sig-net/midnight-examples-test-harness";
@@ -63,7 +63,7 @@ export interface StartDepositOptions {
  * config. The expected event record is reconstructed off-chain (chain fields
  * read from the ledger, routing from the {@link TRANSFER_RESULT_MPC_ROUTING} mirror),
  * its id computed with the library's `calculateRequestId` TS twin, and
- * asserted present as a ledger map key after the call.
+ * asserted present as a ledger map index after the call.
  *
  * @param context - The flow context.
  * @param options - The deposit arguments.
@@ -177,20 +177,20 @@ export async function startDeposit(
     { erc20Address: erc20, amount: options.amount },
   );
   console.log(`deposit queued in tx ${queued.public.txId}`);
-  const outKey = queuedRequestKey(
+  const outIndex = queuedRequestIndex(
     await readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress),
     inIndex,
   );
   // Only the flush removes an entry from the input buffer. An identical open request
-  // holds outKey already, so outputRequestBuffer membership would not show this one moved.
+  // holds outIndex already, so outputRequestBuffer membership would not show this one moved.
   await flushUntil(context, (state) => !state.inputRequestBuffer.member(inIndex), {
     inIndexes: [inIndex],
     requestIds: [],
   });
-  const result = await context.vault.callTx.sendDeposit(outKey);
+  const result = await context.vault.callTx.sendDeposit(outIndex);
   console.log(`deposit sent in tx ${result.public.txId}`);
 
-  // The bidirectionalDepositMap key IS the record's transientHash digest: recomputing
+  // The bidirectionalDepositMap index IS the record's transientHash digest: recomputing
   // it off-chain and finding it on the ledger proves both sides agree on every
   // byte of the event.
   const after = await readVaultLedger(

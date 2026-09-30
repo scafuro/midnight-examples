@@ -64,12 +64,12 @@ import {
   createVaultPrivateState,
   FLUSH_WIDTH,
   FlushChannel,
-  flushedRequestKey,
+  flushedRequestIndex,
   type FlushSlot,
   flushSlots,
   ledger,
   pureCircuits,
-  queuedRequestKey,
+  queuedRequestIndex,
   VAULT_APPROVE_REQUESTS_PATH,
   VAULT_DEPOSIT_REQUESTS_PATH,
   VAULT_REDEEM_REQUESTS_PATH,
@@ -327,17 +327,17 @@ const queueDeposit = (
     args.deposit,
   );
 
-/** Queue, flush and send a deposit, returning the send's context and the request key. */
+/** Queue, flush and send a deposit, returning the send's context and the request index. */
 const deposit = async (
   contract: Contract<VaultPrivateState>,
   ctx: Parameters<Contract<VaultPrivateState>["circuits"]["startDeposit"]>[0],
   args: DepositCallArgs,
 ) => {
   const queued = (await queueDeposit(contract, ctx, args)).context;
-  const outKey = queuedRequestKey(ledgerOf(queued), args.inIndex);
+  const outIndex = queuedRequestIndex(ledgerOf(queued), args.inIndex);
   const flushed = await flush(contract, queued, [args.inIndex], []);
-  const sent = await contract.circuits.sendDeposit(flushed, outKey);
-  return { context: sent.context, outKey };
+  const sent = await contract.circuits.sendDeposit(flushed, outIndex);
+  return { context: sent.context, outIndex };
 };
 
 // ---- Tests ----
@@ -578,7 +578,7 @@ describe("deposit round-trip", () => {
   it("stores a fully contract-composed event readable identically via ledger(), the shared parser, and the RAW reader", async () => {
     const { contract, ctx } = await deployInitialised();
 
-    const { context: next, outKey } = await deposit(contract, ctx, VALID_DEPOSIT);
+    const { context: next, outIndex } = await deposit(contract, ctx, VALID_DEPOSIT);
     const state = next.callContext.currentQueryContext.state;
 
     // Read 1: generated ledger().
@@ -603,7 +603,7 @@ describe("deposit round-trip", () => {
     const notificationPost = decodeSignBidirectionalEventNotificationPayload(
       notificationEvent.payload,
     );
-    // The declared id IS the stored map key: the MPC looks it up directly.
+    // The declared id IS the stored map index: the MPC looks it up directly.
     expect(requestIdHex(notificationPost.requestId)).toBe(idHex);
     expect(decodeSignBidirectionalNotification(notificationPost.event)).toEqual({
       version: 1,
@@ -654,16 +654,16 @@ describe("deposit round-trip", () => {
     expect(calldata.value.words[0]).toEqual(evmAddressAbiWord(VAULT_EVM));
     expect(calldata.value.words[1]).toEqual(numericAbiWord(AMOUNT));
 
-    // The map key IS the record's transientHash digest, recomputed off-chain
+    // The map index IS the record's transientHash digest, recomputed off-chain
     // with the library's TS twin of the request-id circuit. This assertion is
     // the lockstep check the twin's deviation note relies on: the id computed
-    // in TS must equal the key the REAL compiled contract minted in-circuit.
+    // in TS must equal the index the REAL compiled contract minted in-circuit.
     expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
 
-    // The flushed entry sits under its request key with the height the flush
+    // The flushed entry sits under its request index with the height the flush
     // recorded, its arguments sit in depositArgsMap under its input index, and
-    // the send mapped the request id back to that key.
-    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    // the send mapped the request id back to that index.
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.deposit,
       nonceIsVault: false,
@@ -682,7 +682,7 @@ describe("deposit round-trip", () => {
         maxPriorityFeePerGas: VALID_DEPOSIT.maxPriorityFeePerGas,
       },
     });
-    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
   });
 });
@@ -762,27 +762,27 @@ describe("deposit validation", () => {
     ).rejects.toThrow(/Index already in use/);
   });
 
-  it("sendDeposit rejects a queued deposit's key before the flush moves it", async () => {
+  it("sendDeposit rejects a queued deposit's index before the flush moves it", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
-    const outKey = queuedRequestKey(ledgerOf(queued), VALID_DEPOSIT.inIndex);
-    await expect(contract.circuits.sendDeposit(queued, outKey)).rejects.toThrow(
+    const outIndex = queuedRequestIndex(ledgerOf(queued), VALID_DEPOSIT.inIndex);
+    await expect(contract.circuits.sendDeposit(queued, outIndex)).rejects.toThrow(
       /Request not flushed/,
     );
   });
 
   it("an identical repeat names the same transaction and cannot be flushed while the first is open", async () => {
     const { contract, ctx } = await deployInitialised();
-    const { context: afterFirst, outKey } = await deposit(contract, ctx, VALID_DEPOSIT);
+    const { context: afterFirst, outIndex } = await deposit(contract, ctx, VALID_DEPOSIT);
     const repeat = { ...VALID_DEPOSIT, inIndex: 2n };
 
     const queued = (await queueDeposit(contract, afterFirst, repeat)).context;
-    expect(queuedRequestKey(ledgerOf(queued), repeat.inIndex)).toEqual(outKey);
+    expect(queuedRequestIndex(ledgerOf(queued), repeat.inIndex)).toEqual(outIndex);
 
     await expect(flush(contract, queued, [repeat.inIndex], [])).rejects.toThrow(
       /Identical request open/,
     );
-    await expect(contract.circuits.sendDeposit(queued, outKey)).rejects.toThrow(
+    await expect(contract.circuits.sendDeposit(queued, outIndex)).rejects.toThrow(
       /Request already sent/,
     );
   });
@@ -940,14 +940,14 @@ const CONTRACT_RECIPIENT = {
 /**
  * Deploy + initialise + deposit(VALID_DEPOSIT): the arrange step of
  * every claim test. Returns the sent deposit's request id (the single
- * ledger map key) and request key alongside the threaded context.
+ * ledger map index) and request index alongside the threaded context.
  */
 const depositRequested = async () => {
   const { contract, ctx } = await deployInitialised();
-  const { context: next, outKey } = await deposit(contract, ctx, VALID_DEPOSIT);
+  const { context: next, outIndex } = await deposit(contract, ctx, VALID_DEPOSIT);
   const index = toSignBidirectionalEventIndex(ledgerOf(next).bidirectionalDepositMap);
   const idHex = first(index.keys(), "signBidirectional request id");
-  return { contract, ctx: next, requestId: requestIdBytes(idHex), outKey };
+  return { contract, ctx: next, requestId: requestIdBytes(idHex), outIndex };
 };
 
 // ---- Claim-deposit tests ----
@@ -1226,7 +1226,7 @@ const queueWithdraw = (
   args: WithdrawCallArgs,
 ) => contract.circuits.startWithdraw(ctx, args.inIndex, args.withdraw, args.coin);
 
-/** Queue, flush and send a withdrawal, returning the send's context and the request key. */
+/** Queue, flush and send a withdrawal, returning the send's context and the request index. */
 const withdraw = async (
   contract: Contract<VaultPrivateState>,
   ctx: CircuitContext<VaultPrivateState>,
@@ -1234,9 +1234,9 @@ const withdraw = async (
 ) => {
   const queued = (await queueWithdraw(contract, ctx, args)).context;
   const flushed = await flush(contract, queued, [args.inIndex], []);
-  const outKey = flushedRequestKey(ledgerOf(flushed), Action.withdraw, args.inIndex);
-  const sent = await contract.circuits.sendWithdraw(flushed, outKey);
-  return { context: sent.context, outKey };
+  const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.withdraw, args.inIndex);
+  const sent = await contract.circuits.sendWithdraw(flushed, outIndex);
+  return { context: sent.context, outIndex };
 };
 
 // ---- Withdraw tests ----
@@ -1245,7 +1245,7 @@ describe("withdraw round-trip", () => {
   it("burns the coin and stores a vault-path event built from the flushed entry and its args", async () => {
     const { contract, ctx } = await deployInitialised();
 
-    const { context: next, outKey } = await withdraw(contract, ctx, VALID_WITHDRAW);
+    const { context: next, outIndex } = await withdraw(contract, ctx, VALID_WITHDRAW);
     const state = next.callContext.currentQueryContext.state;
 
     const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalWithdrawMap);
@@ -1306,7 +1306,7 @@ describe("withdraw round-trip", () => {
 
     expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
 
-    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.withdraw,
       nonceIsVault: true,
@@ -1320,7 +1320,7 @@ describe("withdraw round-trip", () => {
       request: VALID_WITHDRAW.withdraw,
       gas: DEFAULT_VAULT_GAS,
     });
-    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
     expect(ledger(state).globalEvmNonce).toBe(1n);
   });
@@ -1402,7 +1402,7 @@ describe("vault nonces", () => {
 
     const state = ledgerOf(flushed);
     const nonceOf = (inIndex: bigint) =>
-      state.outputRequestBuffer.lookup(flushedRequestKey(state, Action.withdraw, inIndex)).entry
+      state.outputRequestBuffer.lookup(flushedRequestIndex(state, Action.withdraw, inIndex)).entry
         .evmNonce;
     expect(nonceOf(second.inIndex)).toBe(0n);
     expect(nonceOf(VALID_WITHDRAW.inIndex)).toBe(1n);
@@ -1415,11 +1415,11 @@ describe("vault nonces", () => {
     const { contract, ctx } = await deployInitialised();
     const ownNonce = { ...VALID_DEPOSIT, evmNonce: 5n };
     const queued = (await queueDeposit(contract, ctx, ownNonce)).context;
-    const outKey = queuedRequestKey(ledgerOf(queued), ownNonce.inIndex);
+    const outIndex = queuedRequestIndex(ledgerOf(queued), ownNonce.inIndex);
 
     const flushed = await flush(contract, queued, [ownNonce.inIndex], []);
 
-    expect(ledgerOf(flushed).outputRequestBuffer.lookup(outKey).entry.evmNonce).toBe(5n);
+    expect(ledgerOf(flushed).outputRequestBuffer.lookup(outIndex).entry.evmNonce).toBe(5n);
     expect(ledgerOf(flushed).globalEvmNonce).toBe(0n);
   });
 
@@ -1434,15 +1434,15 @@ describe("vault nonces", () => {
 
     const flushed = await flush(contract, queued, [VALID_WITHDRAW.inIndex], []);
     const state = ledgerOf(flushed);
-    const outKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
-    expect(state.outputRequestBuffer.lookup(outKey).entry.evmNonce).toBe(0n);
+    const outIndex = flushedRequestIndex(state, Action.withdraw, VALID_WITHDRAW.inIndex);
+    expect(state.outputRequestBuffer.lookup(outIndex).entry.evmNonce).toBe(0n);
     expect(state.globalEvmNonce).toBe(1n);
   });
 
-  it("queuedRequestKey refuses a vault-signed request, whose key waits on its flush", async () => {
+  it("queuedRequestIndex refuses a vault-signed request, whose key waits on its flush", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
-    expect(() => queuedRequestKey(ledgerOf(queued), VALID_WITHDRAW.inIndex)).toThrow(
+    expect(() => queuedRequestIndex(ledgerOf(queued), VALID_WITHDRAW.inIndex)).toThrow(
       /vault-signed/,
     );
   });
@@ -1548,10 +1548,14 @@ describe("sendWithdraw", () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
     const flushed = await flush(contract, queued, [VALID_WITHDRAW.inIndex], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.withdraw, VALID_WITHDRAW.inIndex);
+    const outIndex = flushedRequestIndex(
+      ledgerOf(flushed),
+      Action.withdraw,
+      VALID_WITHDRAW.inIndex,
+    );
 
     const sent = (
-      await contract.circuits.sendWithdraw(await strangerContext("sendWithdraw", flushed), outKey)
+      await contract.circuits.sendWithdraw(await strangerContext("sendWithdraw", flushed), outIndex)
     ).context;
     const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalWithdrawMap);
     expect(index.size).toBe(1);
@@ -1560,7 +1564,7 @@ describe("sendWithdraw", () => {
     expect(record.txParams.nonce).toBe(0n);
   });
 
-  it("rejects a key the flush has not moved", async () => {
+  it("rejects an index the flush has not moved", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
     await expect(contract.circuits.sendWithdraw(queued, bytes(32, 0x5a))).rejects.toThrow(
@@ -1570,16 +1574,16 @@ describe("sendWithdraw", () => {
 
   it("rejects a second send of the same request", async () => {
     const { contract, ctx } = await deployInitialised();
-    const { context: sent, outKey } = await withdraw(contract, ctx, VALID_WITHDRAW);
-    await expect(contract.circuits.sendWithdraw(sent, outKey)).rejects.toThrow(
+    const { context: sent, outIndex } = await withdraw(contract, ctx, VALID_WITHDRAW);
+    await expect(contract.circuits.sendWithdraw(sent, outIndex)).rejects.toThrow(
       /Request already sent/,
     );
   });
 
-  it("rejects a flushed deposit's key, and sendDeposit rejects a flushed withdrawal's", async () => {
+  it("rejects a flushed deposit's index, and sendDeposit rejects a flushed withdrawal's", async () => {
     const { contract, ctx } = await deployInitialised();
     const queuedDeposit = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
-    const depositKey = queuedRequestKey(ledgerOf(queuedDeposit), VALID_DEPOSIT.inIndex);
+    const depositIndex = queuedRequestIndex(ledgerOf(queuedDeposit), VALID_DEPOSIT.inIndex);
     const queuedBoth = (await queueWithdraw(contract, queuedDeposit, VALID_WITHDRAW)).context;
     const flushed = await flush(
       contract,
@@ -1587,16 +1591,16 @@ describe("sendWithdraw", () => {
       [VALID_DEPOSIT.inIndex, VALID_WITHDRAW.inIndex],
       [],
     );
-    const withdrawKey = flushedRequestKey(
+    const withdrawIndex = flushedRequestIndex(
       ledgerOf(flushed),
       Action.withdraw,
       VALID_WITHDRAW.inIndex,
     );
 
-    await expect(contract.circuits.sendWithdraw(flushed, depositKey)).rejects.toThrow(
+    await expect(contract.circuits.sendWithdraw(flushed, depositIndex)).rejects.toThrow(
       /Wrong action/,
     );
-    await expect(contract.circuits.sendDeposit(flushed, withdrawKey)).rejects.toThrow(
+    await expect(contract.circuits.sendDeposit(flushed, withdrawIndex)).rejects.toThrow(
       /Wrong action/,
     );
   });
@@ -1605,7 +1609,7 @@ describe("sendWithdraw", () => {
 /**
  * Deploy + initialise + withdraw(VALID_WITHDRAW): the arrange step of every
  * complete-withdraw test. Returns the sent withdrawal's request id (the single
- * withdraw map key) alongside the threaded context.
+ * withdraw map index) alongside the threaded context.
  */
 const withdrawRequested = async () => {
   const { contract, ctx } = await deployInitialised();
@@ -1912,7 +1916,7 @@ const STATA_APPROVAL: ApprovalCase = {
 
 const APPROVALS: ApprovalCase[] = [ROUTER_APPROVAL, STATA_APPROVAL];
 
-/** Start, flush and send an approval, returning the send's context and the request key. */
+/** Start, flush and send an approval, returning the send's context and the request index. */
 const approve = async (
   contract: Contract<VaultPrivateState>,
   ctx: CircuitContext<VaultPrivateState>,
@@ -1920,9 +1924,9 @@ const approve = async (
 ) => {
   const queued = (await approval.start(contract, ctx)).context;
   const flushed = await flush(contract, queued, [APPROVE_INDEX], []);
-  const outKey = flushedRequestKey(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
-  const sent = await contract.circuits.sendApprove(flushed, outKey);
-  return { context: sent.context, outKey };
+  const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
+  const sent = await contract.circuits.sendApprove(flushed, outIndex);
+  return { context: sent.context, outIndex };
 };
 
 // ---- Approve tests ----
@@ -1934,7 +1938,7 @@ describe("approve round-trip", () => {
       const { erc20Address, spender } = approval;
       const { contract, ctx } = await deployInitialised();
 
-      const { context: next, outKey } = await approve(contract, ctx, approval);
+      const { context: next, outIndex } = await approve(contract, ctx, approval);
       const state = next.callContext.currentQueryContext.state;
 
       const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalApproveMap);
@@ -1994,7 +1998,7 @@ describe("approve round-trip", () => {
 
       expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
 
-      const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+      const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
       expect(entry).toEqual({
         action: Action.approve,
         nonceIsVault: true,
@@ -2008,7 +2012,7 @@ describe("approve round-trip", () => {
         request: { erc20Address, spender },
         gas: DEFAULT_APPROVE_GAS,
       });
-      expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+      expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
       expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
       expect(ledger(state).globalEvmNonce).toBe(1n);
     },
@@ -2034,8 +2038,8 @@ describe("approve round-trip", () => {
     const queued = (await contract.circuits.startApproveRouter(ctx, APPROVE_INDEX, otherErc20))
       .context;
     const flushed = await flush(contract, queued, [APPROVE_INDEX], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
-    const sent = (await contract.circuits.sendApprove(flushed, outKey)).context;
+    const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
+    const sent = (await contract.circuits.sendApprove(flushed, outIndex)).context;
 
     const record = first(
       toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalApproveMap).values(),
@@ -2053,10 +2057,10 @@ describe("approve round-trip", () => {
     const flushed = await flush(contract, queuedBoth, [APPROVE_INDEX, VALID_WITHDRAW.inIndex], []);
 
     const state = ledgerOf(flushed);
-    const approveKey = flushedRequestKey(state, Action.approve, APPROVE_INDEX);
-    const withdrawKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
-    expect(state.outputRequestBuffer.lookup(approveKey).entry.evmNonce).toBe(0n);
-    expect(state.outputRequestBuffer.lookup(withdrawKey).entry.evmNonce).toBe(1n);
+    const approveIndex = flushedRequestIndex(state, Action.approve, APPROVE_INDEX);
+    const withdrawIndex = flushedRequestIndex(state, Action.withdraw, VALID_WITHDRAW.inIndex);
+    expect(state.outputRequestBuffer.lookup(approveIndex).entry.evmNonce).toBe(0n);
+    expect(state.outputRequestBuffer.lookup(withdrawIndex).entry.evmNonce).toBe(1n);
     expect(state.globalEvmNonce).toBe(2n);
   });
 });
@@ -2115,10 +2119,10 @@ describe("sendApprove", () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await ROUTER_APPROVAL.start(contract, ctx)).context;
     const flushed = await flush(contract, queued, [APPROVE_INDEX], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
+    const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
 
     const sent = (
-      await contract.circuits.sendApprove(await strangerContext("sendApprove", flushed), outKey)
+      await contract.circuits.sendApprove(await strangerContext("sendApprove", flushed), outIndex)
     ).context;
     const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalApproveMap);
     expect(index.size).toBe(1);
@@ -2127,7 +2131,7 @@ describe("sendApprove", () => {
     expect(record.txParams.nonce).toBe(0n);
   });
 
-  it("rejects a key the flush has not moved", async () => {
+  it("rejects an index the flush has not moved", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await ROUTER_APPROVAL.start(contract, ctx)).context;
     await expect(contract.circuits.sendApprove(queued, bytes(32, 0x5a))).rejects.toThrow(
@@ -2137,28 +2141,28 @@ describe("sendApprove", () => {
 
   it("rejects a second send of the same request", async () => {
     const { contract, ctx } = await deployInitialised();
-    const { context: sent, outKey } = await approve(contract, ctx, ROUTER_APPROVAL);
-    await expect(contract.circuits.sendApprove(sent, outKey)).rejects.toThrow(
+    const { context: sent, outIndex } = await approve(contract, ctx, ROUTER_APPROVAL);
+    await expect(contract.circuits.sendApprove(sent, outIndex)).rejects.toThrow(
       /Request already sent/,
     );
   });
 
-  it("rejects a flushed withdrawal's key, and sendWithdraw rejects a flushed approval's", async () => {
+  it("rejects a flushed withdrawal's index, and sendWithdraw rejects a flushed approval's", async () => {
     const { contract, ctx } = await deployInitialised();
     const queuedApproval = (await ROUTER_APPROVAL.start(contract, ctx)).context;
     const queuedBoth = (await queueWithdraw(contract, queuedApproval, VALID_WITHDRAW)).context;
     const flushed = await flush(contract, queuedBoth, [APPROVE_INDEX, VALID_WITHDRAW.inIndex], []);
-    const approveKey = flushedRequestKey(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
-    const withdrawKey = flushedRequestKey(
+    const approveIndex = flushedRequestIndex(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
+    const withdrawIndex = flushedRequestIndex(
       ledgerOf(flushed),
       Action.withdraw,
       VALID_WITHDRAW.inIndex,
     );
 
-    await expect(contract.circuits.sendApprove(flushed, withdrawKey)).rejects.toThrow(
+    await expect(contract.circuits.sendApprove(flushed, withdrawIndex)).rejects.toThrow(
       /Wrong action/,
     );
-    await expect(contract.circuits.sendWithdraw(flushed, approveKey)).rejects.toThrow(
+    await expect(contract.circuits.sendWithdraw(flushed, approveIndex)).rejects.toThrow(
       /Wrong action/,
     );
   });
@@ -2167,7 +2171,7 @@ describe("sendApprove", () => {
 /**
  * Deploy + initialise + approve(ROUTER_APPROVAL): the arrange step of every
  * complete-approve test. Returns the sent approval's request id (the single
- * approve map key) alongside the threaded context.
+ * approve map index) alongside the threaded context.
  */
 const approveRequested = async () => {
   const { contract, ctx } = await deployInitialised();
@@ -2401,17 +2405,17 @@ const queueReplaceNonce = (
   args: ReplaceNonceCallArgs,
 ) => contract.circuits.startReplaceNonce(ctx, args.inIndex, args.evmNonce);
 
-/** Queue, flush and send a replacement, returning the send's context and the request key. */
+/** Queue, flush and send a replacement, returning the send's context and the request index. */
 const replaceNonce = async (
   contract: Contract<VaultPrivateState>,
   ctx: CircuitContext<VaultPrivateState>,
   args: ReplaceNonceCallArgs,
 ) => {
   const queued = (await queueReplaceNonce(contract, ctx, args)).context;
-  const outKey = queuedRequestKey(ledgerOf(queued), args.inIndex);
+  const outIndex = queuedRequestIndex(ledgerOf(queued), args.inIndex);
   const flushed = await flush(contract, queued, [args.inIndex], []);
-  const sent = await contract.circuits.sendReplaceNonce(flushed, outKey);
-  return { context: sent.context, outKey };
+  const sent = await contract.circuits.sendReplaceNonce(flushed, outIndex);
+  return { context: sent.context, outIndex };
 };
 
 // ---- Replace nonce tests ----
@@ -2420,7 +2424,7 @@ describe("replace nonce round-trip", () => {
   it("stores an empty 21000-gas self-transfer at the named nonce, signed by the vault's account", async () => {
     const { contract, ctx } = await deployInitialised();
 
-    const { context: next, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+    const { context: next, outIndex } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
     const state = next.callContext.currentQueryContext.state;
 
     const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalReplaceNonceMap);
@@ -2474,7 +2478,7 @@ describe("replace nonce round-trip", () => {
 
     expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
 
-    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.replaceNonce,
       nonceIsVault: false,
@@ -2487,7 +2491,7 @@ describe("replace nonce round-trip", () => {
     expect(ledger(state).replaceNonceArgsMap.lookup(VALID_REPLACE_NONCE.inIndex)).toEqual({
       gas: REPLACEMENT_GAS,
     });
-    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
   });
 
@@ -2509,7 +2513,7 @@ describe("replace nonce round-trip", () => {
   it("a withdrawal flushed beside a replacement still takes the next vault nonce", async () => {
     const { contract, ctx } = await deployInitialised();
     const queuedReplacement = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
-    const replacementKey = queuedRequestKey(
+    const replacementIndex = queuedRequestIndex(
       ledgerOf(queuedReplacement),
       VALID_REPLACE_NONCE.inIndex,
     );
@@ -2523,20 +2527,20 @@ describe("replace nonce round-trip", () => {
     );
 
     const state = ledgerOf(flushed);
-    const withdrawKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
-    expect(state.outputRequestBuffer.lookup(replacementKey).entry.evmNonce).toBe(
+    const withdrawIndex = flushedRequestIndex(state, Action.withdraw, VALID_WITHDRAW.inIndex);
+    expect(state.outputRequestBuffer.lookup(replacementIndex).entry.evmNonce).toBe(
       VALID_REPLACE_NONCE.evmNonce,
     );
-    expect(state.outputRequestBuffer.lookup(withdrawKey).entry.evmNonce).toBe(0n);
+    expect(state.outputRequestBuffer.lookup(withdrawIndex).entry.evmNonce).toBe(0n);
     expect(state.globalEvmNonce).toBe(1n);
   });
 
   it("a second replacement of the same nonce cannot be flushed while the first is open", async () => {
     const { contract, ctx } = await deployInitialised();
-    const { context: sent, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+    const { context: sent, outIndex } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
     const repeat = { ...VALID_REPLACE_NONCE, inIndex: VALID_REPLACE_NONCE.inIndex + 1n };
     const queuedRepeat = (await queueReplaceNonce(contract, sent, repeat)).context;
-    expect(queuedRequestKey(ledgerOf(queuedRepeat), repeat.inIndex)).toEqual(outKey);
+    expect(queuedRequestIndex(ledgerOf(queuedRepeat), repeat.inIndex)).toEqual(outIndex);
 
     await expect(flush(contract, queuedRepeat, [repeat.inIndex], [])).rejects.toThrow(
       /Identical request open/,
@@ -2597,13 +2601,13 @@ describe("sendReplaceNonce", () => {
   it("is permissionless: a stranger sends the deployer's replacement as queued", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
-    const outKey = queuedRequestKey(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
+    const outIndex = queuedRequestIndex(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
     const flushed = await flush(contract, queued, [VALID_REPLACE_NONCE.inIndex], []);
 
     const sent = (
       await contract.circuits.sendReplaceNonce(
         await strangerContext("sendReplaceNonce", flushed),
-        outKey,
+        outIndex,
       )
     ).context;
     const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalReplaceNonceMap);
@@ -2613,11 +2617,11 @@ describe("sendReplaceNonce", () => {
     expect(record.txParams.nonce).toBe(VALID_REPLACE_NONCE.evmNonce);
   });
 
-  it("rejects a key the flush has not moved", async () => {
+  it("rejects an index the flush has not moved", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
-    const outKey = queuedRequestKey(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
-    await expect(contract.circuits.sendReplaceNonce(queued, outKey)).rejects.toThrow(
+    const outIndex = queuedRequestIndex(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
+    await expect(contract.circuits.sendReplaceNonce(queued, outIndex)).rejects.toThrow(
       /Request not flushed/,
     );
   });
@@ -2631,16 +2635,16 @@ describe("sendReplaceNonce", () => {
 
   it("rejects a second send of the same request", async () => {
     const { contract, ctx } = await deployInitialised();
-    const { context: sent, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
-    await expect(contract.circuits.sendReplaceNonce(sent, outKey)).rejects.toThrow(
+    const { context: sent, outIndex } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+    await expect(contract.circuits.sendReplaceNonce(sent, outIndex)).rejects.toThrow(
       /Request already sent/,
     );
   });
 
-  it("rejects a flushed withdrawal's key, and sendWithdraw rejects a flushed replacement's", async () => {
+  it("rejects a flushed withdrawal's index, and sendWithdraw rejects a flushed replacement's", async () => {
     const { contract, ctx } = await deployInitialised();
     const queuedReplacement = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
-    const replacementKey = queuedRequestKey(
+    const replacementIndex = queuedRequestIndex(
       ledgerOf(queuedReplacement),
       VALID_REPLACE_NONCE.inIndex,
     );
@@ -2651,16 +2655,16 @@ describe("sendReplaceNonce", () => {
       [VALID_REPLACE_NONCE.inIndex, VALID_WITHDRAW.inIndex],
       [],
     );
-    const withdrawKey = flushedRequestKey(
+    const withdrawIndex = flushedRequestIndex(
       ledgerOf(flushed),
       Action.withdraw,
       VALID_WITHDRAW.inIndex,
     );
 
-    await expect(contract.circuits.sendReplaceNonce(flushed, withdrawKey)).rejects.toThrow(
+    await expect(contract.circuits.sendReplaceNonce(flushed, withdrawIndex)).rejects.toThrow(
       /Wrong action/,
     );
-    await expect(contract.circuits.sendWithdraw(flushed, replacementKey)).rejects.toThrow(
+    await expect(contract.circuits.sendWithdraw(flushed, replacementIndex)).rejects.toThrow(
       /Wrong action/,
     );
   });
@@ -2669,7 +2673,7 @@ describe("sendReplaceNonce", () => {
 /**
  * Deploy + initialise + replaceNonce(VALID_REPLACE_NONCE): the arrange step of
  * every complete-replace-nonce test. Returns the sent replacement's request id
- * (the single replace-nonce map key) alongside the threaded context.
+ * (the single replace-nonce map index) alongside the threaded context.
  */
 const replaceNonceRequested = async () => {
   const { contract, ctx } = await deployInitialised();
@@ -2990,7 +2994,7 @@ const queueSwap = (
   args: SwapCallArgs,
 ) => contract.circuits.startSwap(ctx, args.inIndex, args.swap, args.coin);
 
-/** Queue, flush and send a swap, returning the send's context and the request key. */
+/** Queue, flush and send a swap, returning the send's context and the request index. */
 const swap = async (
   contract: Contract<VaultPrivateState>,
   ctx: CircuitContext<VaultPrivateState>,
@@ -2998,9 +3002,9 @@ const swap = async (
 ) => {
   const queued = (await queueSwap(contract, ctx, args)).context;
   const flushed = await flush(contract, queued, [args.inIndex], []);
-  const outKey = flushedRequestKey(ledgerOf(flushed), Action.swap, args.inIndex);
-  const sent = await contract.circuits.sendSwap(flushed, outKey);
-  return { context: sent.context, outKey };
+  const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.swap, args.inIndex);
+  const sent = await contract.circuits.sendSwap(flushed, outIndex);
+  return { context: sent.context, outIndex };
 };
 
 // ---- Swap tests ----
@@ -3009,7 +3013,7 @@ describe("swap round-trip", () => {
   it("burns erc20AddressIn and stores a vault-path exactOutputSingle event built from the flushed entry and its args", async () => {
     const { contract, ctx } = await deployInitialised();
 
-    const { context: next, outKey } = await swap(contract, ctx, VALID_SWAP);
+    const { context: next, outIndex } = await swap(contract, ctx, VALID_SWAP);
     const state = next.callContext.currentQueryContext.state;
 
     const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalSwapMap);
@@ -3074,7 +3078,7 @@ describe("swap round-trip", () => {
 
     expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
 
-    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.swap,
       nonceIsVault: true,
@@ -3088,7 +3092,7 @@ describe("swap round-trip", () => {
       request: VALID_SWAP.swap,
       gas: DEFAULT_SWAP_GAS,
     });
-    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
     expect(ledger(state).globalEvmNonce).toBe(1n);
   });
@@ -3138,7 +3142,7 @@ describe("swap round-trip", () => {
 
     const state = ledgerOf(flushed);
     const nonceOf = (action: Action, inIndex: bigint) =>
-      state.outputRequestBuffer.lookup(flushedRequestKey(state, action, inIndex)).entry.evmNonce;
+      state.outputRequestBuffer.lookup(flushedRequestIndex(state, action, inIndex)).entry.evmNonce;
     expect(nonceOf(Action.withdraw, VALID_WITHDRAW.inIndex)).toBe(0n);
     expect(nonceOf(Action.swap, VALID_SWAP.inIndex)).toBe(1n);
     expect(state.globalEvmNonce).toBe(2n);
@@ -3263,10 +3267,10 @@ describe("sendSwap", () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueSwap(contract, ctx, VALID_SWAP)).context;
     const flushed = await flush(contract, queued, [VALID_SWAP.inIndex], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.swap, VALID_SWAP.inIndex);
+    const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.swap, VALID_SWAP.inIndex);
 
     const sent = (
-      await contract.circuits.sendSwap(await strangerContext("sendSwap", flushed), outKey)
+      await contract.circuits.sendSwap(await strangerContext("sendSwap", flushed), outIndex)
     ).context;
     const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalSwapMap);
     expect(index.size).toBe(1);
@@ -3275,7 +3279,7 @@ describe("sendSwap", () => {
     expect(record.txParams.nonce).toBe(0n);
   });
 
-  it("rejects a key the flush has not moved", async () => {
+  it("rejects an index the flush has not moved", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueSwap(contract, ctx, VALID_SWAP)).context;
     await expect(contract.circuits.sendSwap(queued, bytes(32, 0x5a))).rejects.toThrow(
@@ -3292,11 +3296,13 @@ describe("sendSwap", () => {
 
   it("rejects a second send of the same request", async () => {
     const { contract, ctx } = await deployInitialised();
-    const { context: sent, outKey } = await swap(contract, ctx, VALID_SWAP);
-    await expect(contract.circuits.sendSwap(sent, outKey)).rejects.toThrow(/Request already sent/);
+    const { context: sent, outIndex } = await swap(contract, ctx, VALID_SWAP);
+    await expect(contract.circuits.sendSwap(sent, outIndex)).rejects.toThrow(
+      /Request already sent/,
+    );
   });
 
-  it("rejects a flushed withdrawal's key, and sendWithdraw rejects a flushed swap's", async () => {
+  it("rejects a flushed withdrawal's index, and sendWithdraw rejects a flushed swap's", async () => {
     const { contract, ctx } = await deployInitialised();
     const queuedSwap = (await queueSwap(contract, ctx, VALID_SWAP)).context;
     const queuedBoth = (await queueWithdraw(contract, queuedSwap, VALID_WITHDRAW)).context;
@@ -3306,21 +3312,25 @@ describe("sendSwap", () => {
       [VALID_SWAP.inIndex, VALID_WITHDRAW.inIndex],
       [],
     );
-    const swapKey = flushedRequestKey(ledgerOf(flushed), Action.swap, VALID_SWAP.inIndex);
-    const withdrawKey = flushedRequestKey(
+    const swapIndex = flushedRequestIndex(ledgerOf(flushed), Action.swap, VALID_SWAP.inIndex);
+    const withdrawIndex = flushedRequestIndex(
       ledgerOf(flushed),
       Action.withdraw,
       VALID_WITHDRAW.inIndex,
     );
 
-    await expect(contract.circuits.sendSwap(flushed, withdrawKey)).rejects.toThrow(/Wrong action/);
-    await expect(contract.circuits.sendWithdraw(flushed, swapKey)).rejects.toThrow(/Wrong action/);
+    await expect(contract.circuits.sendSwap(flushed, withdrawIndex)).rejects.toThrow(
+      /Wrong action/,
+    );
+    await expect(contract.circuits.sendWithdraw(flushed, swapIndex)).rejects.toThrow(
+      /Wrong action/,
+    );
   });
 });
 
 /**
  * Deploy + initialise + swap(VALID_SWAP): the arrange step of every complete-swap
- * test. Returns the sent swap's request id (the single swap map key) alongside the
+ * test. Returns the sent swap's request id (the single swap map index) alongside the
  * threaded context.
  */
 const swapRequested = async () => {
@@ -3477,7 +3487,7 @@ describe("completeSwap settle", () => {
         )
       ).context;
 
-      // The effects map keys the mints by token, not in the order the circuit minted them.
+      // The effects map indexes the mints by token, not in the order the circuit minted them.
       expect(new Map(shieldedMintsOf(next))).toEqual(new Map(mints));
       expect(coinsMinted(attested, next)).toEqual(coins);
       const state = ledgerOf(next);
@@ -3781,7 +3791,7 @@ const queueSupply = (
   args: SupplyCallArgs,
 ) => contract.circuits.startSupply(ctx, args.inIndex, args.supply, args.coin);
 
-/** Queue, flush and send a supply, returning the send's context and the request key. */
+/** Queue, flush and send a supply, returning the send's context and the request index. */
 const supply = async (
   contract: Contract<VaultPrivateState>,
   ctx: CircuitContext<VaultPrivateState>,
@@ -3789,9 +3799,9 @@ const supply = async (
 ) => {
   const queued = (await queueSupply(contract, ctx, args)).context;
   const flushed = await flush(contract, queued, [args.inIndex], []);
-  const outKey = flushedRequestKey(ledgerOf(flushed), Action.supply, args.inIndex);
-  const sent = await contract.circuits.sendSupply(flushed, outKey);
-  return { context: sent.context, outKey };
+  const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.supply, args.inIndex);
+  const sent = await contract.circuits.sendSupply(flushed, outIndex);
+  return { context: sent.context, outIndex };
 };
 
 // ---- Supply tests ----
@@ -3800,7 +3810,7 @@ describe("supply round-trip", () => {
   it("stores a vault-path stataToken deposit built from the flushed entry and its args", async () => {
     const { contract, ctx } = await deployInitialised();
 
-    const { context: next, outKey } = await supply(contract, ctx, VALID_SUPPLY);
+    const { context: next, outIndex } = await supply(contract, ctx, VALID_SUPPLY);
     const state = next.callContext.currentQueryContext.state;
 
     const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalSupplyMap);
@@ -3858,7 +3868,7 @@ describe("supply round-trip", () => {
 
     expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
 
-    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.supply,
       nonceIsVault: true,
@@ -3872,7 +3882,7 @@ describe("supply round-trip", () => {
       request: VALID_SUPPLY.supply,
       gas: DEFAULT_SUPPLY_GAS,
     });
-    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
     expect(ledger(state).globalEvmNonce).toBe(1n);
   });
@@ -3921,10 +3931,10 @@ describe("supply round-trip", () => {
     );
 
     const state = ledgerOf(flushed);
-    const withdrawKey = flushedRequestKey(state, Action.withdraw, VALID_WITHDRAW.inIndex);
-    const supplyKey = flushedRequestKey(state, Action.supply, VALID_SUPPLY.inIndex);
-    expect(state.outputRequestBuffer.lookup(withdrawKey).entry.evmNonce).toBe(0n);
-    expect(state.outputRequestBuffer.lookup(supplyKey).entry.evmNonce).toBe(1n);
+    const withdrawIndex = flushedRequestIndex(state, Action.withdraw, VALID_WITHDRAW.inIndex);
+    const supplyIndex = flushedRequestIndex(state, Action.supply, VALID_SUPPLY.inIndex);
+    expect(state.outputRequestBuffer.lookup(withdrawIndex).entry.evmNonce).toBe(0n);
+    expect(state.outputRequestBuffer.lookup(supplyIndex).entry.evmNonce).toBe(1n);
     expect(state.globalEvmNonce).toBe(2n);
   });
 });
@@ -4013,10 +4023,10 @@ describe("sendSupply", () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
     const flushed = await flush(contract, queued, [VALID_SUPPLY.inIndex], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
+    const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
 
     const sent = (
-      await contract.circuits.sendSupply(await strangerContext("sendSupply", flushed), outKey)
+      await contract.circuits.sendSupply(await strangerContext("sendSupply", flushed), outIndex)
     ).context;
     const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalSupplyMap);
     expect(index.size).toBe(1);
@@ -4025,7 +4035,7 @@ describe("sendSupply", () => {
     expect(record.txParams.nonce).toBe(0n);
   });
 
-  it("rejects a key the flush has not moved", async () => {
+  it("rejects an index the flush has not moved", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
     await expect(contract.circuits.sendSupply(queued, bytes(32, 0x5a))).rejects.toThrow(
@@ -4042,13 +4052,13 @@ describe("sendSupply", () => {
 
   it("rejects a second send of the same request", async () => {
     const { contract, ctx } = await deployInitialised();
-    const { context: sent, outKey } = await supply(contract, ctx, VALID_SUPPLY);
-    await expect(contract.circuits.sendSupply(sent, outKey)).rejects.toThrow(
+    const { context: sent, outIndex } = await supply(contract, ctx, VALID_SUPPLY);
+    await expect(contract.circuits.sendSupply(sent, outIndex)).rejects.toThrow(
       /Request already sent/,
     );
   });
 
-  it("rejects a flushed withdrawal's key, and sendWithdraw rejects a flushed supply's", async () => {
+  it("rejects a flushed withdrawal's index, and sendWithdraw rejects a flushed supply's", async () => {
     const { contract, ctx } = await deployInitialised();
     const queuedWithdraw = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
     const queuedBoth = (await queueSupply(contract, queuedWithdraw, VALID_SUPPLY)).context;
@@ -4058,17 +4068,17 @@ describe("sendSupply", () => {
       [VALID_WITHDRAW.inIndex, VALID_SUPPLY.inIndex],
       [],
     );
-    const withdrawKey = flushedRequestKey(
+    const withdrawIndex = flushedRequestIndex(
       ledgerOf(flushed),
       Action.withdraw,
       VALID_WITHDRAW.inIndex,
     );
-    const supplyKey = flushedRequestKey(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
+    const supplyIndex = flushedRequestIndex(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
 
-    await expect(contract.circuits.sendSupply(flushed, withdrawKey)).rejects.toThrow(
+    await expect(contract.circuits.sendSupply(flushed, withdrawIndex)).rejects.toThrow(
       /Wrong action/,
     );
-    await expect(contract.circuits.sendWithdraw(flushed, supplyKey)).rejects.toThrow(
+    await expect(contract.circuits.sendWithdraw(flushed, supplyIndex)).rejects.toThrow(
       /Wrong action/,
     );
   });
@@ -4077,7 +4087,7 @@ describe("sendSupply", () => {
 /**
  * Deploy + initialise + supply(VALID_SUPPLY): the arrange step of every
  * complete-supply test. Returns the sent supply's request id (the single supply
- * map key) alongside the threaded context.
+ * map index) alongside the threaded context.
  */
 const supplyRequested = async () => {
   const { contract, ctx } = await deployInitialised();
@@ -4443,7 +4453,7 @@ const queueRedeem = (
   args: RedeemCallArgs,
 ) => contract.circuits.startRedeem(ctx, args.inIndex, args.redeem, args.coin);
 
-/** Queue, flush and send a redeem, returning the send's context and the request key. */
+/** Queue, flush and send a redeem, returning the send's context and the request index. */
 const redeem = async (
   contract: Contract<VaultPrivateState>,
   ctx: CircuitContext<VaultPrivateState>,
@@ -4451,9 +4461,9 @@ const redeem = async (
 ) => {
   const queued = (await queueRedeem(contract, ctx, args)).context;
   const flushed = await flush(contract, queued, [args.inIndex], []);
-  const outKey = flushedRequestKey(ledgerOf(flushed), Action.redeem, args.inIndex);
-  const sent = await contract.circuits.sendRedeem(flushed, outKey);
-  return { context: sent.context, outKey };
+  const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.redeem, args.inIndex);
+  const sent = await contract.circuits.sendRedeem(flushed, outIndex);
+  return { context: sent.context, outIndex };
 };
 
 // ---- Redeem tests ----
@@ -4462,7 +4472,7 @@ describe("redeem round-trip", () => {
   it("stores a vault-path stataToken redeem built from the flushed entry and its args", async () => {
     const { contract, ctx } = await deployInitialised();
 
-    const { context: next, outKey } = await redeem(contract, ctx, VALID_REDEEM);
+    const { context: next, outIndex } = await redeem(contract, ctx, VALID_REDEEM);
     const state = next.callContext.currentQueryContext.state;
 
     const typedIndex = toSignBidirectionalEventIndex(ledger(state).bidirectionalRedeemMap);
@@ -4521,7 +4531,7 @@ describe("redeem round-trip", () => {
 
     expect(idHex).toBe(requestIdHex(calculateRequestId(record)));
 
-    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outKey);
+    const { entry, lastSeen } = ledger(state).outputRequestBuffer.lookup(outIndex);
     expect(entry).toEqual({
       action: Action.redeem,
       nonceIsVault: true,
@@ -4535,7 +4545,7 @@ describe("redeem round-trip", () => {
       request: VALID_REDEEM.redeem,
       gas: DEFAULT_REDEEM_GAS,
     });
-    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outKey);
+    expect(ledger(state).evictionMap.lookup(requestIdBytes(idHex))).toEqual(outIndex);
     expect(ledger(state).inputRequestBuffer.isEmpty()).toBe(true);
     expect(ledger(state).globalEvmNonce).toBe(1n);
   });
@@ -4584,13 +4594,13 @@ describe("redeem round-trip", () => {
     );
 
     const state = ledgerOf(flushed);
-    const supplyKey = flushedRequestKey(state, Action.supply, VALID_SUPPLY.inIndex);
-    const redeemKey = flushedRequestKey(state, Action.redeem, VALID_REDEEM.inIndex);
-    expect(state.outputRequestBuffer.lookup(supplyKey).entry.evmNonce).toBe(0n);
-    expect(state.outputRequestBuffer.lookup(redeemKey).entry.evmNonce).toBe(1n);
+    const supplyIndex = flushedRequestIndex(state, Action.supply, VALID_SUPPLY.inIndex);
+    const redeemIndex = flushedRequestIndex(state, Action.redeem, VALID_REDEEM.inIndex);
+    expect(state.outputRequestBuffer.lookup(supplyIndex).entry.evmNonce).toBe(0n);
+    expect(state.outputRequestBuffer.lookup(redeemIndex).entry.evmNonce).toBe(1n);
     expect(state.globalEvmNonce).toBe(2n);
 
-    const sent = (await contract.circuits.sendRedeem(flushed, redeemKey)).context;
+    const sent = (await contract.circuits.sendRedeem(flushed, redeemIndex)).context;
     const record = first(
       toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalRedeemMap).values(),
       "redeem request",
@@ -4683,10 +4693,10 @@ describe("sendRedeem", () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
     const flushed = await flush(contract, queued, [VALID_REDEEM.inIndex], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.redeem, VALID_REDEEM.inIndex);
+    const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.redeem, VALID_REDEEM.inIndex);
 
     const sent = (
-      await contract.circuits.sendRedeem(await strangerContext("sendRedeem", flushed), outKey)
+      await contract.circuits.sendRedeem(await strangerContext("sendRedeem", flushed), outIndex)
     ).context;
     const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalRedeemMap);
     expect(index.size).toBe(1);
@@ -4695,7 +4705,7 @@ describe("sendRedeem", () => {
     expect(record.txParams.nonce).toBe(0n);
   });
 
-  it("rejects a key the flush has not moved", async () => {
+  it("rejects an index the flush has not moved", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
     await expect(contract.circuits.sendRedeem(queued, bytes(32, 0x5a))).rejects.toThrow(
@@ -4712,13 +4722,13 @@ describe("sendRedeem", () => {
 
   it("rejects a second send of the same request", async () => {
     const { contract, ctx } = await deployInitialised();
-    const { context: sent, outKey } = await redeem(contract, ctx, VALID_REDEEM);
-    await expect(contract.circuits.sendRedeem(sent, outKey)).rejects.toThrow(
+    const { context: sent, outIndex } = await redeem(contract, ctx, VALID_REDEEM);
+    await expect(contract.circuits.sendRedeem(sent, outIndex)).rejects.toThrow(
       /Request already sent/,
     );
   });
 
-  it("rejects a flushed supply's key, and sendSupply rejects a flushed redeem's", async () => {
+  it("rejects a flushed supply's index, and sendSupply rejects a flushed redeem's", async () => {
     const { contract, ctx } = await deployInitialised();
     const queuedSupply = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
     const queuedBoth = (await queueRedeem(contract, queuedSupply, VALID_REDEEM)).context;
@@ -4728,18 +4738,22 @@ describe("sendRedeem", () => {
       [VALID_SUPPLY.inIndex, VALID_REDEEM.inIndex],
       [],
     );
-    const supplyKey = flushedRequestKey(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
-    const redeemKey = flushedRequestKey(ledgerOf(flushed), Action.redeem, VALID_REDEEM.inIndex);
+    const supplyIndex = flushedRequestIndex(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
+    const redeemIndex = flushedRequestIndex(ledgerOf(flushed), Action.redeem, VALID_REDEEM.inIndex);
 
-    await expect(contract.circuits.sendRedeem(flushed, supplyKey)).rejects.toThrow(/Wrong action/);
-    await expect(contract.circuits.sendSupply(flushed, redeemKey)).rejects.toThrow(/Wrong action/);
+    await expect(contract.circuits.sendRedeem(flushed, supplyIndex)).rejects.toThrow(
+      /Wrong action/,
+    );
+    await expect(contract.circuits.sendSupply(flushed, redeemIndex)).rejects.toThrow(
+      /Wrong action/,
+    );
   });
 });
 
 /**
  * Deploy + initialise + redeem(VALID_REDEEM): the arrange step of every
  * complete-redeem test. Returns the sent redeem's request id (the single redeem
- * map key) alongside the threaded context.
+ * map index) alongside the threaded context.
  */
 const redeemRequested = async () => {
   const { contract, ctx } = await deployInitialised();
@@ -5028,15 +5042,18 @@ const replay = (
 const READ_CONFLICT = /^REJECTED: mismatch between expected /;
 const APPLIED = /^applied$/;
 
-/** The request id the send of the request under `outKey` recorded in evictionMap. */
-const sentRequestId = (ctx: CircuitContext<VaultPrivateState>, outKey: Uint8Array): Uint8Array => {
-  const outKeyHex = bytesToHex(outKey);
-  for (const [requestId, key] of ledgerOf(ctx).evictionMap) {
-    if (bytesToHex(key) === outKeyHex) {
+/** The request id the send of the request under `outIndex` recorded in evictionMap. */
+const sentRequestId = (
+  ctx: CircuitContext<VaultPrivateState>,
+  outIndex: Uint8Array,
+): Uint8Array => {
+  const outIndexHex = bytesToHex(outIndex);
+  for (const [requestId, index] of ledgerOf(ctx).evictionMap) {
+    if (bytesToHex(index) === outIndexHex) {
       return requestId;
     }
   }
-  throw new Error(`no send recorded the request under ${outKeyHex}`);
+  throw new Error(`no send recorded the request under ${outIndexHex}`);
 };
 
 // ---- Contention fixtures ----
@@ -5056,8 +5073,8 @@ const BUSY_HEIGHT = 150n;
  */
 const busyVault = async () => {
   const { contract, ctx } = await deployInitialised();
-  const { context: sent, outKey } = await deposit(contract, ctx, BUSY_ATTESTED_DEPOSIT);
-  const attestedId = sentRequestId(sent, outKey);
+  const { context: sent, outIndex } = await deposit(contract, ctx, BUSY_ATTESTED_DEPOSIT);
+  const attestedId = sentRequestId(sent, outIndex);
   const queuedAttestation = (
     await contract.circuits.queueAttestation1(
       sent,
@@ -5157,9 +5174,9 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
     name: "sendDeposit",
     run: async (contract, ctx) => {
       const queued = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
-      const outKey = queuedRequestKey(ledgerOf(queued), VALID_DEPOSIT.inIndex);
+      const outIndex = queuedRequestIndex(ledgerOf(queued), VALID_DEPOSIT.inIndex);
       const shared = await flush(contract, queued, [VALID_DEPOSIT.inIndex], []);
-      return { shared, user: await contract.circuits.sendDeposit(shared, outKey) };
+      return { shared, user: await contract.circuits.sendDeposit(shared, outIndex) };
     },
   },
   {
@@ -5167,8 +5184,12 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
     run: async (contract, ctx) => {
       const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
       const shared = await flush(contract, queued, [VALID_WITHDRAW.inIndex], []);
-      const outKey = flushedRequestKey(ledgerOf(shared), Action.withdraw, VALID_WITHDRAW.inIndex);
-      return { shared, user: await contract.circuits.sendWithdraw(shared, outKey) };
+      const outIndex = flushedRequestIndex(
+        ledgerOf(shared),
+        Action.withdraw,
+        VALID_WITHDRAW.inIndex,
+      );
+      return { shared, user: await contract.circuits.sendWithdraw(shared, outIndex) };
     },
   },
   {
@@ -5176,17 +5197,17 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
     run: async (contract, ctx) => {
       const queued = (await ROUTER_APPROVAL.start(contract, ctx)).context;
       const shared = await flush(contract, queued, [APPROVE_INDEX], []);
-      const outKey = flushedRequestKey(ledgerOf(shared), Action.approve, APPROVE_INDEX);
-      return { shared, user: await contract.circuits.sendApprove(shared, outKey) };
+      const outIndex = flushedRequestIndex(ledgerOf(shared), Action.approve, APPROVE_INDEX);
+      return { shared, user: await contract.circuits.sendApprove(shared, outIndex) };
     },
   },
   {
     name: "sendReplaceNonce",
     run: async (contract, ctx) => {
       const queued = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
-      const outKey = queuedRequestKey(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
+      const outIndex = queuedRequestIndex(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
       const shared = await flush(contract, queued, [VALID_REPLACE_NONCE.inIndex], []);
-      return { shared, user: await contract.circuits.sendReplaceNonce(shared, outKey) };
+      return { shared, user: await contract.circuits.sendReplaceNonce(shared, outIndex) };
     },
   },
   {
@@ -5194,8 +5215,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
     run: async (contract, ctx) => {
       const queued = (await queueSwap(contract, ctx, VALID_SWAP)).context;
       const shared = await flush(contract, queued, [VALID_SWAP.inIndex], []);
-      const outKey = flushedRequestKey(ledgerOf(shared), Action.swap, VALID_SWAP.inIndex);
-      return { shared, user: await contract.circuits.sendSwap(shared, outKey) };
+      const outIndex = flushedRequestIndex(ledgerOf(shared), Action.swap, VALID_SWAP.inIndex);
+      return { shared, user: await contract.circuits.sendSwap(shared, outIndex) };
     },
   },
   {
@@ -5203,8 +5224,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
     run: async (contract, ctx) => {
       const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
       const shared = await flush(contract, queued, [VALID_SUPPLY.inIndex], []);
-      const outKey = flushedRequestKey(ledgerOf(shared), Action.supply, VALID_SUPPLY.inIndex);
-      return { shared, user: await contract.circuits.sendSupply(shared, outKey) };
+      const outIndex = flushedRequestIndex(ledgerOf(shared), Action.supply, VALID_SUPPLY.inIndex);
+      return { shared, user: await contract.circuits.sendSupply(shared, outIndex) };
     },
   },
   {
@@ -5212,15 +5233,15 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
     run: async (contract, ctx) => {
       const queued = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
       const shared = await flush(contract, queued, [VALID_REDEEM.inIndex], []);
-      const outKey = flushedRequestKey(ledgerOf(shared), Action.redeem, VALID_REDEEM.inIndex);
-      return { shared, user: await contract.circuits.sendRedeem(shared, outKey) };
+      const outIndex = flushedRequestIndex(ledgerOf(shared), Action.redeem, VALID_REDEEM.inIndex);
+      return { shared, user: await contract.circuits.sendRedeem(shared, outIndex) };
     },
   },
   {
     name: "queueAttestation1 for a deposit",
     run: async (contract, ctx) => {
-      const { context: shared, outKey } = await deposit(contract, ctx, VALID_DEPOSIT);
-      const requestId = sentRequestId(shared, outKey);
+      const { context: shared, outIndex } = await deposit(contract, ctx, VALID_DEPOSIT);
+      const requestId = sentRequestId(shared, outIndex);
       const attestation = respond(
         MPC_RESPONSE_SECRET,
         requestId,
@@ -5237,8 +5258,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "queueAttestation1 for a withdrawal",
     run: async (contract, ctx) => {
-      const { context: shared, outKey } = await withdraw(contract, ctx, VALID_WITHDRAW);
-      const requestId = sentRequestId(shared, outKey);
+      const { context: shared, outIndex } = await withdraw(contract, ctx, VALID_WITHDRAW);
+      const requestId = sentRequestId(shared, outIndex);
       const attestation = respond(
         MPC_RESPONSE_SECRET,
         requestId,
@@ -5255,8 +5276,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "queueAttestation1 for an approval",
     run: async (contract, ctx) => {
-      const { context: shared, outKey } = await approve(contract, ctx, ROUTER_APPROVAL);
-      const requestId = sentRequestId(shared, outKey);
+      const { context: shared, outIndex } = await approve(contract, ctx, ROUTER_APPROVAL);
+      const requestId = sentRequestId(shared, outIndex);
       const attestation = respond(
         MPC_RESPONSE_SECRET,
         requestId,
@@ -5273,8 +5294,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "queueAttestation1 for a nonce replacement",
     run: async (contract, ctx) => {
-      const { context: shared, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
-      const requestId = sentRequestId(shared, outKey);
+      const { context: shared, outIndex } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+      const requestId = sentRequestId(shared, outIndex);
       const attestation = respond(
         MPC_RESPONSE_SECRET,
         requestId,
@@ -5291,8 +5312,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "queueAttestation8 for a swap",
     run: async (contract, ctx) => {
-      const { context: shared, outKey } = await swap(contract, ctx, VALID_SWAP);
-      const requestId = sentRequestId(shared, outKey);
+      const { context: shared, outIndex } = await swap(contract, ctx, VALID_SWAP);
+      const requestId = sentRequestId(shared, outIndex);
       const attestation = respond(
         MPC_RESPONSE_SECRET,
         requestId,
@@ -5309,8 +5330,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "queueAttestation8 for a supply",
     run: async (contract, ctx) => {
-      const { context: shared, outKey } = await supply(contract, ctx, VALID_SUPPLY);
-      const requestId = sentRequestId(shared, outKey);
+      const { context: shared, outIndex } = await supply(contract, ctx, VALID_SUPPLY);
+      const requestId = sentRequestId(shared, outIndex);
       const attestation = respond(
         MPC_RESPONSE_SECRET,
         requestId,
@@ -5327,8 +5348,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "queueAttestation8 for a redeem",
     run: async (contract, ctx) => {
-      const { context: shared, outKey } = await redeem(contract, ctx, VALID_REDEEM);
-      const requestId = sentRequestId(shared, outKey);
+      const { context: shared, outIndex } = await redeem(contract, ctx, VALID_REDEEM);
+      const requestId = sentRequestId(shared, outIndex);
       const attestation = respond(
         MPC_RESPONSE_SECRET,
         requestId,
@@ -5345,8 +5366,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "queueAttestation0 for a failed withdrawal",
     run: async (contract, ctx) => {
-      const { context: shared, outKey } = await withdraw(contract, ctx, VALID_WITHDRAW);
-      const requestId = sentRequestId(shared, outKey);
+      const { context: shared, outIndex } = await withdraw(contract, ctx, VALID_WITHDRAW);
+      const requestId = sentRequestId(shared, outIndex);
       const attestation = respond(
         MPC_RESPONSE_SECRET,
         requestId,
@@ -5363,8 +5384,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "completeDeposit, minting the deposit",
     run: async (contract, ctx) => {
-      const { context: sent, outKey } = await deposit(contract, ctx, VALID_DEPOSIT);
-      const requestId = sentRequestId(sent, outKey);
+      const { context: sent, outIndex } = await deposit(contract, ctx, VALID_DEPOSIT);
+      const requestId = sentRequestId(sent, outIndex);
       const shared = await attest(
         contract,
         sent,
@@ -5392,8 +5413,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "completeWithdraw, re-minting a transfer that returned false",
     run: async (contract, ctx) => {
-      const { context: sent, outKey } = await withdraw(contract, ctx, VALID_WITHDRAW);
-      const requestId = sentRequestId(sent, outKey);
+      const { context: sent, outIndex } = await withdraw(contract, ctx, VALID_WITHDRAW);
+      const requestId = sentRequestId(sent, outIndex);
       const shared = await attest(
         contract,
         sent,
@@ -5409,8 +5430,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "completeApprove",
     run: async (contract, ctx) => {
-      const { context: sent, outKey } = await approve(contract, ctx, ROUTER_APPROVAL);
-      const requestId = sentRequestId(sent, outKey);
+      const { context: sent, outIndex } = await approve(contract, ctx, ROUTER_APPROVAL);
+      const requestId = sentRequestId(sent, outIndex);
       const shared = await attest(
         contract,
         sent,
@@ -5432,8 +5453,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "completeReplaceNonce",
     run: async (contract, ctx) => {
-      const { context: sent, outKey } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
-      const requestId = sentRequestId(sent, outKey);
+      const { context: sent, outIndex } = await replaceNonce(contract, ctx, VALID_REPLACE_NONCE);
+      const requestId = sentRequestId(sent, outIndex);
       const shared = await attest(
         contract,
         sent,
@@ -5455,8 +5476,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "completeSwap, minting the bought token and the change",
     run: async (contract, ctx) => {
-      const { context: sent, outKey } = await swap(contract, ctx, VALID_SWAP);
-      const requestId = sentRequestId(sent, outKey);
+      const { context: sent, outIndex } = await swap(contract, ctx, VALID_SWAP);
+      const requestId = sentRequestId(sent, outIndex);
       const shared = await attest8(
         contract,
         sent,
@@ -5478,8 +5499,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "completeSupply, minting the shares",
     run: async (contract, ctx) => {
-      const { context: sent, outKey } = await supply(contract, ctx, VALID_SUPPLY);
-      const requestId = sentRequestId(sent, outKey);
+      const { context: sent, outIndex } = await supply(contract, ctx, VALID_SUPPLY);
+      const requestId = sentRequestId(sent, outIndex);
       const shared = await attest8(
         contract,
         sent,
@@ -5501,8 +5522,8 @@ const USER_CIRCUIT_CASES: UserCircuitCase[] = [
   {
     name: "completeRedeem, minting the assets",
     run: async (contract, ctx) => {
-      const { context: sent, outKey } = await redeem(contract, ctx, VALID_REDEEM);
-      const requestId = sentRequestId(sent, outKey);
+      const { context: sent, outIndex } = await redeem(contract, ctx, VALID_REDEEM);
+      const requestId = sentRequestId(sent, outIndex);
       const shared = await attest8(
         contract,
         sent,
@@ -5826,8 +5847,8 @@ describe("flushQueue", () => {
     const twin = { ...VALID_DEPOSIT, inIndex: VALID_DEPOSIT.inIndex + 1n };
     const queuedFirst = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
     const queuedBoth = (await queueDeposit(contract, queuedFirst, twin)).context;
-    const outKey = queuedRequestKey(ledgerOf(queuedBoth), VALID_DEPOSIT.inIndex);
-    expect(queuedRequestKey(ledgerOf(queuedBoth), twin.inIndex)).toEqual(outKey);
+    const outIndex = queuedRequestIndex(ledgerOf(queuedBoth), VALID_DEPOSIT.inIndex);
+    expect(queuedRequestIndex(ledgerOf(queuedBoth), twin.inIndex)).toEqual(outIndex);
 
     await expect(
       flush(contract, queuedBoth, [VALID_DEPOSIT.inIndex, twin.inIndex], []),
@@ -5836,7 +5857,7 @@ describe("flushQueue", () => {
 
     const state = ledgerOf(flushed);
     expect(state.outputRequestBuffer.size()).toBe(1n);
-    expect(state.outputRequestBuffer.lookup(outKey).entry.inIndex).toBe(VALID_DEPOSIT.inIndex);
+    expect(state.outputRequestBuffer.lookup(outIndex).entry.inIndex).toBe(VALID_DEPOSIT.inIndex);
     expect(state.inputRequestBuffer.member(VALID_DEPOSIT.inIndex)).toBe(false);
     expect(state.inputRequestBuffer.member(twin.inIndex)).toBe(true);
   });
@@ -5857,10 +5878,14 @@ describe("flushQueue", () => {
   it("an attestation below globalLastSeen leaves it unchanged", async () => {
     const { contract, ctx } = await deployInitialised();
     const second = { ...VALID_DEPOSIT, inIndex: 2n, evmNonce: VALID_DEPOSIT.evmNonce + 1n };
-    const { context: sentFirst, outKey: firstKey } = await deposit(contract, ctx, VALID_DEPOSIT);
-    const { context: sentBoth, outKey: secondKey } = await deposit(contract, sentFirst, second);
-    const firstId = sentRequestId(sentBoth, firstKey);
-    const secondId = sentRequestId(sentBoth, secondKey);
+    const { context: sentFirst, outIndex: firstIndex } = await deposit(
+      contract,
+      ctx,
+      VALID_DEPOSIT,
+    );
+    const { context: sentBoth, outIndex: secondIndex } = await deposit(contract, sentFirst, second);
+    const firstId = sentRequestId(sentBoth, firstIndex);
+    const secondId = sentRequestId(sentBoth, secondIndex);
     const lowerHeight = BUSY_HEIGHT - 30n;
 
     const raised = await attest(
@@ -6104,10 +6129,14 @@ describe("gas parameters reach the constructed transaction", () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueWithdraw(contract, ctx, VALID_WITHDRAW)).context;
     const flushed = await flush(contract, queued, [VALID_WITHDRAW.inIndex], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.withdraw, VALID_WITHDRAW.inIndex);
+    const outIndex = flushedRequestIndex(
+      ledgerOf(flushed),
+      Action.withdraw,
+      VALID_WITHDRAW.inIndex,
+    );
     const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
 
-    const sent = (await contract.circuits.sendWithdraw(reconfigured, outKey)).context;
+    const sent = (await contract.circuits.sendWithdraw(reconfigured, outIndex)).context;
 
     expect(envelopeOf(ledgerOf(sent).bidirectionalWithdrawMap)).toEqual({
       maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
@@ -6136,10 +6165,10 @@ describe("gas parameters reach the constructed transaction", () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await ROUTER_APPROVAL.start(contract, ctx)).context;
     const flushed = await flush(contract, queued, [APPROVE_INDEX], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
+    const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.approve, APPROVE_INDEX);
     const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
 
-    const sent = (await contract.circuits.sendApprove(reconfigured, outKey)).context;
+    const sent = (await contract.circuits.sendApprove(reconfigured, outIndex)).context;
 
     expect(envelopeOf(ledgerOf(sent).bidirectionalApproveMap)).toEqual({
       maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
@@ -6164,11 +6193,11 @@ describe("gas parameters reach the constructed transaction", () => {
   it("a replacement keeps the fees it was queued with when setGasParams runs before its send", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueReplaceNonce(contract, ctx, VALID_REPLACE_NONCE)).context;
-    const outKey = queuedRequestKey(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
+    const outIndex = queuedRequestIndex(ledgerOf(queued), VALID_REPLACE_NONCE.inIndex);
     const flushed = await flush(contract, queued, [VALID_REPLACE_NONCE.inIndex], []);
     const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
 
-    const sent = (await contract.circuits.sendReplaceNonce(reconfigured, outKey)).context;
+    const sent = (await contract.circuits.sendReplaceNonce(reconfigured, outIndex)).context;
 
     expect(envelopeOf(ledgerOf(sent).bidirectionalReplaceNonceMap)).toEqual({
       maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
@@ -6194,10 +6223,10 @@ describe("gas parameters reach the constructed transaction", () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueSwap(contract, ctx, VALID_SWAP)).context;
     const flushed = await flush(contract, queued, [VALID_SWAP.inIndex], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.swap, VALID_SWAP.inIndex);
+    const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.swap, VALID_SWAP.inIndex);
     const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
 
-    const sent = (await contract.circuits.sendSwap(reconfigured, outKey)).context;
+    const sent = (await contract.circuits.sendSwap(reconfigured, outIndex)).context;
 
     expect(envelopeOf(ledgerOf(sent).bidirectionalSwapMap)).toEqual({
       maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
@@ -6223,10 +6252,10 @@ describe("gas parameters reach the constructed transaction", () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueSupply(contract, ctx, VALID_SUPPLY)).context;
     const flushed = await flush(contract, queued, [VALID_SUPPLY.inIndex], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
+    const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.supply, VALID_SUPPLY.inIndex);
     const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
 
-    const sent = (await contract.circuits.sendSupply(reconfigured, outKey)).context;
+    const sent = (await contract.circuits.sendSupply(reconfigured, outIndex)).context;
 
     expect(envelopeOf(ledgerOf(sent).bidirectionalSupplyMap)).toEqual({
       maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
@@ -6252,10 +6281,10 @@ describe("gas parameters reach the constructed transaction", () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueRedeem(contract, ctx, VALID_REDEEM)).context;
     const flushed = await flush(contract, queued, [VALID_REDEEM.inIndex], []);
-    const outKey = flushedRequestKey(ledgerOf(flushed), Action.redeem, VALID_REDEEM.inIndex);
+    const outIndex = flushedRequestIndex(ledgerOf(flushed), Action.redeem, VALID_REDEEM.inIndex);
     const reconfigured = (await setGasParams(contract, flushed, NEW_GAS_PARAMS)).context;
 
-    const sent = (await contract.circuits.sendRedeem(reconfigured, outKey)).context;
+    const sent = (await contract.circuits.sendRedeem(reconfigured, outIndex)).context;
 
     expect(envelopeOf(ledgerOf(sent).bidirectionalRedeemMap)).toEqual({
       maxFeePerGas: DEFAULT_MAX_FEE_PER_GAS,
@@ -6334,9 +6363,9 @@ describe("attested block heights", () => {
       )
     ).context;
 
-    const { context: reissued, outKey } = await deposit(contract, settled, VALID_DEPOSIT);
-    expect(ledgerOf(reissued).evictionMap.lookup(requestId)).toEqual(outKey);
-    expect(ledgerOf(reissued).outputRequestBuffer.lookup(outKey).lastSeen).toBe(settledAt);
+    const { context: reissued, outIndex } = await deposit(contract, settled, VALID_DEPOSIT);
+    expect(ledgerOf(reissued).evictionMap.lookup(requestId)).toEqual(outIndex);
+    expect(ledgerOf(reissued).outputRequestBuffer.lookup(outIndex).lastSeen).toBe(settledAt);
     await expect(
       contract.circuits.queueAttestation1(reissued, attestation, OUTPUT_SUCCESS),
     ).rejects.toThrow(/Stale attestation/);
@@ -6385,10 +6414,10 @@ describe("attested block heights", () => {
           CALLER_RECIPIENT,
         )
       ).context;
-      const outKey = queuedRequestKey(ledgerOf(settled), repeat.inIndex);
+      const outIndex = queuedRequestIndex(ledgerOf(settled), repeat.inIndex);
       const flushed = await flush(contract, settled, [repeat.inIndex], []);
-      expect(ledgerOf(flushed).outputRequestBuffer.lookup(outKey).lastSeen).toBe(settledAt);
-      const resent = (await contract.circuits.sendDeposit(flushed, outKey)).context;
+      expect(ledgerOf(flushed).outputRequestBuffer.lookup(outIndex).lastSeen).toBe(settledAt);
+      const resent = (await contract.circuits.sendDeposit(flushed, outIndex)).context;
       await expect(
         contract.circuits.queueAttestation1(resent, attestation, OUTPUT_SUCCESS),
       ).rejects.toThrow(/Stale attestation/);
@@ -6398,11 +6427,11 @@ describe("attested block heights", () => {
   it("sendDeposit is permissionless: a stranger sends the depositor's request as queued", async () => {
     const { contract, ctx } = await deployInitialised();
     const queued = (await queueDeposit(contract, ctx, VALID_DEPOSIT)).context;
-    const outKey = queuedRequestKey(ledgerOf(queued), VALID_DEPOSIT.inIndex);
+    const outIndex = queuedRequestIndex(ledgerOf(queued), VALID_DEPOSIT.inIndex);
     const flushed = await flush(contract, queued, [VALID_DEPOSIT.inIndex], []);
 
     const sent = (
-      await contract.circuits.sendDeposit(await strangerContext("sendDeposit", flushed), outKey)
+      await contract.circuits.sendDeposit(await strangerContext("sendDeposit", flushed), outIndex)
     ).context;
     const index = toSignBidirectionalEventIndex(ledgerOf(sent).bidirectionalDepositMap);
     expect(index.size).toBe(1);
@@ -6482,7 +6511,7 @@ describe("queueing and settling attestations", () => {
   });
 });
 
-// A request key or id no request holds: the circuits below refuse before reading it.
+// A request index or id no request holds: the circuits below refuse before reading it.
 const UNKNOWN_KEY = bytes(32, 0x5a);
 
 describe("before initialise", () => {
@@ -6759,7 +6788,7 @@ describe("invariant guards, on a ledger built by hand", () => {
   it("completeDeposit refuses a flushed attestation at or below its entry's lastSeen", async () => {
     // Queueing already refuses such an attestation, and nothing re-stamps an open
     // entry, so the entry comes from a vault that flushed the same deposit later.
-    const { contract, ctx, requestId, outKey } = await depositRequested();
+    const { contract, ctx, requestId, outIndex } = await depositRequested();
     const attested = await attest(
       contract,
       ctx,
@@ -6776,7 +6805,7 @@ describe("invariant guards, on a ledger built by hand", () => {
       "outputRequestBuffer",
       ledgerFieldOf(laterFlushed, "outputRequestBuffer"),
     );
-    expect(ledgerOf(restamped).outputRequestBuffer.lookup(outKey).lastSeen).toBe(ATTESTED_HEIGHT);
+    expect(ledgerOf(restamped).outputRequestBuffer.lookup(outIndex).lastSeen).toBe(ATTESTED_HEIGHT);
     expect(ledgerOf(restamped).outputAttestationBuffer.lookup(requestId).blockHeight).toBe(
       ATTESTED_HEIGHT,
     );

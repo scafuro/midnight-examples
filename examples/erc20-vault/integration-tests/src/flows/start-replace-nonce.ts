@@ -4,7 +4,7 @@
 // to sign a zero-value self-transfer to the vault's own EVM address, with no
 // calldata, sent from the VAULT's derived address (path "vault") at that nonce. The
 // request id is recomputed off-chain with the library's TS twin of the request-id
-// circuit and asserted against the ledger map key before it is returned. The settle
+// circuit and asserted against the ledger map index before it is returned. The settle
 // side lives in complete-replace-nonce.ts.
 import {
   calculateRequestId,
@@ -19,7 +19,7 @@ import {
 } from "@sig-net/midnight";
 import {
   newInputIndex,
-  queuedRequestKey,
+  queuedRequestIndex,
   readVaultLedger,
   VAULT_PATH_BYTES,
 } from "@sig-net/midnight-examples-erc20-vault-contract";
@@ -48,7 +48,7 @@ export interface StartReplaceNonceOptions {
  * contract fixes the transfer and copies the vault's fee settings at start under a
  * 21000 gas limit. The expected record is reconstructed off-chain from the flushed
  * entry and its stored arguments, its id computed with the library's
- * `calculateRequestId` TS twin, and asserted present as a ledger map key after the
+ * `calculateRequestId` TS twin, and asserted present as a ledger map index after the
  * send.
  *
  * @param context - The flow context, holding the deployer's identity.
@@ -80,12 +80,12 @@ export async function startReplaceNonce(
   const inIndex = newInputIndex();
   const queued = await context.vault.callTx.startReplaceNonce(inIndex, options.evmNonce);
   console.log(`replacement queued in tx ${queued.public.txId}`);
-  const outKey = queuedRequestKey(
+  const outIndex = queuedRequestIndex(
     await readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress),
     inIndex,
   );
   // Only the flush removes an entry from the input buffer. An identical open request
-  // holds outKey already, so outputRequestBuffer membership would not show this one moved.
+  // holds outIndex already, so outputRequestBuffer membership would not show this one moved.
   const flushed = await flushUntil(context, (state) => !state.inputRequestBuffer.member(inIndex), {
     inIndexes: [inIndex],
     requestIds: [],
@@ -129,10 +129,10 @@ export async function startReplaceNonce(
     expectedRecord.txParams.maxPriorityFeePerGas,
   );
 
-  const result = await context.vault.callTx.sendReplaceNonce(outKey);
+  const result = await context.vault.callTx.sendReplaceNonce(outIndex);
   console.log(`replacement sent in tx ${result.public.txId}`);
 
-  // The bidirectionalReplaceNonceMap key IS the record's transientHash digest:
+  // The bidirectionalReplaceNonceMap index IS the record's transientHash digest:
   // recomputing it off-chain and finding it on the ledger proves both sides agree on
   // every byte of the event.
   const after = await readVaultLedger(

@@ -84,21 +84,21 @@ As illustrated, the flow comprises 10 steps:
     index and the caller's secret, and a hash of the arguments. The ownership
     commitment is deliberately not the `userCommitment`, so the request's
     ownership does not link to the depositor's identity.
-  - The start touches only keys of its own request, so concurrent starts never
+  - The start touches only indexes of its own request, so concurrent starts never
     conflict with each other or with a flush, and the deposit surrenders
     nothing yet.
   - Off chain, [`start-deposit.ts`](../../integration-tests/src/flows/start-deposit.ts)
     refuses a deposit the deposit account cannot pay before calling the
-    circuit, and reads the entry's **request key** with the SDK's
-    [`queuedRequestKey`](../../contract/src/vault-queue.ts).
+    circuit, and reads the entry's **request index** with the SDK's
+    [`queuedRequestIndex`](../../contract/src/vault-queue.ts).
 - **3.** flushQueue(...) moves the request into the output buffer
   - [`flushQueue`](../../contract/src/erc20-vault.compact) is the one circuit
     that reads and writes the state every request shares. Its request slot
     moves the entry from `inputRequestBuffer` into `outputRequestBuffer` under
-    its request key, a hash of every field that determines the EVM
+    its request index, a hash of every field that determines the EVM
     transaction, and records the current `globalLastSeen` as the entry's
     `lastSeen`, the bound its attestation must beat in step 8.
-  - An identical deposit already open holds the same request key, so a flush
+  - An identical deposit already open holds the same request index, so a flush
     carrying this one fails until the first settles, and the SDK leaves it out
     until then (see
     [The last seen height](../contention-handling.md#the-last-seen-height)).
@@ -110,7 +110,7 @@ As illustrated, the flow comprises 10 steps:
     [The flush](../contention-handling.md#the-flush)).
 - **4.** sendDeposit(...) records the request and notifies the MPC
   - [`sendDeposit`](../../contract/src/erc20-vault.compact) takes the request
-    key and composes the ENTIRE EVM sweep from the flushed entry and its
+    index and composes the ENTIRE EVM sweep from the flushed entry and its
     arguments: `transfer(vaultEvmAddress, amount)` on the ERC20, built
     in-circuit around the initialise-pinned
     [`vaultEvmAddress`](../../contract/src/erc20-vault.compact), which is what
@@ -121,7 +121,7 @@ As illustrated, the flow comprises 10 steps:
     is stored in [`bidirectionalDepositMap`](../../contract/src/erc20-vault.compact)
     under its **request id**, the hash of the fields that name one execution,
     and [`evictionMap`](../../contract/src/erc20-vault.compact) maps that id
-    back to the request key. The circuit then calls the singleton's
+    back to the request index. The circuit then calls the singleton's
     [`signBidirectional`](https://github.com/sig-net/midnight-integration/blob/v0.24.0-rc.6/packages/signet-contract/src/signet-contract.compact)
     to notify the MPC, carrying the map's resolved ledger-tree path
     ([`VAULT_DEPOSIT_REQUESTS_PATH`](../../contract/src/index.ts)).
@@ -133,8 +133,8 @@ As illustrated, the flow comprises 10 steps:
     [`TRANSFER_RESULT_MPC_ROUTING`](../../integration-tests/src/mpc-routing.ts)
     mirror), hashes it with the library's
     [`calculateRequestId`](https://github.com/sig-net/midnight-integration/blob/v0.24.0-rc.6/packages/signet-midnight/src/signet-request-id.ts)
-    TypeScript twin, and asserts the recomputed id appears as a key of the
-    deposit map. That id is what every later step keys on.
+    TypeScript twin, and asserts the recomputed id appears as an index of the
+    deposit map. That id is what every later step looks up by.
 - **5.** poll for the MPC's signature
   - The MPC reads the recorded request from the vault's ledger, signs the sweep
     transaction with the user's derived deposit-account key, and posts the

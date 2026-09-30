@@ -319,11 +319,11 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("erc20-vault swap refund e2e
       expect(swapAttestation).toBeDefined();
 
       const context = await session.vaultContext();
-      const requestKey = requestIdBytes(swapRequestId);
+      const requestIndex = requestIdBytes(swapRequestId);
       const isRequestOnLedger = async () =>
         (
           await readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress)
-        ).bidirectionalSwapMap.member(requestKey);
+        ).bidirectionalSwapMap.member(requestIndex);
 
       // Rerun against a kept contract address: if a prior run already settled
       // this request the entry is gone and completeSwap would reject with

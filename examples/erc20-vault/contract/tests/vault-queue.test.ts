@@ -59,7 +59,7 @@ import {
   flushUntil,
   ledger,
   pureCircuits,
-  queuedRequestKey,
+  queuedRequestIndex,
   type VaultCompiledContract,
   type VaultLedgerState,
   type VaultPrivateState,
@@ -168,14 +168,15 @@ const sendDeposits = async (
   const requestIds: Uint8Array[] = [];
   for (const deposit of deposits) {
     next = await startDeposit(contract, next, deposit);
-    const outKey = queuedRequestKey(
+    const outIndex = queuedRequestIndex(
       ledger(next.callContext.currentQueryContext.state),
       deposit.inIndex,
     );
     next = (await contract.circuits.flushQueue(next, flushSlots([deposit.inIndex], []))).context;
-    next = (await contract.circuits.sendDeposit(next, outKey)).context;
-    for (const [requestId, key] of ledger(next.callContext.currentQueryContext.state).evictionMap) {
-      if (bytesToHex(key) === bytesToHex(outKey)) requestIds.push(requestId);
+    next = (await contract.circuits.sendDeposit(next, outIndex)).context;
+    for (const [requestId, index] of ledger(next.callContext.currentQueryContext.state)
+      .evictionMap) {
+      if (bytesToHex(index) === bytesToHex(outIndex)) requestIds.push(requestId);
     }
   }
   return { ctx: next, requestIds };

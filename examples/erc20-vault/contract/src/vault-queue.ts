@@ -85,49 +85,49 @@ export function newInputIndex(): bigint {
 }
 
 /**
- * The output buffer key a queued caller-signed request moves to when flushed,
- * computed by the compiled `requestKey` circuit from the entry the start circuit
- * wrote. A vault-signed request's key covers the nonce its flush assigns, so it
- * has none before the flush: read it afterwards with {@link flushedRequestKey}.
+ * The output buffer index a queued caller-signed request moves to when flushed,
+ * computed by the compiled `requestIndex` circuit from the entry the start circuit
+ * wrote. A vault-signed request's index covers the nonce its flush assigns, so it
+ * has none before the flush: read it afterwards with {@link flushedRequestIndex}.
  *
  * @param state - The vault ledger state.
  * @param inIndex - The request's input buffer index.
- * @returns The request key.
+ * @returns The request index.
  * @throws {Error} When no request is queued under the index, or the queued
  *   request is vault-signed.
  */
-export function queuedRequestKey(state: VaultLedgerState, inIndex: bigint): Uint8Array {
+export function queuedRequestIndex(state: VaultLedgerState, inIndex: bigint): Uint8Array {
   if (!state.inputRequestBuffer.member(inIndex)) {
     throw new Error(`no request is queued under input index ${String(inIndex)}`);
   }
   const entry = state.inputRequestBuffer.lookup(inIndex);
   if (entry.nonceIsVault) {
     throw new Error(
-      `the request under input index ${String(inIndex)} is vault-signed: its key covers the nonce the flush assigns, read it with flushedRequestKey once flushed`,
+      `the request under input index ${String(inIndex)} is vault-signed: its index covers the nonce the flush assigns, read it with flushedRequestIndex once flushed`,
     );
   }
-  return pureCircuits.requestKey(entry);
+  return pureCircuits.requestIndex(entry);
 }
 
 /**
- * The output buffer key of the open `action` request queued under `inIndex`. The
+ * The output buffer index of the open `action` request queued under `inIndex`. The
  * action's args map holds the index from start to complete, so at most one open
- * request of the action carries it. The entry under the key holds the EVM nonce
+ * request of the action carries it. The entry under the index holds the EVM nonce
  * the flush assigned.
  *
  * @param state - The vault ledger state.
  * @param action - The request's action.
  * @param inIndex - The input buffer index the request was queued under.
- * @returns The request key.
+ * @returns The request index.
  * @throws {Error} When no open request of `action` carries the index.
  */
-export function flushedRequestKey(
+export function flushedRequestIndex(
   state: VaultLedgerState,
   action: Action,
   inIndex: bigint,
 ): Uint8Array {
-  for (const [key, { entry }] of state.outputRequestBuffer) {
-    if (entry.action === action && entry.inIndex === inIndex) return key;
+  for (const [index, { entry }] of state.outputRequestBuffer) {
+    if (entry.action === action && entry.inIndex === inIndex) return index;
   }
   throw new Error(`no open ${Action[action]} request carries input index ${String(inIndex)}`);
 }
@@ -197,7 +197,7 @@ export interface FlushItems {
 }
 
 // Up to FLUSH_WIDTH items that would move: `first` ahead of the rest, attestations ahead
-// of requests. A caller-signed request whose request key is open, or taken by an
+// of requests. A caller-signed request whose request index is open, or taken by an
 // earlier request in the batch, would fail the flush, so it is left out. A vault-signed
 // request never is: the flush gives it a nonce no other request holds.
 function movableItems(state: VaultLedgerState, first: FlushItems): FlushItems {
@@ -205,7 +205,7 @@ function movableItems(state: VaultLedgerState, first: FlushItems): FlushItems {
   const inIndexes: bigint[] = [];
   const takenRequestIds = new Set<string>();
   const takenInIndexes = new Set<bigint>();
-  const takenRequestKeys = new Set<string>();
+  const takenRequestIndexes = new Set<string>();
   const addAttestation = (requestId: Uint8Array): void => {
     const hex = bytesToHex(requestId);
     if (requestIds.length + inIndexes.length === FLUSH_WIDTH || takenRequestIds.has(hex)) return;
@@ -218,10 +218,10 @@ function movableItems(state: VaultLedgerState, first: FlushItems): FlushItems {
     if (!state.inputRequestBuffer.member(inIndex)) return;
     const entry = state.inputRequestBuffer.lookup(inIndex);
     if (!entry.nonceIsVault) {
-      const key = pureCircuits.requestKey(entry);
-      const hex = bytesToHex(key);
-      if (takenRequestKeys.has(hex) || state.outputRequestBuffer.member(key)) return;
-      takenRequestKeys.add(hex);
+      const index = pureCircuits.requestIndex(entry);
+      const hex = bytesToHex(index);
+      if (takenRequestIndexes.has(hex) || state.outputRequestBuffer.member(index)) return;
+      takenRequestIndexes.add(hex);
     }
     takenInIndexes.add(inIndex);
     inIndexes.push(inIndex);

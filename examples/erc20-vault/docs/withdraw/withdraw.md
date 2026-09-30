@@ -69,16 +69,16 @@ As illustrated, the flow comprises 9 steps:
   - A request slot of [`flushQueue`](../../contract/src/erc20-vault.compact)
     gives a vault-signed entry the current
     [`globalEvmNonce`](../../contract/src/erc20-vault.compact) before it
-    computes the request key, then moves the entry into `outputRequestBuffer`
+    computes the request index, then moves the entry into `outputRequestBuffer`
     with `globalLastSeen` as its `lastSeen` and advances the nonce by one.
     Each vault-signed request therefore carries a nonce no other request holds,
     so two otherwise identical withdrawals never wait on each other (see
     [Vault-signed requests](../contention-handling.md#vault-signed-requests)).
-  - The request key covers the assigned nonce, so it exists only after the
+  - The request index covers the assigned nonce, so it exists only after the
     flush: `start-withdraw.ts` flushes through the SDK's
     [`flushUntil`](../../contract/src/vault-queue.ts) until the entry leaves
-    the input buffer, then reads the key with
-    [`flushedRequestKey`](../../contract/src/vault-queue.ts).
+    the input buffer, then reads the index with
+    [`flushedRequestIndex`](../../contract/src/vault-queue.ts).
 - **3.** sendWithdraw(...) records the request and notifies the MPC
   - [`sendWithdraw`](../../contract/src/erc20-vault.compact) builds
     contract-enforced calldata for `transfer(destEvmAddress, amount)` on the
@@ -88,13 +88,13 @@ As illustrated, the flow comprises 9 steps:
     (see [Derived keys and accounts](../../README.md#derived-keys-and-accounts)).
   - It stores the **SignBidirectionalEventV1** in
     [`bidirectionalWithdrawMap`](../../contract/src/erc20-vault.compact) under
-    its request id, maps the id to the request key in `evictionMap`, and calls
+    its request id, maps the id to the request index in `evictionMap`, and calls
     the singleton's `signBidirectional(...)` with the map's path
     ([`VAULT_WITHDRAW_REQUESTS_PATH`](../../contract/src/index.ts)).
     Anyone may send it, and a second send is refused.
   - Off chain, `start-withdraw.ts` rebuilds the expected record from the
     flushed entry and its stored arguments and asserts its recomputed request
-    id is a key of the withdraw map.
+    id is an index of the withdraw map.
 - **4.** poll for the MPC's signature
   - The MPC reads the recorded request from the vault's ledger, signs the
     transfer with the vault's derived signing key, and posts the signature back

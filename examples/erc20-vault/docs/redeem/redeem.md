@@ -67,7 +67,7 @@ As illustrated, the flow comprises 9 steps:
     ([`globalEvmNonce`](../../contract/src/erc20-vault.compact)) and moves it
     into `outputRequestBuffer`, exactly as it does for a
     [withdrawal](../withdraw/withdraw.md). `start-redeem.ts` then reads the
-    entry's key with [`flushedRequestKey`](../../contract/src/vault-queue.ts).
+    entry's index with [`flushedRequestIndex`](../../contract/src/vault-queue.ts).
 - **3.** sendRedeem(...) records the request and notifies the MPC
   - [`sendRedeem`](../../contract/src/erc20-vault.compact) builds
     contract-enforced calldata for

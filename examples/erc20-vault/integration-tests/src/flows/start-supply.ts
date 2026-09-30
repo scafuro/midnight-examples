@@ -4,7 +4,7 @@
 // vault's bidirectionalSupplyMap. It asks the MPC to sign an EVM `deposit(amount,
 // vault)` on the pinned stataToken wrapper, sent from the VAULT's derived address
 // (path "vault"). The request id is recomputed off-chain with the library's TS twin
-// of the request-id circuit and asserted against the ledger map key before it is
+// of the request-id circuit and asserted against the ledger map index before it is
 // returned. The settle side lives in complete-supply.ts.
 import {
   bytesToHex,
@@ -22,7 +22,7 @@ import {
 } from "@sig-net/midnight";
 import {
   Action,
-  flushedRequestKey,
+  flushedRequestIndex,
   newInputIndex,
   readVaultLedger,
   VAULT_PATH_BYTES,
@@ -57,7 +57,7 @@ export interface StartSupplyOptions {
  * gas settings at start and the flush assigns the nonce. The expected record is
  * reconstructed off-chain from the flushed entry and its stored arguments, its
  * id computed with the library's `calculateRequestId` TS twin, and asserted
- * present as a ledger map key after the send.
+ * present as a ledger map index after the send.
  *
  * @param context - The flow context.
  * @param options - The supply arguments.
@@ -107,8 +107,8 @@ export async function startSupply(
     inIndexes: [inIndex],
     requestIds: [],
   });
-  const outKey = flushedRequestKey(flushed, Action.supply, inIndex);
-  const { evmNonce } = flushed.outputRequestBuffer.lookup(outKey).entry;
+  const outIndex = flushedRequestIndex(flushed, Action.supply, inIndex);
+  const { evmNonce } = flushed.outputRequestBuffer.lookup(outIndex).entry;
   const { gas } = flushed.supplyArgsMap.lookup(inIndex);
   console.log(`vault EVM nonce: ${String(evmNonce)}`);
 
@@ -154,10 +154,10 @@ export async function startSupply(
     expectedRecord.txParams.maxPriorityFeePerGas,
   );
 
-  const result = await context.vault.callTx.sendSupply(outKey);
+  const result = await context.vault.callTx.sendSupply(outIndex);
   console.log(`supply sent in tx ${result.public.txId}`);
 
-  // The bidirectionalSupplyMap key IS the record's transientHash digest:
+  // The bidirectionalSupplyMap index IS the record's transientHash digest:
   // recomputing it off-chain and finding it on the ledger proves both sides agree
   // on every byte of the event.
   const after = await readVaultLedger(
