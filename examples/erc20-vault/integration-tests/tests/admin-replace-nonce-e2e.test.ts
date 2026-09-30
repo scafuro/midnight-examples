@@ -21,6 +21,7 @@
 // in-process, never a subprocess.
 import { OutputKind, requestIdBytes, type RequestIdHex } from "@sig-net/midnight";
 import {
+  Action,
   readVaultLedger,
   VAULT_REPLACE_NONCE_REQUESTS_PATH,
   VAULT_WITHDRAW_REQUESTS_PATH,
@@ -298,7 +299,10 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
           await minedNonce(context.evmRpcUrl, context.evmVaultAddress),
           "the withdrawal must hold the vault account's next nonce, or the replacement unsticks nothing",
         ).toBe(withdrawNonce);
-        replacementRequestId = await startReplaceNonce(context, { evmNonce: withdrawNonce });
+        replacementRequestId = await startReplaceNonce(context, {
+          requestId: withdrawRequestId,
+          action: Action.withdraw,
+        });
         expect(replacementRequestId).toMatch(/^[0-9a-f]{64}$/);
 
         banner([

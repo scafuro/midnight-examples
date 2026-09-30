@@ -57,7 +57,8 @@ carries:
 - **The action.**
 - **The nonce.** `nonceIsVault` is `false` when the caller names the nonce,
   which is taken verbatim: a deposit names the depositor's own account nonce,
-  and a nonce replacement names the vault account nonce it replaces. It is
+  and a nonce replacement carries the vault account nonce of the sent request
+  it replaces. It is
   `true` for a withdrawal, a swap, a supply, a redeem or an approval, which
   the vault's account signs at a nonce the caller does not choose: the start
   writes 0, and the flush replaces it with the vault's next nonce.
@@ -421,11 +422,14 @@ replacing that nonce with a zero-value self-transfer, the Replace nonce
 section of the contract. It runs the same six steps with these differences:
 
 1. **Start.** `startReplaceNonce` is deployer-gated and takes the input index
-   and the vault account nonce to replace. It copies the vault's fee settings
-   at a 21000 gas limit into `replaceNonceArgsMap`, and queues the entry with
-   `nonceIsVault` unset, so the flush takes the named nonce verbatim and
-   leaves `globalEvmNonce` alone. Nothing checks the nonce against
-   `globalEvmNonce`: the deployer is trusted with it.
+   and the sent request to replace, as a request id and its action. It reads
+   the nonce from that request's event in the action's map, so only a nonce
+   the flush assigned and a send handed to the MPC can be replaced: a deposit
+   is refused, as the caller's account signs it, and so is a request that is
+   not sent under the named action or has already settled. It copies the
+   vault's fee settings at a 21000 gas limit into `replaceNonceArgsMap`, and
+   queues the entry with `nonceIsVault` unset, so the flush takes that nonce
+   verbatim and leaves `globalEvmNonce` alone.
 2. **Send.** `sendReplaceNonce` builds the transfer of zero to
    `vaultEvmAddress`, with no calldata, under the derivation path `"vault"`,
    and records it in `bidirectionalReplaceNonceMap`.

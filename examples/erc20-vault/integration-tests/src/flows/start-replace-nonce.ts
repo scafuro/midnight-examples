@@ -1,14 +1,16 @@
 // `startReplaceNonce` then `sendReplaceNonce`: as the deployer, queue a replacement of
-// the vault account's transaction at a named nonce, flush it, and record its
+// a sent vault-signed request's transaction, flush it, and record its
 // SignBidirectionalEvent in the vault's bidirectionalReplaceNonceMap. It asks the MPC
 // to sign a zero-value self-transfer to the vault's own EVM address, with no
-// calldata, sent from the VAULT's derived address (path "vault") at that nonce. The
+// calldata, sent from the VAULT's derived address (path "vault") at the nonce the
+// replaced request's own event holds. The
 // request id is recomputed off-chain with the library's TS twin of the request-id
 // circuit and asserted against the ledger map index before it is returned. The settle
 // side lives in complete-replace-nonce.ts.
 import {
   calculateRequestId,
   hexToBytes,
+  requestIdBytes,
   type RequestIdHex,
   requestIdHex,
   type SignBidirectionalEvent,
@@ -18,6 +20,7 @@ import {
   TxParamType,
 } from "@sig-net/midnight";
 import {
+  Action,
   newInputIndex,
   queuedRequestIndex,
   readVaultLedger,
@@ -31,8 +34,10 @@ import { flushUntil } from "./vault-queue.ts";
 
 /** Options for {@link startReplaceNonce}. */
 export interface StartReplaceNonceOptions {
-  /** The vault account nonce whose transaction the replacement takes. */
-  readonly evmNonce: bigint;
+  /** The sent request whose vault account nonce the replacement takes. */
+  readonly requestId: RequestIdHex;
+  /** The request's action, which names the event map holding it. */
+  readonly action: Action;
 }
 
 /**
@@ -41,33 +46,30 @@ export interface StartReplaceNonceOptions {
  * resulting request id.
  *
  * The contract's warning on `startReplaceNonce` applies in full: the replacement
- * takes the nonce of whichever request the flush assigned it, and that request's
- * own transaction can then never execute. Call this only for a transaction that can
- * never be mined and is in flight nowhere. The circuit is deployer-gated, so the
- * context's identity must be the deployer's. The caller names only the nonce: the
- * contract fixes the transfer and copies the vault's fee settings at start under a
- * 21000 gas limit. The expected record is reconstructed off-chain from the flushed
- * entry and its stored arguments, its id computed with the library's
- * `calculateRequestId` TS twin, and asserted present as a ledger map index after the
- * send.
+ * takes the replaced request's nonce, and that request's own transaction can then
+ * never execute. Call this only for a transaction that can never be mined and is in
+ * flight nowhere. The circuit is deployer-gated, so the context's identity must be
+ * the deployer's. The caller names only the sent request: the contract reads the
+ * nonce from that request's own event, fixes the transfer and copies the vault's
+ * fee settings at start under a 21000 gas limit. The expected record is
+ * reconstructed off-chain from the flushed entry and its stored arguments, its id
+ * computed with the library's `calculateRequestId` TS twin, and asserted present
+ * as a ledger map index after the send.
  *
  * @param context - The flow context, holding the deployer's identity.
- * @param options - The nonce to replace.
+ * @param options - The sent request to replace.
  * @returns The request id as 64-char lowercase hex.
- * @throws {Error} If the nonce is negative, the vault is uninitialised, the
- *   context's identity is not the deployer's, or the recomputed id does not appear
- *   on the ledger.
+ * @throws {Error} If the vault is uninitialised, the request is not sent under the
+ *   named action, the context's identity is not the deployer's, or the recomputed
+ *   id does not appear on the ledger.
  */
 export async function startReplaceNonce(
   context: VaultContext,
   options: StartReplaceNonceOptions,
 ): Promise<RequestIdHex> {
-  if (options.evmNonce < 0n) {
-    throw new Error(`evmNonce must be non-negative; got ${String(options.evmNonce)}.`);
-  }
-  console.log(`vault contract: ${context.vaultContractAddress}`);
-  console.log(`vault account:  ${context.evmVaultAddress}`);
-  console.log(`replaced nonce: ${String(options.evmNonce)}`);
+  console.log(`vault contract:   ${context.vaultContractAddress}`);
+  console.log(`vault account:    ${context.evmVaultAddress}`);
+  console.log(`replaced request: ${options.requestId} (${Action[options.action]})`);
 
   const before = await readVaultLedger(
     context.providers.publicDataProvider,
@@ -78,7 +80,11 @@ export async function startReplaceNonce(
   }
 
   const inIndex = newInputIndex();
-  const queued = await context.vault.callTx.startReplaceNonce(inIndex, options.evmNonce);
+  const queued = await context.vault.callTx.startReplaceNonce(
+    inIndex,
+    requestIdBytes(options.requestId),
+    options.action,
+  );
   console.log(`replacement queued in tx ${queued.public.txId}`);
   const outIndex = queuedRequestIndex(
     await readVaultLedger(context.providers.publicDataProvider, context.vaultContractAddress),
@@ -91,12 +97,14 @@ export async function startReplaceNonce(
     requestIds: [],
   });
   const { gas } = flushed.replaceNonceArgsMap.lookup(inIndex);
+  const { evmNonce } = flushed.outputRequestBuffer.lookup(outIndex).entry;
+  console.log(`replaced nonce:   ${String(evmNonce)}`);
 
   // The record the contract will store, reconstructed byte for byte: the event's own
   // sender (the vault contract, kernel.self() in-circuit), the pinned chain, the
-  // named nonce, the gas the start copied, a zero-value transfer to the vault's own
-  // EVM address with no calldata, the vault's own 32-byte derivation path, and the
-  // contract-fixed routing.
+  // replaced request's nonce, the gas the start copied, a zero-value transfer to the
+  // vault's own EVM address with no calldata, the vault's own 32-byte derivation path,
+  // and the contract-fixed routing.
   const keyVersion = SIGNET_DEFAULT_KEY_VERSION;
   const expectedRecord: SignBidirectionalEvent = {
     sender: { bytes: hexToBytes(stripHexPrefix(context.vaultContractAddress)) },
@@ -107,7 +115,7 @@ export async function startReplaceNonce(
     txParams: {
       to: before.vaultEvmAddress,
       chainId: before.evmChainId,
-      nonce: options.evmNonce,
+      nonce: evmNonce,
       gasLimit: gas.gasLimit,
       maxFeePerGas: gas.maxFeePerGas,
       maxPriorityFeePerGas: gas.maxPriorityFeePerGas,

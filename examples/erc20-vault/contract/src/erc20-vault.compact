@@ -480,8 +480,8 @@ circuit settleRequest(
 
 // ==== Replace nonce ==================================================================
 // A zero-value self-transfer to vaultEvmAddress with no calldata, signed by the MPC with
-// the vault's own account at the nonce the deployer names, under the vault's fee
-// settings and the 21000 gas a plain transfer costs.
+// the vault's own account at the nonce of a sent request the deployer names, under the
+// vault's fee settings and the 21000 gas a plain transfer costs.
 
 export struct ReplaceNonceArgs {
   gas: GasParams;
@@ -501,18 +501,46 @@ circuit replaceNonceArgsHash(args: ReplaceNonceArgs): Bytes<32> {
   ]));
 }
 
+// The vault account nonce a sent request holds, read from its event in the action's
+// map. A deposit signs with the caller's account, so it holds no vault nonce.
+circuit sentVaultNonce(requestId: RequestId, action: Action): Uint<64> {
+  assert(action != Action.deposit, "Deposit has no vault nonce");
+  if (action == Action.withdraw) {
+    assert(bidirectionalWithdrawMap.member(requestId), "Request not sent");
+    return bidirectionalWithdrawMap.lookup(requestId).txParams.nonce;
+  } else if (action == Action.approve) {
+    assert(bidirectionalApproveMap.member(requestId), "Request not sent");
+    return bidirectionalApproveMap.lookup(requestId).txParams.nonce;
+  } else if (action == Action.swap) {
+    assert(bidirectionalSwapMap.member(requestId), "Request not sent");
+    return bidirectionalSwapMap.lookup(requestId).txParams.nonce;
+  } else if (action == Action.supply) {
+    assert(bidirectionalSupplyMap.member(requestId), "Request not sent");
+    return bidirectionalSupplyMap.lookup(requestId).txParams.nonce;
+  } else if (action == Action.redeem) {
+    assert(bidirectionalRedeemMap.member(requestId), "Request not sent");
+    return bidirectionalRedeemMap.lookup(requestId).txParams.nonce;
+  } else {
+    assert(bidirectionalReplaceNonceMap.member(requestId), "Request not sent");
+    return bidirectionalReplaceNonceMap.lookup(requestId).txParams.nonce;
+  }
+}
+
 // ⚠️ EMERGENCY USE ONLY. THIS CAN LOSE USER FUNDS. ⚠️
-// Replaces the vault account's transaction at evmNonce with a zero-value
-// self-transfer, to unstick the account when that transaction can never be
-// mined. Every nonce the flush assigns belongs to a user's request, and the
-// replacement takes it: that request's own transaction can then never
-// execute. Before calling this make sure that the signature of the transaction
-// you're replacing has had a signature issued by the MPC. If that is the case 
-// user funds won't be lost.
-export circuit startReplaceNonce(inIndex: Uint<64>, evmNonce: Uint<64>): [] {
+// Replaces the vault account's transaction of the sent request `requestId` of `action`
+// with a zero-value self-transfer at the same nonce, to unstick the account when that
+// transaction can never be mined. The nonce comes from the request's own event, so only
+// a nonce the flush assigned and the MPC was asked to sign can be replaced. The
+// replaced request's own transaction can then never execute: the MPC attests it
+// unviable, and its complete takes the failure branch. Before calling this make sure
+// the MPC has signed the transaction being replaced: a replacement racing an unsigned
+// one may leave that request without an attestation, and if anything was surrendered
+// at the start may stay burned.
+export circuit startReplaceNonce(inIndex: Uint<64>, requestId: RequestId, action: Action): [] {
   requireInitialised();
   assert(userCommitment(callerSecretKey()) == deployer, "Not the deployer");
 
+  const evmNonce = sentVaultNonce(disclose(requestId), disclose(action));
   const disclosedIndex = disclose(inIndex);
   assert(
     !inputRequestBuffer.member(disclosedIndex) && !replaceNonceArgsMap.member(disclosedIndex),
