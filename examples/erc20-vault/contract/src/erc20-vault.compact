@@ -1319,7 +1319,8 @@ export circuit completeSwap(
       ) == record.digest,
       "Output does not match the attestation"
     );
-    // Two coins minted under one nonce would link to each other.
+    // changeNonce and mintNonce  must be sampled independently and uniformly at random.  No check can guarantee that. 
+    // The following check only prevents equality,  which would trivially impact the hiding of the committed coins.
     assert(changeNonce != mintNonce, "changeNonce must differ from mintNonce");
     mintShieldedToken(
       vaultTokenDomainSeparator(args.request.erc20AddressOut),
